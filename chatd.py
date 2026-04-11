@@ -156,6 +156,8 @@ def chat_stream_generator(
     req_id: str = "-",
 ) -> Generator[bytes, None, None]:
     MAX_TOOL_ROUNDS = 5
+    prev_tool_names: Optional[List[str]] = None
+    repeat_count = 0
 
     try:
         for round_num in range(MAX_TOOL_ROUNDS):
@@ -243,6 +245,29 @@ def chat_stream_generator(
                 log.info("[%s] stream complete, no more tool rounds", req_id)
                 break
 
+            # ── tool loop detection ─────────────────────────────────────────
+            current_tool_names = [
+                (tc.get("function") or {}).get("name") for tc in last_tool_calls
+            ]
+            if current_tool_names == prev_tool_names:
+                repeat_count += 1
+                if repeat_count >= 2:
+                    log.warning("[%s] tool loop detected (%s x%d), aborting",
+                                req_id, current_tool_names, repeat_count)
+                    err_chunk = json.dumps({
+                        "model": model,
+                        "message": {
+                            "role": "assistant",
+                            "content": "\n[ошибка: цикл инструментов, остановлено]\n",
+                        },
+                        "done": True,
+                    }, ensure_ascii=False)
+                    yield (err_chunk + "\n").encode("utf-8")
+                    return
+            else:
+                repeat_count = 0
+            prev_tool_names = current_tool_names
+
             # ── tool execution ────────────────────────────────────────────
             messages.append({
                 "role": "assistant",
@@ -322,6 +347,8 @@ def chat():
         try:
             MAX_TOOL_ROUNDS = 5
             resp: Dict = {}
+            prev_tc_names: Optional[List[str]] = None
+            rep = 0
             for i in range(MAX_TOOL_ROUNDS):
                 ollama_payload: Dict[str, Any] = {
                     "model": model,
@@ -346,8 +373,17 @@ def chat():
                 if not tool_calls:
                     break
 
-                log.info("[%s] non-stream tool_calls: %s", req_id,
-                         [tc.get("function", {}).get("name") for tc in tool_calls])
+                tc_names = [(tc.get("function") or {}).get("name") for tc in tool_calls]
+                log.info("[%s] non-stream tool_calls: %s", req_id, tc_names)
+
+                if tc_names == prev_tc_names:
+                    rep += 1
+                    if rep >= 2:
+                        log.warning("[%s] non-stream tool loop detected, aborting", req_id)
+                        return jsonify({"error": "tool loop detected"}), 500
+                else:
+                    rep = 0
+                prev_tc_names = tc_names
 
                 messages.append({
                     "role": "assistant",

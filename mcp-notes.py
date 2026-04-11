@@ -20,22 +20,19 @@ def memos_headers() -> dict:
 
 
 @mcp.tool()
-async def notes_search(query: str, limit: int = 10) -> str:
-    if not query.strip():
-        raise ValueError("query is required")
-
+async def notes_search(query: str = "", limit: int = 10) -> str:
+    """Search notes by keyword, or list recent notes if query is empty."""
     url = f"{MEMOS_URL.rstrip('/')}/api/v1/memos"
-    params = {
-        "content": query,
-        "limit": limit,
-    }
+    params: dict = {"limit": limit}
+    if query.strip():
+        params["content"] = query
 
     async with httpx.AsyncClient(timeout=10.0) as client:
         r = await client.get(url, params=params, headers=memos_headers())
         r.raise_for_status()
         data = r.json()
 
-    # Пытаемся вытащить список заметок из нескольких возможных форматов
+    # Вытаскиваем список заметок из нескольких возможных форматов
     if isinstance(data, list):
         notes_raw = data
     elif isinstance(data, dict):
