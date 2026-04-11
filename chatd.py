@@ -102,18 +102,19 @@ def build_model_messages(raw_messages):
 
 
 def call_ollama_with_tools(model, messages):
-    #model_messages = build_model_messages(messages)
+    is_stream = False
+    model_messages = build_model_messages(messages)
     payload = {
         "model": model,
-        "messages": messages,
+        "messages": model_messages,
         "tools": TOOLS,
-        "stream": False,
+        "stream": is_stream,
     }
 
     with requests.post(f"{OLLAMA_API}/api/chat",
                        json=payload,
                        timeout=300,
-                       stream=True) as r:
+                       stream=is_stream) as r:
         r.raise_for_status()
 
         full_message = ""
@@ -213,6 +214,8 @@ def chat():
     })
 
 
+init_tools()
+
+
 if __name__ == "__main__":
-    init_tools()
     app.run(host="0.0.0.0", port=5001, debug=False)
