@@ -6,7 +6,13 @@ After=network.target
 Type=simple
 User=chatd
 WorkingDirectory=/opt/chatd
-ExecStart=/opt/chatd/venv/bin/python /opt/chatd/chatd.py
+ExecStart=/opt/chatd/venv/bin/gunicorn \
+    --bind 0.0.0.0:5001 \
+    --worker-class gevent \
+    --workers 1 \
+    --timeout 360 \
+    --keep-alive 5 \
+    chatd:app
 Restart=on-failure
 NoNewPrivileges=yes
 PrivateTmp=yes
