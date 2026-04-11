@@ -218,12 +218,20 @@ def chat_stream_generator(
                                  req_id, [c.get("function", {}).get("name") for c in tc])
                         last_tool_calls = tc
 
+                    # keepalive: при наличии tool_calls контент не стримим,
+                    # но раз в 5 чанков шлём пустую строку чтобы nginx/браузер
+                    # не посчитали соединение зависшим.
+                    if last_tool_calls and chunk_count % 5 == 0:
+                        yield b"\n"
+
                     if done:
                         log.info("[%s] round %d done, chunks=%d, tool_calls=%s, content_len=%d",
                                  req_id, round_num, chunk_count,
                                  bool(last_tool_calls), len(content_acc))
                         if last_tool_calls:
-                            break  # будет следующий раунд
+                            # flush перед переходом к следующему раунду
+                            yield b"\n"
+                            break
                         else:
                             yield line + b"\n"
                         break
