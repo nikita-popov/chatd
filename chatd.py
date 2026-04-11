@@ -1,6 +1,7 @@
 import json
+import logging
 import re
-import time
+import traceback
 from typing import Any, Dict, Generator, List, Optional
 
 import requests
@@ -8,6 +9,17 @@ from requests.exceptions import ReadTimeout
 from flask import Flask, request, Response, jsonify, stream_with_context
 
 from mcp_client import MCPClient, MCP_MONITOR_CMD, MCP_ALERTS_CMD, MCP_NOTES_CMD
+
+# ─── logging ─────────────────────────────────────────────────────────────────
+
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger("chatd")
+
+# ─── config ─────────────────────────────────────────────────────────────────
 
 OLLAMA_API = "http://127.0.0.1:11434"
 
@@ -57,6 +69,22 @@ def build_model_messages(raw_messages: List[Dict]) -> List[Dict]:
     return result
 
 
+# ─── CORS ───────────────────────────────────────────────────────────────────
+
+@app.after_request
+def add_cors(response: Response) -> Response:
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    return response
+
+
+@app.route("/api/chat", methods=["OPTIONS"])
+@app.route("/chat", methods=["OPTIONS"])
+def options_chat():
+    return Response(status=204)
+
+
 # ─── tools ──────────────────────────────────────────────────────────────────
 
 def load_tools():
@@ -67,12 +95,15 @@ def load_tools():
         "notes":   MCPClient(MCP_NOTES_CMD),
         "alerts":  MCPClient(MCP_ALERTS_CMD),
     }
-    for _source, client in servers.items():
-        for t in client.list_tools():
+    for source, client in servers.items():
+        server_tools = client.list_tools()
+        log.info("[tools] %s: %d tools loaded", source, len(server_tools))
+        for t in server_tools:
             name = getattr(t, "name", None)
             description = getattr(t, "description", "") or ""
             input_schema = getattr(t, "inputSchema", None) or getattr(t, "input_schema", None)
             if not name or not input_schema:
+                log.warning("[tools] %s: skipping tool without name or schema: %r", source, t)
                 continue
             tools.append({
                 "type": "function",
@@ -83,19 +114,25 @@ def load_tools():
                 },
             })
             registry[name] = client
+            log.debug("[tools] registered: %s", name)
     return tools, registry
 
 
 def init_tools():
     global TOOLS, TOOL_REGISTRY
+    log.info("[tools] initializing MCP tools...")
     TOOLS, TOOL_REGISTRY = load_tools()
+    log.info("[tools] total: %d tools in registry", len(TOOLS))
 
 
 def call_tool(name: str, arguments: Dict[str, Any]) -> Any:
     client = TOOL_REGISTRY.get(name)
     if client is None:
         raise RuntimeError(f"Unknown tool: {name}")
-    return client.call_tool(name, arguments)
+    log.debug("[tool] calling %s with args: %s", name, arguments)
+    result = client.call_tool(name, arguments)
+    log.debug("[tool] %s result: %s", name, str(result)[:200])
+    return result
 
 
 # ─── routes ─────────────────────────────────────────────────────────────────
@@ -116,123 +153,168 @@ def chat_stream_generator(
     model: str,
     messages: List[Dict],
     options: Optional[Dict] = None,
+    req_id: str = "-",
 ) -> Generator[bytes, None, None]:
-    """
-    Генератор, который:
-    1. Стримит ответ Ollama напрямую клиенту
-    2. При tool_calls — паузует стрим, исполняет инструменты, продолжает
-    Клиент видит один непрерывный NDJSON-стрим.
-    """
     MAX_TOOL_ROUNDS = 5
 
-    for _round in range(MAX_TOOL_ROUNDS):
-        payload: Dict[str, Any] = {
-            "model": model,
-            "messages": build_model_messages(messages),
-            "tools": TOOLS,
-            "stream": True,
-        }
-        if options:
-            payload["options"] = options
+    try:
+        for round_num in range(MAX_TOOL_ROUNDS):
+            log.info("[%s] stream round %d, messages=%d", req_id, round_num, len(messages))
 
-        with requests.post(
-            f"{OLLAMA_API}/api/chat",
-            json=payload,
-            timeout=300,
-            stream=True,
-        ) as r:
-            r.raise_for_status()
-
-            content_acc = ""
-            last_tool_calls: Optional[List[Dict]] = None  # только из финального чанка
-
-            for line in r.iter_lines():
-                if not line:
-                    continue
-
-                chunk = json.loads(line.decode("utf-8"))
-                msg = chunk.get("message") or {}
-                done = chunk.get("done", False)
-                delta = msg.get("content") or ""
-                content_acc += delta
-
-                tc = msg.get("tool_calls")
-                if tc:
-                    last_tool_calls = tc  # запомнили, но НЕ прерываем стрим
-
-                if done:
-                    if last_tool_calls:
-                        # Будет следующий раунд — не отдаём финальный done
-                        break
-                    else:
-                        # Финальный done без tool_calls — отдаём клиенту
-                        yield line + b"\n"
-                    break
-
-                if not tc:
-                    # Обычный контентный чанк — сразу клиенту
-                    yield line + b"\n"
-
-        if not last_tool_calls:
-            break
-
-        # ── tool execution ───────────────────────────────────────────────
-        messages.append({
-            "role": "assistant",
-            "content": content_acc,
-            "tool_calls": last_tool_calls,
-        })
-
-        for tc in last_tool_calls:
-            fn = tc.get("function") or {}
-            tool_name = fn.get("name")
-            tool_args = fn.get("arguments") or {}
-            if isinstance(tool_args, str):
-                try:
-                    tool_args = json.loads(tool_args)
-                except json.JSONDecodeError:
-                    tool_args = {}
-
-            thinking_chunk = {
+            payload: Dict[str, Any] = {
                 "model": model,
-                "message": {
-                    "role": "assistant",
-                    "content": f"\n[tool: {tool_name}]\n",
-                },
-                "done": False,
+                "messages": build_model_messages(messages),
+                "tools": TOOLS,
+                "stream": True,
             }
-            yield (json.dumps(thinking_chunk, ensure_ascii=False) + "\n").encode("utf-8")
+            if options:
+                payload["options"] = options
+
+            log.debug("[%s] -> Ollama payload (messages count=%d, tools=%d)",
+                      req_id, len(payload["messages"]), len(TOOLS))
 
             try:
-                tool_result = call_tool(tool_name, tool_args)
+                r = requests.post(
+                    f"{OLLAMA_API}/api/chat",
+                    json=payload,
+                    timeout=300,
+                    stream=True,
+                )
+                r.raise_for_status()
             except Exception as e:
-                tool_result = {"error": str(e)}
+                log.error("[%s] Ollama request failed: %s", req_id, e)
+                err_chunk = json.dumps({
+                    "model": model,
+                    "message": {"role": "assistant", "content": f"\n[error: {e}]\n"},
+                    "done": True,
+                }, ensure_ascii=False)
+                yield (err_chunk + "\n").encode("utf-8")
+                return
 
+            content_acc = ""
+            last_tool_calls: Optional[List[Dict]] = None
+            chunk_count = 0
+
+            with r:
+                for line in r.iter_lines():
+                    if not line:
+                        continue
+
+                    try:
+                        chunk = json.loads(line.decode("utf-8"))
+                    except json.JSONDecodeError as e:
+                        log.warning("[%s] bad JSON line: %s | %r", req_id, e, line[:120])
+                        continue
+
+                    chunk_count += 1
+                    msg = chunk.get("message") or {}
+                    done = chunk.get("done", False)
+                    delta = msg.get("content") or ""
+                    content_acc += delta
+
+                    tc = msg.get("tool_calls")
+                    if tc:
+                        log.info("[%s] tool_calls received: %s",
+                                 req_id, [c.get("function", {}).get("name") for c in tc])
+                        last_tool_calls = tc
+
+                    if done:
+                        log.info("[%s] round %d done, chunks=%d, tool_calls=%s, content_len=%d",
+                                 req_id, round_num, chunk_count,
+                                 bool(last_tool_calls), len(content_acc))
+                        if last_tool_calls:
+                            break  # будет следующий раунд
+                        else:
+                            yield line + b"\n"
+                        break
+
+                    if not tc:
+                        yield line + b"\n"
+
+            if not last_tool_calls:
+                log.info("[%s] stream complete, no more tool rounds", req_id)
+                break
+
+            # ── tool execution ────────────────────────────────────────────
             messages.append({
-                "role": "tool",
-                "content": json.dumps(tool_result, ensure_ascii=False),
+                "role": "assistant",
+                "content": content_acc,
+                "tool_calls": last_tool_calls,
             })
 
-        last_tool_calls = None
+            for tc in last_tool_calls:
+                fn = tc.get("function") or {}
+                tool_name = fn.get("name") or "unknown"
+                tool_args = fn.get("arguments") or {}
+                if isinstance(tool_args, str):
+                    try:
+                        tool_args = json.loads(tool_args)
+                    except json.JSONDecodeError:
+                        log.warning("[%s] failed to parse tool_args for %s", req_id, tool_name)
+                        tool_args = {}
+
+                log.info("[%s] executing tool: %s(%s)", req_id, tool_name, tool_args)
+
+                thinking_chunk = json.dumps({
+                    "model": model,
+                    "message": {
+                        "role": "assistant",
+                        "content": f"\n[→ {tool_name}]\n",
+                    },
+                    "done": False,
+                }, ensure_ascii=False)
+                yield (thinking_chunk + "\n").encode("utf-8")
+
+                try:
+                    tool_result = call_tool(tool_name, tool_args)
+                except Exception as e:
+                    log.error("[%s] tool %s failed: %s", req_id, tool_name, e)
+                    tool_result = {"error": str(e)}
+
+                messages.append({
+                    "role": "tool",
+                    "content": json.dumps(tool_result, ensure_ascii=False),
+                })
+
+            last_tool_calls = None
+
+    except Exception as e:
+        log.error("[%s] unhandled exception in generator: %s", req_id, traceback.format_exc())
+        err_chunk = json.dumps({
+            "model": model,
+            "message": {"role": "assistant", "content": f"\n[internal error: {e}]\n"},
+            "done": True,
+        }, ensure_ascii=False)
+        yield (err_chunk + "\n").encode("utf-8")
 
 
 @app.post("/chat")
 @app.post("/api/chat")
 def chat():
-    original_payload = request.get_json(force=True, silent=False)
+    import uuid
+    req_id = uuid.uuid4().hex[:8]
+
+    try:
+        original_payload = request.get_json(force=True, silent=False)
+    except Exception as e:
+        log.error("[%s] failed to parse request JSON: %s", req_id, e)
+        return jsonify({"error": "invalid JSON"}), 400
+
     model    = original_payload.get("model") or "qwen3:4b"
     messages = original_payload.get("messages") or []
     options  = original_payload.get("options") or {}
-    messages = ensure_system_prompt(messages)
-
     want_stream = original_payload.get("stream", True)
 
+    messages = ensure_system_prompt(messages)
+
+    log.info("[%s] POST /api/chat model=%s stream=%s messages=%d options=%s",
+             req_id, model, want_stream, len(messages), options)
+
     if not want_stream:
-        # Не-стриминговый путь — для тестирования через curl
         try:
             MAX_TOOL_ROUNDS = 5
             resp: Dict = {}
-            for _ in range(MAX_TOOL_ROUNDS):
+            for i in range(MAX_TOOL_ROUNDS):
                 ollama_payload: Dict[str, Any] = {
                     "model": model,
                     "messages": build_model_messages(messages),
@@ -242,6 +324,7 @@ def chat():
                 if options:
                     ollama_payload["options"] = options
 
+                log.debug("[%s] non-stream round %d", req_id, i)
                 r = requests.post(
                     f"{OLLAMA_API}/api/chat",
                     json=ollama_payload,
@@ -254,6 +337,9 @@ def chat():
 
                 if not tool_calls:
                     break
+
+                log.info("[%s] non-stream tool_calls: %s", req_id,
+                         [tc.get("function", {}).get("name") for tc in tool_calls])
 
                 messages.append({
                     "role": "assistant",
@@ -278,17 +364,19 @@ def chat():
 
             msg = resp.get("message") or {}
             answer = (msg.get("content") or "").strip() or "[пустой ответ]"
+            log.info("[%s] non-stream done, answer_len=%d", req_id, len(answer))
             return jsonify({"model": model, "answer": answer, "raw": resp})
 
         except ReadTimeout:
+            log.error("[%s] ollama timeout", req_id)
             return jsonify({"error": "ollama timeout"}), 504
         except Exception as e:
-            import traceback; traceback.print_exc()
+            log.error("[%s] non-stream error: %s", req_id, traceback.format_exc())
             return jsonify({"error": str(e)}), 502
 
-    # Стриминговый путь — основной
+    log.info("[%s] starting stream generator", req_id)
     return Response(
-        stream_with_context(chat_stream_generator(model, messages, options or None)),
+        stream_with_context(chat_stream_generator(model, messages, options or None, req_id)),
         content_type="application/x-ndjson",
         headers={
             "X-Accel-Buffering": "no",
@@ -298,7 +386,7 @@ def chat():
     )
 
 
-# ─── entry point ─────────────────────────────────────────────────────────────
+# ─── entry point ────────────────────────────────────────────────────────────
 
 init_tools()
 
