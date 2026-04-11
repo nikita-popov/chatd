@@ -28,6 +28,13 @@ SYSTEM_PROMPT = (
     "Отвечай кратко, по делу, по-русски, без рассуждений и воды."
 )
 
+# Дефолтные опции для Ollama: ограничиваем think-токены и ответ.
+# Клиент может переопределить через поле options в POST /api/chat.
+DEFAULT_OPTIONS: Dict[str, Any] = {
+    "num_predict": 2048,   # макс ответ (think + response)
+    "num_ctx":     8192,   # контекст окно
+}
+
 TOOLS: List[Dict] = []
 TOOL_REGISTRY: Dict[str, MCPClient] = {}
 
@@ -43,6 +50,14 @@ def proxy_get(path: str) -> Response:
         status=r.status_code,
         content_type=r.headers.get("Content-Type", "application/json"),
     )
+
+
+def merge_options(client_options: Optional[Dict]) -> Dict[str, Any]:
+    """Merge client options over defaults. Client values take precedence."""
+    opts = dict(DEFAULT_OPTIONS)
+    if client_options:
+        opts.update(client_options)
+    return opts
 
 
 def ensure_system_prompt(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -85,7 +100,7 @@ def options_chat():
     return Response(status=204)
 
 
-# ─── tools ──────────────────────────────────────────────────────────────────
+# ─── tools ─────────────────────────────────────────────────────────────────
 
 def load_tools():
     tools = []
@@ -152,7 +167,7 @@ def tags():
 def chat_stream_generator(
     model: str,
     messages: List[Dict],
-    options: Optional[Dict] = None,
+    options: Dict[str, Any],
     req_id: str = "-",
 ) -> Generator[bytes, None, None]:
     MAX_TOOL_ROUNDS = 5
@@ -168,18 +183,17 @@ def chat_stream_generator(
                 "messages": build_model_messages(messages),
                 "tools": TOOLS,
                 "stream": True,
+                "options": options,
             }
-            if options:
-                payload["options"] = options
 
-            log.debug("[%s] -> Ollama payload (messages count=%d, tools=%d)",
-                      req_id, len(payload["messages"]), len(TOOLS))
+            log.debug("[%s] -> Ollama payload (messages count=%d, tools=%d, options=%s)",
+                      req_id, len(payload["messages"]), len(TOOLS), options)
 
             try:
                 r = requests.post(
                     f"{OLLAMA_API}/api/chat",
                     json=payload,
-                    timeout=300,
+                    timeout=600,
                     stream=True,
                 )
                 r.raise_for_status()
@@ -231,7 +245,6 @@ def chat_stream_generator(
                                  req_id, round_num, chunk_count,
                                  bool(last_tool_calls), len(content_acc))
                         if last_tool_calls:
-                            # flush перед переходом к следующему раунду
                             yield b"\n"
                             break
                         else:
@@ -333,9 +346,9 @@ def chat():
         log.error("[%s] failed to parse request JSON: %s", req_id, e)
         return jsonify({"error": "invalid JSON"}), 400
 
-    model    = original_payload.get("model") or "qwen3:4b"
-    messages = original_payload.get("messages") or []
-    options  = original_payload.get("options") or {}
+    model       = original_payload.get("model") or "qwen3:4b"
+    messages    = original_payload.get("messages") or []
+    options     = merge_options(original_payload.get("options"))
     want_stream = original_payload.get("stream", True)
 
     messages = ensure_system_prompt(messages)
@@ -355,15 +368,14 @@ def chat():
                     "messages": build_model_messages(messages),
                     "tools": TOOLS,
                     "stream": False,
+                    "options": options,
                 }
-                if options:
-                    ollama_payload["options"] = options
 
                 log.debug("[%s] non-stream round %d", req_id, i)
                 r = requests.post(
                     f"{OLLAMA_API}/api/chat",
                     json=ollama_payload,
-                    timeout=300,
+                    timeout=600,
                 )
                 r.raise_for_status()
                 resp = r.json()
@@ -420,7 +432,7 @@ def chat():
 
     log.info("[%s] starting stream generator", req_id)
     return Response(
-        stream_with_context(chat_stream_generator(model, messages, options or None, req_id)),
+        stream_with_context(chat_stream_generator(model, messages, options, req_id)),
         content_type="application/x-ndjson",
         headers={
             "X-Accel-Buffering": "no",
