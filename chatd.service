@@ -1,0 +1,15 @@
+[Unit]
+Description=simple chat backend
+After=network.target
+
+[Service]
+Type=simple
+User=chatd
+WorkingDirectory=/opt/chatd
+ExecStart=/opt/chatd/venv/bin/python /opt/chatd/chatd.py
+Restart=on-failure
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target
