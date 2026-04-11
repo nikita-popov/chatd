@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 
 import json
+import re
 import time
 from typing import Any, Dict, List
 
 import requests
 from requests.exceptions import ReadTimeout
 
-from flask import Flask, request, Response, jsonify, stream_with_context
+from flask import Flask, request, Response, jsonify
 
 from mcp_client import MCPClient, MCP_MONITOR_CMD, MCP_ALERTS_CMD, MCP_NOTES_CMD
 
@@ -22,14 +23,6 @@ TOOLS: List[Dict] = []
 TOOL_REGISTRY: Dict[str, MCPClient] = {}
 
 app = Flask(__name__)
-
-
-def init_tools():
-    global TOOLS, TOOL_REGISTRY
-    TOOLS, TOOL_REGISTRY = load_tools()
-
-
-init_tools()
 
 
 def proxy_get(path: str) -> Response:
@@ -83,16 +76,15 @@ def load_tools():
     return tools, registry
 
 
-def call_tool(name: str, arguments: Dict[str, Any]) -> Any:
-    if name.startswith("alerts_"):
-        client = mcp_alerts
-    if name.startswith("monitor_"):
-        client = mcp_monitor
-    elif name.startswith("notes_"):
-        client = mcp_notes
-    else:
-        raise RuntimeError(f"Unknown tool prefix for {name}")
+def init_tools():
+    global TOOLS, TOOL_REGISTRY
+    TOOLS, TOOL_REGISTRY = load_tools()
 
+
+def call_tool(name: str, arguments: Dict[str, Any]) -> Any:
+    client = TOOL_REGISTRY.get(name)
+    if client is None:
+        raise RuntimeError(f"Unknown tool: {name}")
     return client.call_tool(name, arguments)
 
 
@@ -100,16 +92,12 @@ def build_model_messages(raw_messages):
     result = []
     for m in raw_messages:
         role = m.get("role")
-        content = m.get("content", "")
-
-        if role not in ("system", "user", "assistant"):
+        if role not in ("system", "user", "assistant", "tool"):
             continue
-
+        content = m.get("content", "") or ""
         if role == "assistant":
-            continue
-
+            content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
         result.append({"role": role, "content": content})
-
     return result
 
 
@@ -119,7 +107,7 @@ def call_ollama_with_tools(model, messages):
         "model": model,
         "messages": messages,
         "tools": TOOLS,
-        "stream": True,
+        "stream": False,
     }
 
     with requests.post(f"{OLLAMA_API}/api/chat",
@@ -166,15 +154,40 @@ def tags():
 @app.post("/api/chat")
 def chat():
     payload = request.get_json(force=True, silent=False)
-
     model = payload.get("model") or "qwen3:4b"
     messages = payload.get("messages") or []
-
     messages = ensure_system_prompt(messages)
 
     started = time.time()
     try:
-        resp = call_ollama_with_tools(model, messages)
+        MAX_TOOL_ROUNDS = 5
+        for _ in range(MAX_TOOL_ROUNDS):
+            resp = call_ollama_with_tools(model, messages)
+            msg = resp.get("message") or {}
+            tool_calls = msg.get("tool_calls") or []
+
+            if not tool_calls:
+                break
+
+            # Добавляем ответ модели с tool_calls в историю
+            messages.append({"role": "assistant", "content": msg.get("content") or "", "tool_calls": tool_calls})
+
+            # Исполняем каждый инструмент
+            for tc in tool_calls:
+                fn = tc.get("function") or {}
+                tool_name = fn.get("name")
+                tool_args = fn.get("arguments") or {}
+                if isinstance(tool_args, str):
+                    tool_args = json.loads(tool_args)
+                try:
+                    tool_result = call_tool(tool_name, tool_args)
+                except Exception as e:
+                    tool_result = {"error": str(e)}
+                messages.append({
+                    "role": "tool",
+                    "content": json.dumps(tool_result, ensure_ascii=False),
+                })
+
     except ReadTimeout:
         return jsonify({"error": "ollama timeout"}), 504
     except Exception as e:
@@ -188,7 +201,6 @@ def chat():
         answer = "[пустой ответ]"
 
     total_sec = resp.get("total_duration", 0) / 1e9 if resp.get("total_duration") else (time.time() - started)
-    eval_count = resp.get("eval_count")
 
     return jsonify({
         "model": model,
@@ -196,10 +208,11 @@ def chat():
         "raw": resp,
         "meta": {
             "total_sec": total_sec,
-            "eval_count": eval_count,
+            "eval_count": resp.get("eval_count"),
         }
     })
 
 
 if __name__ == "__main__":
+    init_tools()
     app.run(host="0.0.0.0", port=5001, debug=False)
