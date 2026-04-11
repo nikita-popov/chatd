@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+
 import json
 import time
 from typing import Any, Dict, List
@@ -10,7 +11,6 @@ from flask import Flask, request, Response, jsonify, stream_with_context
 
 from mcp_client import MCPClient, MCP_MONITOR_CMD, MCP_ALERTS_CMD, MCP_NOTES_CMD
 
-# Ollama native API
 OLLAMA_API = "http://127.0.0.1:11434"
 
 SYSTEM_PROMPT = (
@@ -18,14 +18,18 @@ SYSTEM_PROMPT = (
     "Отвечай кратко, по делу, по-русски, без рассуждений и воды."
 )
 
+TOOLS: List[Dict] = []
+TOOL_REGISTRY: Dict[str, MCPClient] = {}
+
 app = Flask(__name__)
 
-# MCP clients
-mcp_monitor = MCPClient(MCP_MONITOR_CMD)
-mcp_alerts = MCPClient(MCP_ALERTS_CMD)
-mcp_notes = MCPClient(MCP_NOTES_CMD)
 
-mcp_tools_cache: List[Dict[str, Any]] = []
+def init_tools():
+    global TOOLS, TOOL_REGISTRY
+    TOOLS, TOOL_REGISTRY = load_tools()
+
+
+init_tools()
 
 
 def proxy_get(path: str) -> Response:
@@ -80,10 +84,10 @@ def load_tools():
 
 
 def call_tool(name: str, arguments: Dict[str, Any]) -> Any:
+    if name.startswith("alerts_"):
+        client = mcp_alerts
     if name.startswith("monitor_"):
         client = mcp_monitor
-    elif name.startswith("smarthome_"):
-        client = mcp_smarthome
     elif name.startswith("notes_"):
         client = mcp_notes
     else:
@@ -101,10 +105,8 @@ def build_model_messages(raw_messages):
         if role not in ("system", "user", "assistant"):
             continue
 
-        # Вырежем старые "рассуждения", если они были — например, если они размечены как-то спецом.
-        # Самый простой KISS-вариант: из прошлых assistant оставляем только последнюю или вообще убираем.
         if role == "assistant":
-            continue  # сначала попробуй вообще не слать прошлые ответы модели
+            continue
 
         result.append({"role": role, "content": content})
 
@@ -112,12 +114,11 @@ def build_model_messages(raw_messages):
 
 
 def call_ollama_with_tools(model, messages):
-    tools, _ = load_tools()
     #model_messages = build_model_messages(messages)
     payload = {
         "model": model,
         "messages": messages,
-        "tools": tools,
+        "tools": TOOLS,
         "stream": True,
     }
 
@@ -201,7 +202,4 @@ def chat():
 
 
 if __name__ == "__main__":
-    mcp_alerts.start()
-    mcp_monitor.start()
-    mcp_notes.start()
     app.run(host="0.0.0.0", port=5001, debug=False)
