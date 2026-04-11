@@ -51,7 +51,6 @@ def build_model_messages(raw_messages: List[Dict]) -> List[Dict]:
         if role == "assistant":
             content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
         entry: Dict[str, Any] = {"role": role, "content": content}
-        # Сохраняем tool_calls если они есть (нужны для истории)
         if role == "assistant" and m.get("tool_calls"):
             entry["tool_calls"] = m["tool_calls"]
         result.append(entry)
@@ -99,49 +98,6 @@ def call_tool(name: str, arguments: Dict[str, Any]) -> Any:
     return client.call_tool(name, arguments)
 
 
-# ─── ollama stream ───────────────────────────────────────────────────────────
-
-def _ollama_stream_request(messages: List[Dict]) -> requests.Response:
-    """Открывает стриминговый запрос к Ollama. Возвращает Response объект."""
-    payload = {
-        "model": _current_model,   # см. ниже — пробрасываем через контекст
-        "messages": build_model_messages(messages),
-        "tools": TOOLS,
-        "stream": True,
-    }
-    return requests.post(
-        f"{OLLAMA_API}/api/chat",
-        json=payload,
-        timeout=300,
-        stream=True,
-    )
-
-
-def _collect_stream(
-    r: requests.Response,
-) -> tuple[str, Optional[List[Dict]], Dict]:
-    """
-    Читает NDJSON-стрим от Ollama.
-    Возвращает (accumulated_content, tool_calls_or_None, final_chunk).
-    """
-    content_acc = ""
-    tool_calls = None
-    final_chunk = {}
-
-    for line in r.iter_lines():
-        if not line:
-            continue
-        chunk = json.loads(line.decode("utf-8"))
-        final_chunk = chunk
-        msg = chunk.get("message") or {}
-        delta = msg.get("content") or ""
-        content_acc += delta
-        if msg.get("tool_calls"):
-            tool_calls = msg["tool_calls"]
-
-    return content_acc, tool_calls, final_chunk
-
-
 # ─── routes ─────────────────────────────────────────────────────────────────
 
 @app.get("/health")
@@ -156,30 +112,28 @@ def tags():
     return proxy_get("/api/tags")
 
 
-# Глобальная переменная модели — прокидывается из chat() в генератор
-# (thread-local не нужен — у нас один worker, но можно заменить на threading.local)
-_current_model = "qwen3:4b"
-
-
-def chat_stream_generator(model: str, messages: List[Dict]) -> Generator[bytes, None, None]:
+def chat_stream_generator(
+    model: str,
+    messages: List[Dict],
+    options: Optional[Dict] = None,
+) -> Generator[bytes, None, None]:
     """
     Генератор, который:
     1. Стримит ответ Ollama напрямую клиенту
     2. При tool_calls — паузует стрим, исполняет инструменты, продолжает
     Клиент видит один непрерывный NDJSON-стрим.
     """
-    global _current_model
-    _current_model = model
-
     MAX_TOOL_ROUNDS = 5
 
-    for round_num in range(MAX_TOOL_ROUNDS):
-        payload = {
+    for _round in range(MAX_TOOL_ROUNDS):
+        payload: Dict[str, Any] = {
             "model": model,
             "messages": build_model_messages(messages),
             "tools": TOOLS,
             "stream": True,
         }
+        if options:
+            payload["options"] = options
 
         with requests.post(
             f"{OLLAMA_API}/api/chat",
@@ -190,111 +144,107 @@ def chat_stream_generator(model: str, messages: List[Dict]) -> Generator[bytes, 
             r.raise_for_status()
 
             content_acc = ""
-            tool_calls = None
-            final_chunk = {}
-            is_last_round = False
+            last_tool_calls: Optional[List[Dict]] = None  # только из финального чанка
 
             for line in r.iter_lines():
                 if not line:
                     continue
 
                 chunk = json.loads(line.decode("utf-8"))
-                final_chunk = chunk
                 msg = chunk.get("message") or {}
-
-                # Собираем tool_calls (не стримим их клиенту — нет смысла)
-                if msg.get("tool_calls"):
-                    tool_calls = msg["tool_calls"]
-
+                done = chunk.get("done", False)
                 delta = msg.get("content") or ""
                 content_acc += delta
-                done = chunk.get("done", False)
 
-                if tool_calls and done:
-                    # Не отдаём финальный done-чанк клиенту сейчас —
-                    # будет ещё один раунд
-                    break
-
-                if not tool_calls:
-                    # Обычный чанк — пробрасываем клиенту как есть
-                    yield line + b"\n"
+                tc = msg.get("tool_calls")
+                if tc:
+                    last_tool_calls = tc  # запомнили, но НЕ прерываем стрим
 
                 if done:
-                    is_last_round = True
+                    if last_tool_calls:
+                        # Будет следующий раунд — не отдаём финальный done
+                        break
+                    else:
+                        # Финальный done без tool_calls — отдаём клиенту
+                        yield line + b"\n"
                     break
 
-            if is_last_round or not tool_calls:
-                # Финальный раунд — больше нечего делать
-                break
+                if not tc:
+                    # Обычный контентный чанк — сразу клиенту
+                    yield line + b"\n"
 
-            # ── tool execution ───────────────────────────────────────────
-            # Добавляем assistant-сообщение с tool_calls в историю
+        if not last_tool_calls:
+            break
+
+        # ── tool execution ───────────────────────────────────────────────
+        messages.append({
+            "role": "assistant",
+            "content": content_acc,
+            "tool_calls": last_tool_calls,
+        })
+
+        for tc in last_tool_calls:
+            fn = tc.get("function") or {}
+            tool_name = fn.get("name")
+            tool_args = fn.get("arguments") or {}
+            if isinstance(tool_args, str):
+                try:
+                    tool_args = json.loads(tool_args)
+                except json.JSONDecodeError:
+                    tool_args = {}
+
+            thinking_chunk = {
+                "model": model,
+                "message": {
+                    "role": "assistant",
+                    "content": f"\n[tool: {tool_name}]\n",
+                },
+                "done": False,
+            }
+            yield (json.dumps(thinking_chunk, ensure_ascii=False) + "\n").encode("utf-8")
+
+            try:
+                tool_result = call_tool(tool_name, tool_args)
+            except Exception as e:
+                tool_result = {"error": str(e)}
+
             messages.append({
-                "role": "assistant",
-                "content": content_acc,
-                "tool_calls": tool_calls,
+                "role": "tool",
+                "content": json.dumps(tool_result, ensure_ascii=False),
             })
 
-            # Исполняем инструменты и добавляем результаты
-            for tc in tool_calls:
-                fn = tc.get("function") or {}
-                tool_name = fn.get("name")
-                tool_args = fn.get("arguments") or {}
-                if isinstance(tool_args, str):
-                    try:
-                        tool_args = json.loads(tool_args)
-                    except json.JSONDecodeError:
-                        tool_args = {}
-
-                # Отправляем клиенту "thinking" чанк — пусть видит что идёт работа
-                thinking_chunk = {
-                    "model": model,
-                    "message": {
-                        "role": "assistant",
-                        "content": f"\n[tool: {tool_name}]\n",
-                    },
-                    "done": False,
-                }
-                yield (json.dumps(thinking_chunk, ensure_ascii=False) + "\n").encode("utf-8")
-
-                try:
-                    tool_result = call_tool(tool_name, tool_args)
-                except Exception as e:
-                    tool_result = {"error": str(e)}
-
-                messages.append({
-                    "role": "tool",
-                    "content": json.dumps(tool_result, ensure_ascii=False),
-                })
-
-            tool_calls = None  # сброс для следующего раунда
+        last_tool_calls = None
 
 
 @app.post("/chat")
 @app.post("/api/chat")
 def chat():
-    payload = request.get_json(force=True, silent=False)
-    model = payload.get("model") or "qwen3:4b"
-    messages = payload.get("messages") or []
+    original_payload = request.get_json(force=True, silent=False)
+    model    = original_payload.get("model") or "qwen3:4b"
+    messages = original_payload.get("messages") or []
+    options  = original_payload.get("options") or {}
     messages = ensure_system_prompt(messages)
 
-    # ollama-gui всегда шлёт stream=true, но на всякий случай читаем флаг
-    want_stream = payload.get("stream", True)
+    want_stream = original_payload.get("stream", True)
 
     if not want_stream:
         # Не-стриминговый путь — для тестирования через curl
         try:
             MAX_TOOL_ROUNDS = 5
-            resp = {}
+            resp: Dict = {}
             for _ in range(MAX_TOOL_ROUNDS):
+                ollama_payload: Dict[str, Any] = {
+                    "model": model,
+                    "messages": build_model_messages(messages),
+                    "tools": TOOLS,
+                    "stream": False,
+                }
+                if options:
+                    ollama_payload["options"] = options
+
                 r = requests.post(
                     f"{OLLAMA_API}/api/chat",
-                    json={
-                        "model": model,
-                        "messages": build_model_messages(messages),
-                        "tools": TOOLS,
-                        "stream": False,
-                    },
+                    json=ollama_payload,
                     timeout=300,
                 )
                 r.raise_for_status()
@@ -305,7 +255,11 @@ def chat():
                 if not tool_calls:
                     break
 
-                messages.append({"role": "assistant", "content": msg.get("content") or "", "tool_calls": tool_calls})
+                messages.append({
+                    "role": "assistant",
+                    "content": msg.get("content") or "",
+                    "tool_calls": tool_calls,
+                })
 
                 for tc in tool_calls:
                     fn = tc.get("function") or {}
@@ -334,8 +288,13 @@ def chat():
 
     # Стриминговый путь — основной
     return Response(
-        stream_with_context(chat_stream_generator(model, messages)),
+        stream_with_context(chat_stream_generator(model, messages, options or None)),
         content_type="application/x-ndjson",
+        headers={
+            "X-Accel-Buffering": "no",
+            "Cache-Control": "no-cache",
+            "Transfer-Encoding": "chunked",
+        },
     )
 
 
