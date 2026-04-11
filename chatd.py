@@ -26,7 +26,7 @@ app = Flask(__name__)
 
 
 def proxy_get(path: str) -> Response:
-    r = requests.get(f"{OLLAMA_API}{path}", timeout=60)
+    r = requests.get(f"{OLLAMA_API}{path}", timeout=3000)
     return Response(
         r.content,
         status=r.status_code,
@@ -113,7 +113,7 @@ def call_ollama_with_tools(model, messages):
 
     with requests.post(f"{OLLAMA_API}/api/chat",
                        json=payload,
-                       timeout=300,
+                       timeout=3000,
                        stream=is_stream) as r:
         r.raise_for_status()
 
