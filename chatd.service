@@ -6,12 +6,14 @@ After=network.target
 Type=simple
 User=chatd
 WorkingDirectory=/opt/chatd
+Environment="MEMPALACE_PALACE_PATH=/var/lib/mempalace"
 ExecStart=/opt/chatd/venv/bin/gunicorn \
     --bind 0.0.0.0:5001 \
     --worker-class gevent \
     --workers 1 \
-    --timeout 360 \
-    --keep-alive 5 \
+    --timeout 0 \
+    --keep-alive 75 \
+    --graceful-timeout 60 \
     chatd:app
 Restart=on-failure
 NoNewPrivileges=yes
