@@ -246,23 +246,24 @@ def chat_stream_generator(
                                  req_id, [c.get("function", {}).get("name") for c in tc])
                         last_tool_calls = tc
 
-                    # keepalive во время think-фазы: шлём валидный NDJSON-чанк
-                    # с пустым content, чтобы парсер фронта не падал на голом \n.
-                    if last_tool_calls and chunk_count % 5 == 0:
-                        yield make_chunk(model, "")
-
                     if done:
                         log.info("[%s] round %d done, chunks=%d, tool_calls=%s, content_len=%d",
                                  req_id, round_num, chunk_count,
                                  bool(last_tool_calls), len(content_acc))
                         if last_tool_calls:
-                            # перед переходом к следующему раунду не шлём done=True
+                            # Не отдаём финальный done-чанк: фронт решит,
+                            # что стрим закончен, а мы ещё будем писать после tool call.
                             break
                         else:
                             yield line + b"\n"
                         break
 
-                    if not tc:
+                    # Прокидываем все чанки на фронт — thinking, content, пустые.
+                    # Исключение: чанк с tool_calls — фронт его не понимает, заменяем
+                    # на пустой чанк чтобы не сломать парсер.
+                    if tc:
+                        yield make_chunk(model, "")
+                    else:
                         yield line + b"\n"
 
             if not last_tool_calls:
