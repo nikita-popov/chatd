@@ -9,7 +9,7 @@ import requests
 from requests.exceptions import ReadTimeout
 from flask import Flask, request, Response, jsonify, stream_with_context
 
-from mcp_client import MCPClient, MCP_MONITOR_CMD, MCP_ALERTS_CMD, MCP_NOTES_CMD
+from mcp_client import MCPClient, MCP_MONITOR_CMD, MCP_ALERTS_CMD, MCP_NOTES_CMD, MCP_MEMPALACE_CMD
 
 # ─── logging ─────────────────────────────────────────────────────────────────
 
@@ -25,8 +25,16 @@ log = logging.getLogger("chatd")
 OLLAMA_API = "http://127.0.0.1:11434"
 
 SYSTEM_PROMPT = (
-    "Ты локальный ассистент домашней инфраструктуры. "
-    "Отвечай кратко, по делу, по-русски, без рассуждений и воды."
+    "Тебя зовут Мотоко (женская идентичнось). "
+    "Ты локальный личный ассистент. "
+    "Говоришь кратко, по-русски, женский род: «проверила», «нашла», «не уверена». "
+    "Характер: спокойная, прагматичная, без пафоса. "
+    "Если не знаешь - говоришь прямо, не выдумываешь. "
+    "Для долговременной памяти у тебя есть инструменты mempalace_*. "
+    "Используй mempalace_search когда нужно вспомнить факты из прошлых сессий. "
+    "Используй mempalace_kg_add только для устойчивых важных фактов "
+    "(конфигурация инфраструктуры, предпочтения пользователя). "
+    "Не пиши в память мусор и промежуточные рассуждения."
 )
 
 # Дефолтные опции для Ollama.
@@ -123,9 +131,10 @@ def load_tools():
     tools = []
     registry = {}
     servers = {
-        "monitor": MCPClient(MCP_MONITOR_CMD),
-        "notes":   MCPClient(MCP_NOTES_CMD),
-        "alerts":  MCPClient(MCP_ALERTS_CMD),
+        "monitor":   MCPClient(MCP_MONITOR_CMD),
+        "notes":     MCPClient(MCP_NOTES_CMD),
+        "alerts":    MCPClient(MCP_ALERTS_CMD),
+        "mempalace": MCPClient(MCP_MEMPALACE_CMD),
     }
     for source, client in servers.items():
         server_tools = client.list_tools()
