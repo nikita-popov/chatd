@@ -2,6 +2,7 @@ import json
 import logging
 import re
 import traceback
+from datetime import datetime, timezone
 from typing import Any, Dict, Generator, List, Optional
 
 import requests
@@ -28,11 +29,11 @@ SYSTEM_PROMPT = (
     "Отвечай кратко, по делу, по-русски, без рассуждений и воды."
 )
 
-# Дефолтные опции для Ollama: ограничиваем think-токены и ответ.
+# Дефолтные опции для Ollama.
 # Клиент может переопределить через поле options в POST /api/chat.
 DEFAULT_OPTIONS: Dict[str, Any] = {
-    "num_predict": 2048,   # макс ответ (think + response)
-    "num_ctx":     8192,   # контекст окно
+    "num_predict": 2048,
+    "num_ctx":     8192,
 }
 
 TOOLS: List[Dict] = []
@@ -42,6 +43,23 @@ app = Flask(__name__)
 
 
 # ─── helpers ────────────────────────────────────────────────────────────────
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f") + "000Z"
+
+
+def make_chunk(model: str, content: str, done: bool = False) -> bytes:
+    """Build an Ollama-compatible NDJSON chunk with created_at."""
+    obj: Dict[str, Any] = {
+        "model": model,
+        "created_at": now_iso(),
+        "message": {"role": "assistant", "content": content},
+        "done": done,
+    }
+    if done:
+        obj["done_reason"] = "stop"
+    return (json.dumps(obj, ensure_ascii=False) + "\n").encode("utf-8")
+
 
 def proxy_get(path: str) -> Response:
     r = requests.get(f"{OLLAMA_API}{path}", timeout=60)
@@ -53,7 +71,6 @@ def proxy_get(path: str) -> Response:
 
 
 def merge_options(client_options: Optional[Dict]) -> Dict[str, Any]:
-    """Merge client options over defaults. Client values take precedence."""
     opts = dict(DEFAULT_OPTIONS)
     if client_options:
         opts.update(client_options)
@@ -199,12 +216,7 @@ def chat_stream_generator(
                 r.raise_for_status()
             except Exception as e:
                 log.error("[%s] Ollama request failed: %s", req_id, e)
-                err_chunk = json.dumps({
-                    "model": model,
-                    "message": {"role": "assistant", "content": f"\n[error: {e}]\n"},
-                    "done": True,
-                }, ensure_ascii=False)
-                yield (err_chunk + "\n").encode("utf-8")
+                yield make_chunk(model, f"\n[error: {e}]\n", done=True)
                 return
 
             content_acc = ""
@@ -234,18 +246,17 @@ def chat_stream_generator(
                                  req_id, [c.get("function", {}).get("name") for c in tc])
                         last_tool_calls = tc
 
-                    # keepalive: при наличии tool_calls контент не стримим,
-                    # но раз в 5 чанков шлём пустую строку чтобы nginx/браузер
-                    # не посчитали соединение зависшим.
+                    # keepalive во время think-фазы: шлём валидный NDJSON-чанк
+                    # с пустым content, чтобы парсер фронта не падал на голом \n.
                     if last_tool_calls and chunk_count % 5 == 0:
-                        yield b"\n"
+                        yield make_chunk(model, "")
 
                     if done:
                         log.info("[%s] round %d done, chunks=%d, tool_calls=%s, content_len=%d",
                                  req_id, round_num, chunk_count,
                                  bool(last_tool_calls), len(content_acc))
                         if last_tool_calls:
-                            yield b"\n"
+                            # перед переходом к следующему раунду не шлём done=True
                             break
                         else:
                             yield line + b"\n"
@@ -267,15 +278,7 @@ def chat_stream_generator(
                 if repeat_count >= 2:
                     log.warning("[%s] tool loop detected (%s x%d), aborting",
                                 req_id, current_tool_names, repeat_count)
-                    err_chunk = json.dumps({
-                        "model": model,
-                        "message": {
-                            "role": "assistant",
-                            "content": "\n[ошибка: цикл инструментов, остановлено]\n",
-                        },
-                        "done": True,
-                    }, ensure_ascii=False)
-                    yield (err_chunk + "\n").encode("utf-8")
+                    yield make_chunk(model, "\n[ошибка: цикл инструментов, остановлено]\n", done=True)
                     return
             else:
                 repeat_count = 0
@@ -301,15 +304,8 @@ def chat_stream_generator(
 
                 log.info("[%s] executing tool: %s(%s)", req_id, tool_name, tool_args)
 
-                thinking_chunk = json.dumps({
-                    "model": model,
-                    "message": {
-                        "role": "assistant",
-                        "content": f"\n[→ {tool_name}]\n",
-                    },
-                    "done": False,
-                }, ensure_ascii=False)
-                yield (thinking_chunk + "\n").encode("utf-8")
+                # Уведомляем фронт о вызове инструмента — полный Ollama-формат чанка
+                yield make_chunk(model, f"\n[→ {tool_name}]\n")
 
                 try:
                     tool_result = call_tool(tool_name, tool_args)
@@ -326,12 +322,7 @@ def chat_stream_generator(
 
     except Exception as e:
         log.error("[%s] unhandled exception in generator: %s", req_id, traceback.format_exc())
-        err_chunk = json.dumps({
-            "model": model,
-            "message": {"role": "assistant", "content": f"\n[internal error: {e}]\n"},
-            "done": True,
-        }, ensure_ascii=False)
-        yield (err_chunk + "\n").encode("utf-8")
+        yield make_chunk(model, f"\n[internal error: {e}]\n", done=True)
 
 
 @app.post("/chat")
