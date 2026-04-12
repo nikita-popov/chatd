@@ -52,8 +52,6 @@ MEMPALACE_ALLOWED_TOOLS = {
     "mempalace_status",
 }
 
-KEEPALIVE_EVERY_N_CHUNKS = 5
-
 TOOLS: List[Dict] = []
 TOOL_REGISTRY: Dict[str, MCPClient] = {}
 
@@ -79,7 +77,12 @@ def make_chunk(model: str, content: str, done: bool = False) -> bytes:
 
 
 def make_keepalive(model: str) -> bytes:
-    """Empty content chunk to keep connection alive during long thinking/tool phases."""
+    """Empty content chunk.
+
+    Only used between tool rounds (after tool execution, before the next
+    Ollama request). Never injected into the token stream itself to avoid
+    corrupting token boundaries seen by the frontend.
+    """
     return make_chunk(model, "")
 
 
@@ -198,26 +201,22 @@ def call_tool(name: str, arguments: Dict[str, Any]) -> Any:
 class ThinkingRemapper:
     """
     Converts Ollama's message.thinking stream into <think>...</think> in
-    message.content so that frontends that only read content get thinking too.
-
-    Ollama streams thinking tokens in msg.thinking and content tokens in
-    msg.content as separate fields in the same chunk. We remap thinking
-    into content wrapped in <think>...</think> tags.
+    message.content so frontends that only read content still receive thinking.
 
     State machine:
       idle     - no thinking seen yet
       thinking - inside a thinking block, <think> already emitted
       closed   - </think> emitted, back to normal content
 
-    Also tracks thinking_acc and content_acc so the caller can build
-    a complete assistant message for the conversation history.
+    thinking_acc: raw thinking text (no tags), for logging/debugging.
+    content_acc:  only the real response text, used for conversation history.
     """
 
     def __init__(self, model: str):
         self.model = model
         self._state: str = "idle"
-        self.thinking_acc: str = ""  # accumulated raw thinking (no tags)
-        self.content_acc: str = ""   # accumulated final content (no thinking)
+        self.thinking_acc: str = ""
+        self.content_acc: str = ""
 
     def feed(self, line: bytes) -> bytes:
         """Process one NDJSON line. Returns the (possibly rewritten) line."""
@@ -226,19 +225,16 @@ class ThinkingRemapper:
         except (json.JSONDecodeError, UnicodeDecodeError):
             return line
 
-        msg = chunk.get("message") or {}
+        msg      = chunk.get("message") or {}
         thinking = msg.get("thinking") or ""
         content  = msg.get("content")  or ""
 
-        # Accumulate for caller
         self.thinking_acc += thinking
         self.content_acc  += content
 
         if not thinking and self._state == "idle":
-            # Pure content, no thinking involved — pass through unchanged
             return line
 
-        # Remove thinking field from the outgoing chunk
         if "thinking" in msg:
             del msg["thinking"]
 
@@ -249,12 +245,9 @@ class ThinkingRemapper:
             else:
                 msg["content"] = thinking
         else:
-            # No thinking in this chunk
             if self._state == "thinking":
-                # Thinking just ended — close the tag, then emit content
                 self._state = "closed"
                 msg["content"] = "</think>" + content
-            # state == "closed": normal content, leave msg["content"] as-is
 
         chunk["message"] = msg
         return (json.dumps(chunk, ensure_ascii=False) + "\n").encode("utf-8")
@@ -355,18 +348,13 @@ def chat_stream_generator(
                             yield remapper.feed(line)
                         break
 
-                    # Always run remapper so accumulators stay correct.
-                    # For tc chunks the remapped output is a keepalive (content is
-                    # typically empty anyway), but we still need remapper to track state.
+                    # Always run remapper to keep accumulators correct.
                     out = remapper.feed(line)
-                    if tc:
-                        # Don't forward tool_call chunks to the frontend;
-                        # send a keepalive instead so the connection stays alive.
-                        yield make_keepalive(model)
-                    else:
+                    if not tc:
+                        # Forward token to frontend as-is (no keepalives inside
+                        # the token stream — they corrupt token boundaries).
                         yield out
-                        if chunk_count % KEEPALIVE_EVERY_N_CHUNKS == 0:
-                            yield make_keepalive(model)
+                    # tc chunks are silently consumed; tool execution happens below.
 
             if not last_tool_calls:
                 log.info("[%s] stream complete, no more tool rounds", req_id)
@@ -388,8 +376,6 @@ def chat_stream_generator(
             prev_tool_names = current_tool_names
 
             # ── tool execution ────────────────────────────────────────────
-            # Use remapper.content_acc for the history entry — it contains only
-            # the real response text, never thinking tokens.
             messages.append({
                 "role": "assistant",
                 "content": remapper.content_acc,
@@ -408,6 +394,8 @@ def chat_stream_generator(
                         tool_args = {}
 
                 log.info("[%s] executing tool: %s(%s)", req_id, tool_name, tool_args)
+                # Announce the tool call to the frontend with real content
+                # (this is a meaningful chunk, not a keepalive).
                 yield make_chunk(model, f"\n[→ {tool_name}]\n")
 
                 try:
@@ -421,7 +409,10 @@ def chat_stream_generator(
                     "content": json.dumps(tool_result, ensure_ascii=False),
                 })
 
-                yield make_keepalive(model)
+            # Single keepalive after all tools executed, before next Ollama round.
+            # At this point the token stream is paused legitimately, so an empty
+            # chunk is safe and keeps nginx/browser from closing the connection.
+            yield make_keepalive(model)
 
             last_tool_calls = None
 
