@@ -61,31 +61,6 @@ def make_chunk(model: str, content: str, done: bool = False) -> bytes:
     return (json.dumps(obj, ensure_ascii=False) + "\n").encode("utf-8")
 
 
-def remap_thinking(line: bytes) -> bytes:
-    """
-    Ollama thinking models stream thinking tokens in message.thinking.
-    ollama-gui only reads message.content, so we move thinking into
-    content wrapped in <think>...</think> tags.
-
-    Pure content chunks and done chunks pass through unchanged.
-    """
-    try:
-        chunk = json.loads(line.decode("utf-8"))
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        return line
-
-    msg = chunk.get("message") or {}
-    thinking = msg.get("thinking") or ""
-    if not thinking:
-        return line
-
-    # Replace thinking field with <think>...</think> in content
-    msg["content"] = f"<think>{thinking}</think>"
-    del msg["thinking"]
-    chunk["message"] = msg
-    return (json.dumps(chunk, ensure_ascii=False) + "\n").encode("utf-8")
-
-
 def proxy_get(path: str) -> Response:
     r = requests.get(f"{OLLAMA_API}{path}", timeout=60)
     return Response(
@@ -192,6 +167,69 @@ def call_tool(name: str, arguments: Dict[str, Any]) -> Any:
     return result
 
 
+# ─── ThinkingRemapper ──────────────────────────────────────────────────────────
+
+class ThinkingRemapper:
+    """
+    Converts Ollama's message.thinking stream into <think>...</think> in
+    message.content so that frontends that only read content get thinking too.
+
+    State machine:
+      idle       - no thinking seen yet
+      thinking   - inside a thinking block, <think> already emitted
+      closed     - </think> emitted, back to normal content
+    """
+
+    def __init__(self, model: str):
+        self.model = model
+        self._state: str = "idle"  # idle | thinking | closed
+
+    def feed(self, line: bytes) -> bytes:
+        """Process one NDJSON line. Returns the (possibly rewritten) line."""
+        try:
+            chunk = json.loads(line.decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return line
+
+        msg = chunk.get("message") or {}
+        thinking = msg.get("thinking") or ""
+        content  = msg.get("content")  or ""
+
+        if not thinking and self._state == "idle":
+            # Pure content, no thinking involved — pass through unchanged
+            return line
+
+        # Remove the thinking field from the outgoing chunk
+        if "thinking" in msg:
+            del msg["thinking"]
+
+        if thinking:
+            if self._state == "idle":
+                # First thinking token — open the tag
+                self._state = "thinking"
+                msg["content"] = "<think>" + thinking
+            else:
+                # Continuation of thinking block
+                msg["content"] = thinking
+        else:
+            # No thinking in this chunk
+            if self._state == "thinking":
+                # Thinking just ended — close the tag before content
+                self._state = "closed"
+                msg["content"] = "</think>" + content
+            # state == "closed": normal content, pass through
+
+        chunk["message"] = msg
+        return (json.dumps(chunk, ensure_ascii=False) + "\n").encode("utf-8")
+
+    def close(self) -> Optional[bytes]:
+        """If stream ends while still in thinking state, emit closing tag."""
+        if self._state == "thinking":
+            self._state = "closed"
+            return make_chunk(self.model, "</think>")
+        return None
+
+
 # ─── routes ─────────────────────────────────────────────────────────────────
 
 @app.get("/health")
@@ -247,6 +285,7 @@ def chat_stream_generator(
             content_acc = ""
             last_tool_calls: Optional[List[Dict]] = None
             chunk_count = 0
+            remapper = ThinkingRemapper(model)
 
             with r:
                 for line in r.iter_lines():
@@ -276,17 +315,21 @@ def chat_stream_generator(
                                  req_id, round_num, chunk_count,
                                  bool(last_tool_calls), len(content_acc))
                         if last_tool_calls:
+                            closing = remapper.close()
+                            if closing:
+                                yield closing
                             break
                         else:
-                            yield remap_thinking(line)
+                            closing = remapper.close()
+                            if closing:
+                                yield closing
+                            yield remapper.feed(line)
                         break
 
                     if tc:
-                        # tool_calls чанк фронт не понимает — заменяем пустым
                         yield make_chunk(model, "")
                     else:
-                        # thinking → <think>...</think>, остальное проходит как есть
-                        yield remap_thinking(line)
+                        yield remapper.feed(line)
 
             if not last_tool_calls:
                 log.info("[%s] stream complete, no more tool rounds", req_id)
