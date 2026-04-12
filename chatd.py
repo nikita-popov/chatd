@@ -44,6 +44,17 @@ DEFAULT_OPTIONS: Dict[str, Any] = {
     "num_ctx":     8192,
 }
 
+# Whitelist tools из mempalace, доступных модели.
+# Остальные 14+ инструментов (traverse, diary, graph_stats и т.д.) исключаются,
+# чтобы не перегружать контекст маленьких моделей.
+MEMPALACE_ALLOWED_TOOLS = {
+    "mempalace_search",
+    "mempalace_add_drawer",
+    "mempalace_kg_add",
+    "mempalace_kg_query",
+    "mempalace_status",
+}
+
 TOOLS: List[Dict] = []
 TOOL_REGISTRY: Dict[str, MCPClient] = {}
 
@@ -146,6 +157,12 @@ def load_tools():
             if not name or not input_schema:
                 log.warning("[tools] %s: skipping tool without name or schema: %r", source, t)
                 continue
+            # Фильтруем mempalace: в реестр попадают все (для вызова),
+            # но в список для модели — только из whitelist.
+            registry[name] = client
+            if source == "mempalace" and name not in MEMPALACE_ALLOWED_TOOLS:
+                log.debug("[tools] mempalace: skipping from model context: %s", name)
+                continue
             tools.append({
                 "type": "function",
                 "function": {
@@ -154,7 +171,6 @@ def load_tools():
                     "parameters": input_schema,
                 },
             })
-            registry[name] = client
             log.debug("[tools] registered: %s", name)
     return tools, registry
 
