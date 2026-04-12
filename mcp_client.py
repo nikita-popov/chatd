@@ -10,11 +10,7 @@ from mcp.client.stdio import stdio_client
 MCP_ALERTS_CMD = ["/opt/chatd/venv/bin/python", "/opt/chatd/mcp-alerts.py"]
 MCP_MONITOR_CMD = ["/opt/chatd/venv/bin/python", "/opt/chatd/mcp-monitor.py"]
 MCP_NOTES_CMD = ["/opt/chatd/venv/bin/python", "/opt/chatd/mcp-notes.py"]
-MCP_MEMPALACE_CMD = [
-    "/opt/chatd/venv/bin/python",
-    "-m", "mempalace.mcp_server",
-    "--config", "/opt/chatd/mempalace.yaml",
-]
+MCP_MEMPALACE_CMD = ["/opt/chatd/venv/bin/python", "-m", "mempalace.mcp_server"]
 
 
 class MCPClient:
