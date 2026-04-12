@@ -61,6 +61,31 @@ def make_chunk(model: str, content: str, done: bool = False) -> bytes:
     return (json.dumps(obj, ensure_ascii=False) + "\n").encode("utf-8")
 
 
+def remap_thinking(line: bytes) -> bytes:
+    """
+    Ollama thinking models stream thinking tokens in message.thinking.
+    ollama-gui only reads message.content, so we move thinking into
+    content wrapped in <think>...</think> tags.
+
+    Pure content chunks and done chunks pass through unchanged.
+    """
+    try:
+        chunk = json.loads(line.decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return line
+
+    msg = chunk.get("message") or {}
+    thinking = msg.get("thinking") or ""
+    if not thinking:
+        return line
+
+    # Replace thinking field with <think>...</think> in content
+    msg["content"] = f"<think>{thinking}</think>"
+    del msg["thinking"]
+    chunk["message"] = msg
+    return (json.dumps(chunk, ensure_ascii=False) + "\n").encode("utf-8")
+
+
 def proxy_get(path: str) -> Response:
     r = requests.get(f"{OLLAMA_API}{path}", timeout=60)
     return Response(
@@ -251,20 +276,17 @@ def chat_stream_generator(
                                  req_id, round_num, chunk_count,
                                  bool(last_tool_calls), len(content_acc))
                         if last_tool_calls:
-                            # Не отдаём финальный done-чанк: фронт решит,
-                            # что стрим закончен, а мы ещё будем писать после tool call.
                             break
                         else:
-                            yield line + b"\n"
+                            yield remap_thinking(line)
                         break
 
-                    # Прокидываем все чанки на фронт — thinking, content, пустые.
-                    # Исключение: чанк с tool_calls — фронт его не понимает, заменяем
-                    # на пустой чанк чтобы не сломать парсер.
                     if tc:
+                        # tool_calls чанк фронт не понимает — заменяем пустым
                         yield make_chunk(model, "")
                     else:
-                        yield line + b"\n"
+                        # thinking → <think>...</think>, остальное проходит как есть
+                        yield remap_thinking(line)
 
             if not last_tool_calls:
                 log.info("[%s] stream complete, no more tool rounds", req_id)
@@ -304,8 +326,6 @@ def chat_stream_generator(
                         tool_args = {}
 
                 log.info("[%s] executing tool: %s(%s)", req_id, tool_name, tool_args)
-
-                # Уведомляем фронт о вызове инструмента — полный Ollama-формат чанка
                 yield make_chunk(model, f"\n[→ {tool_name}]\n")
 
                 try:
