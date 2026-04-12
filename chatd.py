@@ -57,6 +57,10 @@ MEMPALACE_ALLOWED_TOOLS = {
     "mempalace_status",
 }
 
+# Кеепалайв каждые N чанков во время thinking/tool_calls,
+# чтобы nginx/браузер не обрывал соединение по таймауту.
+KEEPALIVE_EVERY_N_CHUNKS = 5
+
 TOOLS: List[Dict] = []
 TOOL_REGISTRY: Dict[str, MCPClient] = {}
 
@@ -80,6 +84,17 @@ def make_chunk(model: str, content: str, done: bool = False) -> bytes:
     if done:
         obj["done_reason"] = "stop"
     return (json.dumps(obj, ensure_ascii=False) + "\n").encode("utf-8")
+
+
+def make_keepalive(model: str) -> bytes:
+    """Empty content chunk to keep the connection alive.
+
+    Sent periodically during long thinking/tool_call phases so that
+    nginx and browsers don't close the connection due to idle timeout.
+    The chunk carries done=false and empty content, which frontends
+    that follow the Ollama streaming protocol safely ignore.
+    """
+    return make_chunk(model, "")
 
 
 def proxy_get(path: str) -> Response:
@@ -354,9 +369,17 @@ def chat_stream_generator(
                         break
 
                     if tc:
-                        yield make_chunk(model, "")
+                        # tool_calls chunk: yield keepalive so connection stays alive
+                        yield make_keepalive(model)
                     else:
-                        yield remapper.feed(line)
+                        out = remapper.feed(line)
+                        yield out
+                        # Periodic keepalive during long thinking phases:
+                        # every KEEPALIVE_EVERY_N_CHUNKS emit an extra empty chunk.
+                        # remapper.feed() already yielded the real content above,
+                        # so the extra chunk just resets the nginx idle timer.
+                        if chunk_count % KEEPALIVE_EVERY_N_CHUNKS == 0:
+                            yield make_keepalive(model)
 
             if not last_tool_calls:
                 log.info("[%s] stream complete, no more tool rounds", req_id)
@@ -408,6 +431,9 @@ def chat_stream_generator(
                     "role": "tool",
                     "content": json.dumps(tool_result, ensure_ascii=False),
                 })
+
+                # Keepalive after tool call: next Ollama round may take a while to start.
+                yield make_keepalive(model)
 
             last_tool_calls = None
 
