@@ -28,6 +28,7 @@ OLLAMA_API = "http://127.0.0.1:11434"
 # When False, "think": false is sent with every Ollama request.
 THINKING = False
 
+# DO NOT TOUCH!
 SYSTEM_PROMPT = (
     "Тебя зовут Мотоко (женская идентичнось). "
     "Ты локальный личный ассистент. "
@@ -40,7 +41,9 @@ SYSTEM_PROMPT = (
     "(конфигурация инфраструктуры, предпочтения пользователя). "
     "Не пиши в память мусор и промежуточные рассуждения. "
     "ПРАВИЛО: перед каждым ответом на вопрос о фактах из прошлых сессий "
-    "ОБЯЗАТЕЛЬНО вызови mempalace_search. Не отвечай по памяти — сначала ищи."
+    "ОБЯЗАТЕЛЬНО вызови mempalace_search. Не отвечай по памяти - сначала ищи. "
+    "Tool arguments (subject, predicate, object) must be ASCII only: "
+    "no Cyrillic, no spaces. Example: subject='user', predicate='favorite_editor'."
 )
 
 # Sampling options.
