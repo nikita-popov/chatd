@@ -24,6 +24,10 @@ log = logging.getLogger("chatd")
 
 OLLAMA_API = "http://127.0.0.1:11434"
 
+# Set to True to enable qwen3 extended thinking (<think>...</think>).
+# When False, "think": false is sent with every Ollama request.
+THINKING = False
+
 SYSTEM_PROMPT = (
     "Тебя зовут Мотоко (женская идентичнось). "
     "Ты локальный личный ассистент. "
@@ -124,6 +128,20 @@ def build_model_messages(raw_messages: List[Dict]) -> List[Dict]:
             entry["tool_calls"] = m["tool_calls"]
         result.append(entry)
     return result
+
+
+def make_ollama_payload(model: str, messages: List[Dict], options: Dict[str, Any], stream: bool) -> Dict[str, Any]:
+    """Build an Ollama /api/chat payload, respecting the global THINKING flag."""
+    payload: Dict[str, Any] = {
+        "model": model,
+        "messages": messages,
+        "tools": TOOLS,
+        "stream": stream,
+        "options": options,
+    }
+    if not THINKING:
+        payload["think"] = False
+    return payload
 
 
 # ─── CORS ───────────────────────────────────────────────────────────────────
@@ -288,16 +306,15 @@ def chat_stream_generator(
         for round_num in range(MAX_TOOL_ROUNDS):
             log.info("[%s] stream round %d, messages=%d", req_id, round_num, len(messages))
 
-            payload: Dict[str, Any] = {
-                "model": model,
-                "messages": build_model_messages(messages),
-                "tools": TOOLS,
-                "stream": True,
-                "options": options,
-            }
+            payload = make_ollama_payload(
+                model,
+                build_model_messages(messages),
+                options,
+                stream=True,
+            )
 
-            log.debug("[%s] -> Ollama payload (messages count=%d, tools=%d, options=%s)",
-                      req_id, len(payload["messages"]), len(TOOLS), options)
+            log.debug("[%s] -> Ollama payload (messages count=%d, tools=%d, options=%s, think=%s)",
+                      req_id, len(payload["messages"]), len(TOOLS), options, THINKING)
 
             try:
                 r = requests.post(
@@ -348,13 +365,9 @@ def chat_stream_generator(
                             yield remapper.feed(line)
                         break
 
-                    # Always run remapper to keep accumulators correct.
                     out = remapper.feed(line)
                     if not tc:
-                        # Forward token to frontend as-is (no keepalives inside
-                        # the token stream — they corrupt token boundaries).
                         yield out
-                    # tc chunks are silently consumed; tool execution happens below.
 
             if not last_tool_calls:
                 log.info("[%s] stream complete, no more tool rounds", req_id)
@@ -394,8 +407,6 @@ def chat_stream_generator(
                         tool_args = {}
 
                 log.info("[%s] executing tool: %s(%s)", req_id, tool_name, tool_args)
-                # Announce the tool call to the frontend with real content
-                # (this is a meaningful chunk, not a keepalive).
                 yield make_chunk(model, f"\n[→ {tool_name}]\n")
 
                 try:
@@ -409,11 +420,7 @@ def chat_stream_generator(
                     "content": json.dumps(tool_result, ensure_ascii=False),
                 })
 
-            # Single keepalive after all tools executed, before next Ollama round.
-            # At this point the token stream is paused legitimately, so an empty
-            # chunk is safe and keeps nginx/browser from closing the connection.
             yield make_keepalive(model)
-
             last_tool_calls = None
 
     except Exception as e:
@@ -450,15 +457,14 @@ def chat():
             prev_tc_names: Optional[List[str]] = None
             rep = 0
             for i in range(MAX_TOOL_ROUNDS):
-                ollama_payload: Dict[str, Any] = {
-                    "model": model,
-                    "messages": build_model_messages(messages),
-                    "tools": TOOLS,
-                    "stream": False,
-                    "options": options,
-                }
+                ollama_payload = make_ollama_payload(
+                    model,
+                    build_model_messages(messages),
+                    options,
+                    stream=False,
+                )
 
-                log.debug("[%s] non-stream round %d", req_id, i)
+                log.debug("[%s] non-stream round %d, think=%s", req_id, i, THINKING)
                 r = requests.post(
                     f"{OLLAMA_API}/api/chat",
                     json=ollama_payload,
