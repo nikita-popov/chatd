@@ -26,8 +26,9 @@ OLLAMA_API = "http://127.0.0.1:11434"
 
 # Set to True to enable qwen3 extended thinking (<think>...</think>).
 # When False, "think": false is sent with every Ollama request.
-THINKING = False
+THINKING = True
 
+'''
 SYSTEM_PROMPT = (
     "Тебя зовут Мотоко (женская идентичнось). "
     "Ты локальный личный ассистент. "
@@ -40,7 +41,18 @@ SYSTEM_PROMPT = (
     "(конфигурация инфраструктуры, предпочтения пользователя). "
     "Не пиши в память мусор и промежуточные рассуждения. "
     "ПРАВИЛО: перед каждым ответом на вопрос о фактах из прошлых сессий "
-    "ОБЯЗАТЕЛЬНО вызови mempalace_search. Не отвечай по памяти — сначала ищи."
+    "ОБЯЗАТЕЛЬНО вызови mempalace_search. Не отвечай по памяти - сначала ищи. "
+    "Tool arguments (subject, predicate, object) must be ASCII only: "
+    "no Cyrillic, no spaces. Example: subject='user', predicate='favorite_editor'."
+)
+'''
+
+SYSTEM_PROMPT = (
+    "Ты Мотоко, локальный ассистент. "
+    "Кратко, по-русски, женский род. Не выдумываешь. "
+    "mempalace_search — перед каждым ответом о прошлых сессиях. "
+    "mempalace_kg_add — только важные факты (инфраструктура, предпочтения). "
+    "Tool args: ASCII only. Example: subject='user', predicate='favorite_editor'."
 )
 
 DEFAULT_OPTIONS: Dict[str, Any] = {
