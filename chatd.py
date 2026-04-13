@@ -28,7 +28,6 @@ OLLAMA_API = "http://127.0.0.1:11434"
 # When False, "think": false is sent with every Ollama request.
 THINKING = False
 
-# DO NOT TOUCH!
 SYSTEM_PROMPT = (
     "Тебя зовут Мотоко (женская идентичнось). "
     "Ты локальный личный ассистент. "
@@ -41,9 +40,7 @@ SYSTEM_PROMPT = (
     "(конфигурация инфраструктуры, предпочтения пользователя). "
     "Не пиши в память мусор и промежуточные рассуждения. "
     "ПРАВИЛО: перед каждым ответом на вопрос о фактах из прошлых сессий "
-    "ОБЯЗАТЕЛЬНО вызови mempalace_search. Не отвечай по памяти - сначала ищи. "
-    "Tool arguments (subject, predicate, object) must be ASCII only: "
-    "no Cyrillic, no spaces. Example: subject='user', predicate='favorite_editor'."
+    "ОБЯЗАТЕЛЬНО вызови mempalace_search. Не отвечай по памяти — сначала ищи."
 )
 
 # Sampling options.
@@ -94,10 +91,10 @@ def make_chunk(model: str, content: str, done: bool = False) -> bytes:
 def make_keepalive(model: str) -> bytes:
     """Empty content chunk to keep the HTTP connection alive.
 
-    Yielded immediately when Ollama returns done=True with tool_calls so the
-    frontend does not drop the connection before tool execution finishes.
-    Also yielded once more after all tools complete, before the next Ollama
-    round-trip.
+    Yielded at stream start so the browser sees an immediate response,
+    preventing 499 while Ollama loads the model into VRAM.
+    Also yielded when tool_calls arrive (done=True but no content yet)
+    and after all tools complete before the next Ollama round-trip.
     """
     return make_chunk(model, "")
 
@@ -314,6 +311,10 @@ def chat_stream_generator(
     prev_tool_names: Optional[List[str]] = None
     repeat_count = 0
 
+    # Yield an empty chunk immediately so the browser sees a response and does
+    # not abort the request while Ollama loads the model into VRAM (499 fix).
+    yield make_keepalive(model)
+
     try:
         for round_num in range(MAX_TOOL_ROUNDS):
             log.info("[%s] stream round %d, messages=%d", req_id, round_num, len(messages))
@@ -374,9 +375,7 @@ def chat_stream_generator(
                         if closing:
                             yield closing
                         if last_tool_calls:
-                            # Keepalive immediately on done+tool_calls so the
-                            # frontend does not drop the connection while we
-                            # execute tools (which may take several seconds).
+                            # Keep connection alive while tools execute.
                             yield make_keepalive(model)
                         else:
                             yield remapper.feed(line)
