@@ -40,9 +40,7 @@ SYSTEM_PROMPT = (
     "(конфигурация инфраструктуры, предпочтения пользователя). "
     "Не пиши в память мусор и промежуточные рассуждения. "
     "ПРАВИЛО: перед каждым ответом на вопрос о фактах из прошлых сессий "
-    "ОБЯЗАТЕЛЬНО вызови mempalace_search. Не отвечай по памяти - сначала ищи. "
-    "Tool arguments (subject, predicate, object) must be ASCII only: "
-    "no Cyrillic, no spaces. Example: subject='user', predicate='favorite_editor'."
+    "ОБЯЗАТЕЛЬНО вызови mempalace_search. Не отвечай по памяти — сначала ищи."
 )
 
 # Sampling options.
@@ -91,11 +89,12 @@ def make_chunk(model: str, content: str, done: bool = False) -> bytes:
 
 
 def make_keepalive(model: str) -> bytes:
-    """Empty content chunk.
+    """Empty content chunk to keep the HTTP connection alive.
 
-    Only used between tool rounds (after tool execution, before the next
-    Ollama request). Never injected into the token stream itself to avoid
-    corrupting token boundaries seen by the frontend.
+    Yielded immediately when Ollama returns done=True with tool_calls so the
+    frontend does not drop the connection before tool execution finishes.
+    Also yielded once more after all tools complete, before the next Ollama
+    round-trip.
     """
     return make_chunk(model, "")
 
@@ -371,7 +370,12 @@ def chat_stream_generator(
                         closing = remapper.close()
                         if closing:
                             yield closing
-                        if not last_tool_calls:
+                        if last_tool_calls:
+                            # Keepalive immediately on done+tool_calls so the
+                            # frontend does not drop the connection while we
+                            # execute tools (which may take several seconds).
+                            yield make_keepalive(model)
+                        else:
                             yield remapper.feed(line)
                         break
 
