@@ -40,7 +40,9 @@ SYSTEM_PROMPT = (
     "(конфигурация инфраструктуры, предпочтения пользователя). "
     "Не пиши в память мусор и промежуточные рассуждения. "
     "ПРАВИЛО: перед каждым ответом на вопрос о фактах из прошлых сессий "
-    "ОБЯЗАТЕЛЬНО вызови mempalace_search. Не отвечай по памяти — сначала ищи."
+    "ОБЯЗАТЕЛЬНО вызови mempalace_search. Не отвечай по памяти - сначала ищи. "
+    "Tool arguments (subject, predicate, object) must be ASCII only: "
+    "no Cyrillic, no spaces. Example: subject='user', predicate='favorite_editor'."
 )
 
 # Sampling options.
@@ -48,12 +50,12 @@ SYSTEM_PROMPT = (
 # When THINKING=True you may want to raise temperature to 0.7-1.0
 # and remove repeat_penalty to let the model explore freely.
 DEFAULT_OPTIONS: Dict[str, Any] = {
-    "num_predict":    2048,
+    "num_predict":    768,
     "num_ctx":        8192,
-    "temperature":    0.6,   # qwen3 recommended for non-thinking mode
+    "temperature":    0.6,
     "top_p":          0.9,
     "top_k":          20,
-    "repeat_penalty": 1.1,
+    "repeat_penalty": 1.2,
 }
 
 MEMPALACE_ALLOWED_TOOLS = {
@@ -448,7 +450,7 @@ def chat():
         log.error("[%s] failed to parse request JSON: %s", req_id, e)
         return jsonify({"error": "invalid JSON"}), 400
 
-    model       = original_payload.get("model") or "qwen3:4b"
+    model       = original_payload.get("model") or "qwen3:8b"
     messages    = original_payload.get("messages") or []
     options     = merge_options(original_payload.get("options"))
     want_stream = original_payload.get("stream", True)
@@ -548,4 +550,5 @@ def chat():
 init_tools()
 
 if __name__ == "__main__":
+    log.info("started")
     app.run(host="0.0.0.0", port=5001, debug=False)
