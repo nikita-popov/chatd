@@ -282,6 +282,14 @@ class ThinkingRemapper:
         return None
 
 
+# ─── stream yield helper ───────────────────────────────────────────────────
+
+def _yield_chunk(req_id: str, label: str, data: bytes):
+    """Log every outgoing chunk with its label and byte size, then yield it."""
+    log.debug("[%s] yield %-12s %d bytes: %s", req_id, label, len(data), data[:120])
+    return data
+
+
 # ─── routes ─────────────────────────────────────────────────────────────────
 
 @app.get("/health")
@@ -308,7 +316,9 @@ def chat_stream_generator(
 
     # Yield an empty chunk immediately so the browser sees a response and does
     # not abort the request while Ollama loads the model into VRAM (499 fix).
-    yield make_keepalive(model)
+    data = make_keepalive(model)
+    log.debug("[%s] yield %-12s %d bytes", req_id, "keepalive/0", len(data))
+    yield data
 
     try:
         for round_num in range(MAX_TOOL_ROUNDS):
@@ -332,9 +342,13 @@ def chat_stream_generator(
                     stream=True,
                 )
                 r.raise_for_status()
+                log.debug("[%s] Ollama HTTP %d, headers: %s",
+                          req_id, r.status_code, dict(r.headers))
             except Exception as e:
                 log.error("[%s] Ollama request failed: %s", req_id, e)
-                yield make_chunk(model, f"\n[error: {e}]\n", done=True)
+                data = make_chunk(model, f"\n[error: {e}]\n", done=True)
+                log.debug("[%s] yield %-12s %d bytes", req_id, "error", len(data))
+                yield data
                 return
 
             last_tool_calls: Optional[List[Dict]] = None
@@ -368,17 +382,27 @@ def chat_stream_generator(
                                  bool(last_tool_calls), len(remapper.content_acc))
                         closing = remapper.close()
                         if closing:
+                            log.debug("[%s] yield %-12s %d bytes", req_id, "think/close", len(closing))
                             yield closing
                         if last_tool_calls:
-                            # Keep connection alive while tools execute.
-                            yield make_keepalive(model)
+                            data = make_keepalive(model)
+                            log.debug("[%s] yield %-12s %d bytes", req_id, "keepalive/tc", len(data))
+                            yield data
                         else:
-                            yield remapper.feed(line)
+                            data = remapper.feed(line)
+                            log.debug("[%s] yield %-12s %d bytes", req_id, "done", len(data))
+                            yield data
                         break
 
                     out = remapper.feed(line)
                     if not tc:
+                        log.debug("[%s] yield %-12s %d bytes: ...%s",
+                                  req_id, f"chunk/{chunk_count}", len(out),
+                                  out[-60:].decode("utf-8", errors="replace").strip())
                         yield out
+
+            log.debug("[%s] exited Ollama iter_lines loop, last_tool_calls=%s",
+                      req_id, bool(last_tool_calls))
 
             if not last_tool_calls:
                 log.info("[%s] stream complete, no more tool rounds", req_id)
@@ -393,7 +417,9 @@ def chat_stream_generator(
                 if repeat_count >= 2:
                     log.warning("[%s] tool loop detected (%s x%d), aborting",
                                 req_id, current_tool_names, repeat_count)
-                    yield make_chunk(model, "\n[ошибка: цикл инструментов, остановлено]\n", done=True)
+                    data = make_chunk(model, "\n[ошибка: цикл инструментов, остановлено]\n", done=True)
+                    log.debug("[%s] yield %-12s %d bytes", req_id, "loop/abort", len(data))
+                    yield data
                     return
             else:
                 repeat_count = 0
@@ -418,7 +444,9 @@ def chat_stream_generator(
                         tool_args = {}
 
                 log.info("[%s] executing tool: %s(%s)", req_id, tool_name, tool_args)
-                yield make_chunk(model, f"\n[→ {tool_name}]\n")
+                data = make_chunk(model, f"\n[→ {tool_name}]\n")
+                log.debug("[%s] yield %-12s %d bytes", req_id, "tool/ann", len(data))
+                yield data
 
                 try:
                     tool_result = call_tool(tool_name, tool_args)
@@ -431,12 +459,20 @@ def chat_stream_generator(
                     "content": json.dumps(tool_result, ensure_ascii=False),
                 })
 
-            yield make_keepalive(model)
+            data = make_keepalive(model)
+            log.debug("[%s] yield %-12s %d bytes", req_id, "keepalive/tr", len(data))
+            yield data
             last_tool_calls = None
 
+        log.debug("[%s] generator exiting normally", req_id)
+
+    except GeneratorExit:
+        log.warning("[%s] GeneratorExit: client disconnected mid-stream", req_id)
     except Exception as e:
         log.error("[%s] unhandled exception in generator: %s", req_id, traceback.format_exc())
-        yield make_chunk(model, f"\n[internal error: {e}]\n", done=True)
+        data = make_chunk(model, f"\n[internal error: {e}]\n", done=True)
+        log.debug("[%s] yield %-12s %d bytes", req_id, "exception", len(data))
+        yield data
 
 
 @app.post("/chat")
