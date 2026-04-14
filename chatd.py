@@ -1,3 +1,4 @@
+import functools
 import json
 import logging
 import os
@@ -24,22 +25,49 @@ log = logging.getLogger("chatd")
 
 # ─── context ─────────────────────────────────────────────────────────────────
 
-def load_wakeup_context() -> str:
-    """Load L0+L1 memory context from mempalace wake-up."""
+def _run_wakeup() -> str:
+    """Execute mempalace wake-up and return raw stdout (L0 + L1 text)."""
+    env = {**os.environ, "MEMPALACE_PALACE_PATH": "/var/lib/mempalace"}
     try:
-        env = {**os.environ, "MEMPALACE_PALACE_PATH": "/var/lib/mempalace"}
         result = subprocess.run(
             ["/opt/chatd/venv/bin/python", "-m", "mempalace", "wake-up"],
-            capture_output=True, text=True, timeout=10, env=env
+            capture_output=True, text=True, timeout=10, env=env,
         )
-        log.info("Wake-up text loaded")
+        if result.returncode != 0:
+            log.warning("mempalace wake-up exited %d: %s", result.returncode, result.stderr.strip())
         return result.stdout.strip()
     except Exception as e:
         log.warning("mempalace wake-up failed: %s", e)
         return ""
 
 
-SYSTEM_PROMPT = load_wakeup_context()
+@functools.lru_cache(maxsize=1)
+def _wakeup_cached() -> str:
+    """Return cached wake-up text.
+
+    Cache is a single slot — subsequent calls return the same string until
+    cache_clear() is called (e.g. after mempalace_kg_add writes new facts).
+    """
+    text = _run_wakeup()
+    log.info("wake-up cache populated (%d chars)", len(text))
+    return text
+
+
+def get_system_prompt() -> str:
+    """Return current system prompt (L0 + L1).
+
+    Uses lru_cache so the subprocess is only spawned once per cache epoch.
+    Cache is invalidated by invalidate_wakeup_cache() after kg_add writes.
+    Falls back to empty string on error — ensure_system_prompt handles that.
+    """
+    return _wakeup_cached()
+
+
+def invalidate_wakeup_cache() -> None:
+    """Evict the lru_cache so the next request re-runs wake-up."""
+    _wakeup_cached.cache_clear()
+    log.info("wake-up cache invalidated")
+
 
 # ─── config ──────────────────────────────────────────────────────────────────
 
@@ -67,17 +95,18 @@ TOOL_DESCRIPTION_OVERRIDES = {
         "Call ONLY when the user asks to find or list their notes."
     ),
     "mempalace_search": (
-        "Full-text search in long-term memory about the user. "
-        "MUST be called before answering any personal question about user preferences, "
-        "habits, name, tools, or stored facts. Never guess without calling this first."
+        "Semantic search in long-term memory archive. "
+        "Call when mempalace_kg_query returned no results and the user asks "
+        "about personal preferences, habits, or stored facts."
     ),
     "mempalace_kg_add": (
         "Add a fact to knowledge graph memory. "
         "Call ONLY when the user EXPLICITLY asks you to remember something."
     ),
     "mempalace_kg_query": (
-        "Query knowledge graph by entity. "
-        "Use to look up a specific stored fact about a person or object."
+        "Query knowledge graph for a specific stored fact (fast, structured). "
+        "Call FIRST when the user asks about their preferences, name, habits, or tools. "
+        "Fall back to mempalace_search only if this returns nothing."
     ),
 }
 
@@ -98,6 +127,12 @@ MEMPALACE_ALLOWED_TOOLS = {
     "mempalace_search",
     "mempalace_kg_add",
     "mempalace_kg_query",
+}
+
+# Tools that write to memory and require wake-up cache invalidation afterward.
+MEMPALACE_WRITE_TOOLS = {
+    "mempalace_kg_add",
+    "mempalace_add_drawer",
 }
 
 TOOLS: List[Dict] = []
@@ -152,10 +187,11 @@ def merge_options(client_options: Optional[Dict]) -> Dict[str, Any]:
 
 
 def ensure_system_prompt(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    system_prompt = get_system_prompt()
     if not isinstance(messages, list) or not messages:
-        return [{"role": "system", "content": SYSTEM_PROMPT}]
+        return [{"role": "system", "content": system_prompt}]
     if messages[0].get("role") != "system":
-        return [{"role": "system", "content": SYSTEM_PROMPT}] + messages
+        return [{"role": "system", "content": system_prompt}] + messages
     return messages
 
 
@@ -263,6 +299,9 @@ def call_tool(name: str, arguments: Dict[str, Any]) -> Any:
     log.debug("[tool] calling %s with args: %s", name, arguments)
     result = client.call_tool(name, arguments)
     log.debug("[tool] %s result: %s", name, str(result)[:200])
+    # Invalidate wake-up cache so the next request sees fresh L1 facts.
+    if name in MEMPALACE_WRITE_TOOLS:
+        invalidate_wakeup_cache()
     return result
 
 
