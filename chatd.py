@@ -30,14 +30,57 @@ THINKING = False
 
 # DO NOT TOUCH!
 SYSTEM_PROMPT = (
-    "Тебя зовут Эльза (женская идентичнось). "
-    "Ты локальный личный ассистент. "
-    "Говоришь кратко, по-русски, женский род. "
-    "Характер: спокойная, прагматичная, без пафоса, не выдумываешь. "
-    "Всегда проверяй доступные тебе инструменты и нужны ли они тебе. "
-    "Для долговременной памяти у тебя есть инструменты mempalace_*. "
-    "Tool arguments MUST be ASCII only: no Cyrillic, no spaces."
+    "Your name is Elza (female identity). "
+    "You are a local personal assistant. "
+    "Reply in Russian, use feminine grammatical gender. "
+    "Be concise, calm, pragmatic. No fluff, no hallucinations.\n\n"
+
+    "## Tool usage rules\n"
+    "Call tools ONLY when the user explicitly asks for real-time data "
+    "or when memory is directly relevant:\n"
+    "- monitoring/alerts: only when asked about server status, alerts, metrics\n"
+    "- notes/search: only when asked to find, create or list notes\n"
+    "- mempalace_search: BEFORE answering personal questions about the user "
+    "(preferences, name, habits)\n"
+    "- mempalace_kg_add: ONLY when the user explicitly tells you something to remember\n"
+    "- Do NOT call any tool for greetings, general questions, or tasks "
+    "you can answer from context\n\n"
+
+    "Tool arguments MUST be ASCII only: no Cyrillic, no spaces.\n"
+    "Example: subject=user, predicate=favoriteeditor, object=emacs"
 )
+
+# В load_tools() после получения description от MCP-сервера
+TOOL_DESCRIPTION_OVERRIDES = {
+    "alerts_list": (
+        "List Alertmanager alerts. "
+        "Call ONLY when the user asks about server alerts, incidents, or firing rules."
+    ),
+    "alerts_summary": (
+        "Summarize active Alertmanager alerts by name/severity/state. "
+        "Call ONLY when asked for a monitoring overview or alert statistics."
+    ),
+    "monitor_query": (
+        "Query VictoriaMetrics with PromQL. "
+        "Call ONLY when the user asks for specific metrics (CPU, RAM, uptime, etc.)."
+    ),
+    "notes_search": (
+        "Search Memos notes by text query. "
+        "Call ONLY when the user asks to find or list their notes."
+    ),
+    "mempalace_search": (
+        "Full-text search in long-term memory. "
+        "Use before answering personal questions about the user's preferences or history."
+    ),
+    "mempalace_kg_add": (
+        "Add a fact to knowledge graph memory. "
+        "Call ONLY when the user EXPLICITLY asks you to remember something."
+    ),
+    "mempalace_kg_query": (
+        "Query knowledge graph by entity. "
+        "Use to look up a specific stored fact about a person or object."
+    ),
+}
 
 # Sampling options.
 # Tuned for qwen3 non-thinking mode (THINKING=False).
@@ -46,10 +89,10 @@ SYSTEM_PROMPT = (
 DEFAULT_OPTIONS: Dict[str, Any] = {
     "num_predict":    768,
     "num_ctx":        8192,
-    "temperature":    0.6,
+    "temperature":    0.3,
     "top_p":          0.9,
-    "top_k":          20,
-    "repeat_penalty": 1.2,
+    "top_k":          40,
+    "repeat_penalty": 1.05,
 }
 
 MEMPALACE_ALLOWED_TOOLS = {
@@ -135,7 +178,12 @@ def build_model_messages(raw_messages: List[Dict]) -> List[Dict]:
     return result
 
 
-def make_ollama_payload(model: str, messages: List[Dict], options: Dict[str, Any], stream: bool) -> Dict[str, Any]:
+def make_ollama_payload(
+        model: str,
+        messages: List[Dict],
+        options: Dict[str, Any],
+        stream: bool,
+) -> Dict[str, Any]:
     """Build an Ollama /api/chat payload, respecting the global THINKING flag."""
     payload: Dict[str, Any] = {
         "model": model,
@@ -182,6 +230,8 @@ def load_tools():
         for t in server_tools:
             name = getattr(t, "name", None)
             description = getattr(t, "description", "") or ""
+            # заменяем description если есть override
+            description = TOOL_DESCRIPTION_OVERRIDES.get(name, description)
             input_schema = getattr(t, "inputSchema", None) or getattr(t, "input_schema", None)
             if not name or not input_schema:
                 log.warning("[tools] %s: skipping tool without name or schema: %r", source, t)
