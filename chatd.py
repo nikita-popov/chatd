@@ -1,6 +1,8 @@
 import json
 import logging
+import os
 import re
+import subprocess
 import traceback
 from datetime import datetime, timezone
 from typing import Any, Dict, Generator, List, Optional
@@ -20,36 +22,32 @@ logging.basicConfig(
 )
 log = logging.getLogger("chatd")
 
-# ─── config ─────────────────────────────────────────────────────────────────
+# ─── context ─────────────────────────────────────────────────────────────────
+
+def load_wakeup_context() -> str:
+    """Load L0+L1 memory context from mempalace wake-up."""
+    try:
+        env = {**os.environ, "MEMPALACE_PALACE_PATH": "/var/lib/mempalace"}
+        result = subprocess.run(
+            ["/opt/chatd/venv/bin/python", "-m", "mempalace", "wake-up"],
+            capture_output=True, text=True, timeout=10, env=env
+        )
+        log.info("Wake-up text loaded")
+        return result.stdout.strip()
+    except Exception as e:
+        log.warning("mempalace wake-up failed: %s", e)
+        return ""
+
+
+SYSTEM_PROMPT = load_wakeup_context()
+
+# ─── config ──────────────────────────────────────────────────────────────────
 
 OLLAMA_API = "http://127.0.0.1:11434"
 
 # Set to True to enable qwen3 extended thinking (<think>...</think>).
 # When False, "think": false is sent with every Ollama request.
 THINKING = False
-
-# DO NOT TOUCH!
-SYSTEM_PROMPT = (
-    "Your name is Elza (female identity). "
-    "You are a local personal assistant. "
-    "Reply in Russian, use feminine grammatical gender. "
-    "Be concise, calm, pragmatic. No fluff, no hallucinations.\n\n"
-
-    "## Tool usage rules\n"
-    "Call tools ONLY when the user explicitly asks for real-time data "
-    "or when memory is directly relevant:\n"
-    "- monitoring/alerts: only when asked about server status, alerts, metrics\n"
-    "- notes_*: only when asked to find, create or list notes\n"
-    "- mempalace_search: you MUST call this before answering ANY question about "
-    "the user's preferences, habits, name, or personal facts. "
-    "Do NOT answer from context or guess — always look up first.\n"
-    "- mempalace_kg_add: ONLY when the user explicitly says to remember something\n"
-    "- Do NOT call any tool for greetings, general questions, or tasks "
-    "you can answer from conversation context\n\n"
-
-    "Tool arguments MUST be ASCII only: no Cyrillic, no spaces.\n"
-    "Example: subject=user, predicate=favoriteeditor, object=emacs"
-)
 
 TOOL_DESCRIPTION_OVERRIDES = {
     "alerts_list": (
@@ -98,10 +96,8 @@ DEFAULT_OPTIONS: Dict[str, Any] = {
 
 MEMPALACE_ALLOWED_TOOLS = {
     "mempalace_search",
-    "mempalace_add_drawer",
     "mempalace_kg_add",
     "mempalace_kg_query",
-    "mempalace_status",
 }
 
 TOOLS: List[Dict] = []
@@ -198,7 +194,7 @@ def make_ollama_payload(
     return payload
 
 
-# ─── CORS ───────────────────────────────────────────────────────────────────
+# ─── CORS ────────────────────────────────────────────────────────────────────
 
 @app.after_request
 def add_cors(response: Response) -> Response:
@@ -214,7 +210,7 @@ def options_chat():
     return Response(status=204)
 
 
-# ─── tools ─────────────────────────────────────────────────────────────────
+# ─── tools ───────────────────────────────────────────────────────────────────
 
 def load_tools():
     tools = []
@@ -270,7 +266,7 @@ def call_tool(name: str, arguments: Dict[str, Any]) -> Any:
     return result
 
 
-# ─── ThinkingRemapper ─────────────────────────────────────────────────────────
+# ─── ThinkingRemapper ────────────────────────────────────────────────────────
 
 class ThinkingRemapper:
     """
@@ -334,7 +330,7 @@ class ThinkingRemapper:
         return None
 
 
-# ─── stream yield helper ───────────────────────────────────────────────────
+# ─── stream yield helper ─────────────────────────────────────────────────────
 
 def _yield_chunk(req_id: str, label: str, data: bytes):
     """Log every outgoing chunk with its label and byte size, then yield it."""
@@ -342,7 +338,7 @@ def _yield_chunk(req_id: str, label: str, data: bytes):
     return data
 
 
-# ─── routes ─────────────────────────────────────────────────────────────────
+# ─── routes ──────────────────────────────────────────────────────────────────
 
 @app.get("/health")
 @app.get("/api/health")
@@ -634,7 +630,7 @@ def chat():
     )
 
 
-# ─── entry point ────────────────────────────────────────────────────────────
+# ─── entry point ─────────────────────────────────────────────────────────────
 
 init_tools()
 
