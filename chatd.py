@@ -39,18 +39,18 @@ SYSTEM_PROMPT = (
     "Call tools ONLY when the user explicitly asks for real-time data "
     "or when memory is directly relevant:\n"
     "- monitoring/alerts: only when asked about server status, alerts, metrics\n"
-    "- notes/search: only when asked to find, create or list notes\n"
-    "- mempalace_search: BEFORE answering personal questions about the user "
-    "(preferences, name, habits)\n"
-    "- mempalace_kg_add: ONLY when the user explicitly tells you something to remember\n"
+    "- notes_*: only when asked to find, create or list notes\n"
+    "- mempalace_search: you MUST call this before answering ANY question about "
+    "the user's preferences, habits, name, or personal facts. "
+    "Do NOT answer from context or guess — always look up first.\n"
+    "- mempalace_kg_add: ONLY when the user explicitly says to remember something\n"
     "- Do NOT call any tool for greetings, general questions, or tasks "
-    "you can answer from context\n\n"
+    "you can answer from conversation context\n\n"
 
     "Tool arguments MUST be ASCII only: no Cyrillic, no spaces.\n"
     "Example: subject=user, predicate=favoriteeditor, object=emacs"
 )
 
-# В load_tools() после получения description от MCP-сервера
 TOOL_DESCRIPTION_OVERRIDES = {
     "alerts_list": (
         "List Alertmanager alerts. "
@@ -69,8 +69,9 @@ TOOL_DESCRIPTION_OVERRIDES = {
         "Call ONLY when the user asks to find or list their notes."
     ),
     "mempalace_search": (
-        "Full-text search in long-term memory. "
-        "Use before answering personal questions about the user's preferences or history."
+        "Full-text search in long-term memory about the user. "
+        "MUST be called before answering any personal question about user preferences, "
+        "habits, name, tools, or stored facts. Never guess without calling this first."
     ),
     "mempalace_kg_add": (
         "Add a fact to knowledge graph memory. "
@@ -230,7 +231,7 @@ def load_tools():
         for t in server_tools:
             name = getattr(t, "name", None)
             description = getattr(t, "description", "") or ""
-            # заменяем description если есть override
+            # Override description if specified to improve model tool-selection.
             description = TOOL_DESCRIPTION_OVERRIDES.get(name, description)
             input_schema = getattr(t, "inputSchema", None) or getattr(t, "input_schema", None)
             if not name or not input_schema:
