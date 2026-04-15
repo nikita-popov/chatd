@@ -4,10 +4,10 @@ A minimal chat backend that connects [Ollama](https://ollama.com) to MCP tool se
 
 Sits between a static frontend (e.g. [ollama-gui](https://github.com/ollama-webui/ollama-webui)) and Ollama, adding:
 
-- **MCP tool dispatch** — monitor, alerts, notes, memory
-- **Agentic tool loop** — up to 5 rounds of tool calls per request
-- **Persistent memory** — MemPalace `wake-up` context injected into every system prompt
-- **Streaming** — NDJSON passthrough with keepalive chunks to prevent 499s
+- **MCP tool dispatch** - monitor, alerts, notes, memory
+- **Agentic tool loop** - up to 5 rounds of tool calls per request
+- **Persistent memory** - MemPalace `wake-up` context injected into every system prompt
+- **Streaming** - NDJSON passthrough with keepalive chunks to prevent 499s
 
 ## Architecture
 
@@ -39,9 +39,9 @@ cd /opt/chatd
 
 python3 -m venv venv
 . venv/bin/activate
-pip install flask gunicorn requests mcp mempalace
+pip install -r requirements.txt
 
-# Initialise MemPalace palace
+# Initialise MemPalace
 MEMPALACE_PALACE_PATH=/var/lib/mempalace mempalace init
 ```
 
@@ -70,7 +70,7 @@ MEMPALACE_PALACE_PATH=/var/lib/mempalace python chatd.py
 
 ```sh
 cp chatd.service /etc/systemd/system/
-systemctl enable --now chatd
+systemctl enable --now chatd.service
 ```
 
 The service binds to `0.0.0.0:5001` via gunicorn (1 worker, 4 threads).
@@ -79,7 +79,7 @@ The service binds to `0.0.0.0:5001` via gunicorn (1 worker, 4 threads).
 
 See `example.nginx.conf`. Key points:
 
-- `gzip off` on `/api/` — mandatory, nginx buffers gzip and breaks streaming
+- `gzip off` on `/api/` - mandatory, nginx buffers gzip and breaks streaming
 - `proxy_buffering off` on `/api/`
 - `proxy_set_header Connection ""` for HTTP/1.1 keepalive upstream
 
@@ -118,7 +118,7 @@ Tools exposed to the model (filtered subset of what each MCP server provides):
 | `alerts_list` | mcp-alerts.py | User asks about firing alerts |
 | `alerts_summary` | mcp-alerts.py | User asks for alert overview |
 | `notes_search` | mcp-notes.py | User asks to find notes |
-| `mempalace_status` | mempalace | Once per session — loads memory protocol |
+| `mempalace_status` | mempalace | Once per session - loads memory protocol |
 | `mempalace_search` | mempalace | Semantic search in long-term memory |
 | `mempalace_add_drawer` | mempalace | Filing new facts into ChromaDB |
 | `mempalace_kg_query` | mempalace | Structured fact lookup (fast) |
