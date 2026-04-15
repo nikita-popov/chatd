@@ -18,17 +18,15 @@ import sqlite3
 from pathlib import Path
 from typing import Optional
 
-from config import MEMPALACE_PALACE_PATH
+from config import MEMPALACE_KG_PATH, MEMPALACE_PALACE_PATH
 
 log = logging.getLogger("chatd.memory")
 
 # ── paths ─────────────────────────────────────────────────────────────────────
 
-# MEMPALACE_PALACE_PATH points to the palace directory, e.g.
-# ~/.mempalace/palace.  MemPalace keeps knowledge_graph.sqlite3 in the
-# *parent* of that directory (~/.mempalace/).
-_PALACE_DIR: Path = Path(os.path.expanduser(MEMPALACE_PALACE_PATH))
-_KG_PATH: Path = _PALACE_DIR.parent / "knowledge_graph.sqlite3"
+# Both paths are independent: palace dir (wings/rooms) and the KG SQLite
+# file are not required to share a parent directory.
+_KG_PATH: Path = Path(os.path.expanduser(MEMPALACE_KG_PATH))
 
 # ── L1: in-process KG dict ────────────────────────────────────────────────────
 
