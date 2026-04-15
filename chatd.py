@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
-import functools
 import json
 import logging
 import os
 import re
-import subprocess
 import traceback
 import uuid
 from datetime import datetime, timezone
@@ -14,11 +12,11 @@ import requests
 from requests.exceptions import ReadTimeout
 from flask import Flask, request, Response, jsonify, stream_with_context
 
+import memory
 from config import (
     OLLAMA_API,
     THINKING,
     DEFAULT_OPTIONS,
-    MEMPALACE_PALACE_PATH,
     MEMPALACE_ALLOWED_TOOLS,
     MEMPALACE_WRITE_TOOLS,
     TOOL_DESCRIPTION_OVERRIDES,
@@ -26,7 +24,7 @@ from config import (
 from mcp_client import MCPClient, discover_mcp_servers
 from think_remapper import ThinkingRemapper
 
-# ── logging ───────────────────────────────────────────────────────────────────
+# ── logging ────────────────────────────────────────────────────────────────────────
 
 logging.basicConfig(
     level=logging.DEBUG,
@@ -35,43 +33,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("chatd")
 
-# ── mempalace wake-up ─────────────────────────────────────────────────────────
-
-def _run_wakeup() -> str:
-    """Execute mempalace wake-up and return raw stdout (L0 + L1 text)."""
-    venv_python = os.environ.get("CHATD_MCP_MEMPALACE", "").split()[0] or "python3"
-    env = {**os.environ, "MEMPALACE_PALACE_PATH": MEMPALACE_PALACE_PATH}
-    try:
-        result = subprocess.run(
-            [venv_python, "-m", "mempalace", "wake-up"],
-            capture_output=True, text=True, timeout=10, env=env,
-        )
-        if result.returncode != 0:
-            log.warning("mempalace wake-up exited %d: %s", result.returncode, result.stderr.strip())
-        return result.stdout.strip()
-    except Exception as e:
-        log.warning("mempalace wake-up failed: %s", e)
-        return ""
-
-
-@functools.lru_cache(maxsize=1)
-def _wakeup_cached() -> str:
-    """Return cached wake-up text (single slot, cleared by invalidate_wakeup_cache)."""
-    text = _run_wakeup()
-    log.info("wake-up cache populated (%d chars)", len(text))
-    return text
-
-
-def get_system_prompt() -> str:
-    return _wakeup_cached()
-
-
-def invalidate_wakeup_cache() -> None:
-    _wakeup_cached.cache_clear()
-    log.info("wake-up cache invalidated")
-
-
-# ── app ───────────────────────────────────────────────────────────────────────
+# ── app ─────────────────────────────────────────────────────────────────────────────
 
 TOOLS: List[Dict] = []
 TOOL_REGISTRY: Dict[str, MCPClient] = {}
@@ -119,7 +81,7 @@ def merge_options(client_options: Optional[Dict]) -> Dict[str, Any]:
 
 
 def ensure_system_prompt(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    system_prompt = get_system_prompt()
+    system_prompt = memory.wake_up()
     if not isinstance(messages, list) or not messages:
         return [{"role": "system", "content": system_prompt}]
     if messages[0].get("role") != "system":
@@ -163,7 +125,7 @@ def make_ollama_payload(
     return payload
 
 
-# ── CORS ──────────────────────────────────────────────────────────────────────
+# ── CORS ──────────────────────────────────────────────────────────────────────────
 
 @app.after_request
 def add_cors(response: Response) -> Response:
@@ -179,7 +141,7 @@ def options_chat():
     return Response(status=204)
 
 
-# ── tools ─────────────────────────────────────────────────────────────────────
+# ── tools ───────────────────────────────────────────────────────────────────────
 
 def load_tools():
     tools    = []
@@ -239,18 +201,25 @@ def call_tool(name: str, arguments: Dict[str, Any]) -> Any:
     result = client.call_tool(name, arguments)
     log.debug("[tool] %s result: %s", name, str(result)[:200])
     if name in MEMPALACE_WRITE_TOOLS:
-        invalidate_wakeup_cache()
+        # Keep in-process KG dict consistent after a structured fact write.
+        if name == "mempalace_kg_add":
+            memory.kg_add(
+                arguments.get("subject", ""),
+                arguments.get("predicate", ""),
+                arguments.get("object", ""),
+            )
+        memory.invalidate()
     return result
 
 
-# ── stream yield helper ───────────────────────────────────────────────────────
+# ── stream yield helper ──────────────────────────────────────────────────────────────────
 
 def _log_yield(req_id: str, label: str, data: bytes) -> bytes:
     log.debug("[%s] yield %-12s %d bytes", req_id, label, len(data))
     return data
 
 
-# ── routes ────────────────────────────────────────────────────────────────────
+# ── routes ───────────────────────────────────────────────────────────────────────
 
 @app.get("/health")
 @app.get("/api/health")
@@ -356,7 +325,7 @@ def chat_stream_generator(
                 log.info("[%s] stream complete, no more tool rounds", req_id)
                 break
 
-            # ── loop detection ────────────────────────────────────────────────
+            # ── loop detection ───────────────────────────────────────────────────────────────
             current_tool_names = [
                 (tc.get("function") or {}).get("name") for tc in last_tool_calls
             ]
@@ -371,7 +340,7 @@ def chat_stream_generator(
                 repeat_count = 0
             prev_tool_names = current_tool_names
 
-            # ── tool execution ────────────────────────────────────────────────
+            # ── tool execution ─────────────────────────────────────────────────────────────────
             messages.append({
                 "role":       "assistant",
                 "content":    remapper.content_acc,
@@ -513,9 +482,10 @@ def chat():
     )
 
 
-# ── entry point ───────────────────────────────────────────────────────────────
+# ── entry point ──────────────────────────────────────────────────────────────────────
 
 init_tools()
+memory.init()
 
 if __name__ == "__main__":
     log.info("started")
