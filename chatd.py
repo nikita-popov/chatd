@@ -201,13 +201,8 @@ def call_tool(name: str, arguments: Dict[str, Any]) -> Any:
     result = client.call_tool(name, arguments)
     log.debug("[tool] %s result: %s", name, str(result)[:200])
     if name in MEMPALACE_WRITE_TOOLS:
-        # Keep in-process KG dict consistent after a structured fact write.
-        if name == "mempalace_kg_add":
-            memory.kg_add(
-                arguments.get("subject", ""),
-                arguments.get("predicate", ""),
-                arguments.get("object", ""),
-            )
+        # Invalidate the in-process KnowledgeGraph connection and wake-up
+        # cache so the next request sees the freshly written data.
         memory.invalidate()
     return result
 
