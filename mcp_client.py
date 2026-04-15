@@ -1,16 +1,38 @@
 #!/usr/bin/env python3
 import asyncio
 import json
+import os
+import shlex
 from contextlib import AsyncExitStack
 from typing import Any
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
-MCP_ALERTS_CMD = ["/opt/chatd/venv/bin/python", "/opt/chatd/mcp-alerts.py"]
-MCP_MONITOR_CMD = ["/opt/chatd/venv/bin/python", "/opt/chatd/mcp-monitor.py"]
-MCP_NOTES_CMD = ["/opt/chatd/venv/bin/python", "/opt/chatd/mcp-notes.py"]
-MCP_MEMPALACE_CMD = ["/opt/chatd/venv/bin/python", "-m", "mempalace.mcp_server"]
+# ---------------------------------------------------------------------------
+# MCP server auto-discovery
+#
+# Each CHATD_MCP_<NAME> environment variable registers one MCP server.
+# The value is a shell command string, e.g.:
+#
+#   CHATD_MCP_MONITOR="/opt/chatd/venv/bin/python /opt/chatd/mcp-monitor.py"
+#   CHATD_MCP_NOTES="/opt/chatd/venv/bin/python /opt/chatd/mcp-notes.py"
+#   CHATD_MCP_MEMPALACE="/opt/chatd/venv/bin/python -m mempalace.mcp_server"
+#
+# Set these in .env or the systemd unit Environment= directives.
+# ---------------------------------------------------------------------------
+
+MCP_ENV_PREFIX = "CHATD_MCP_"
+
+
+def discover_mcp_servers() -> dict[str, list[str]]:
+    """Return {name: argv} for every CHATD_MCP_* variable in the environment."""
+    servers: dict[str, list[str]] = {}
+    for key, val in os.environ.items():
+        if key.startswith(MCP_ENV_PREFIX) and val.strip():
+            name = key[len(MCP_ENV_PREFIX):].lower()
+            servers[name] = shlex.split(val)
+    return servers
 
 
 class MCPClient:
@@ -19,49 +41,37 @@ class MCPClient:
 
     async def _with_session(self, fn):
         command = self.cmd[0]
-        args = self.cmd[1:]
-
+        args    = self.cmd[1:]
         async with AsyncExitStack() as stack:
             read, write = await stack.enter_async_context(
-                stdio_client(
-                    StdioServerParameters(
-                        command=command,
-                        args=args,
-                        env=None,
-                    )
-                )
+                stdio_client(StdioServerParameters(command=command, args=args, env=None))
             )
             session = await stack.enter_async_context(ClientSession(read, write))
             await session.initialize()
             return await fn(session)
 
-    def start(self):
-        return None
+    def start(self):  return None
+    def stop(self):   return None
 
-    def stop(self):
-        return None
-
-    def list_tools(self):
+    def list_tools(self) -> list:
         async def run(session):
             result = await session.list_tools()
             return result.tools
         return asyncio.run(self._with_session(run))
 
-    def call_tool(self, name: str, arguments: dict[str, Any]):
+    def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
         async def run(session):
-            result = await session.call_tool(name, arguments=arguments)
-            return result
+            return await session.call_tool(name, arguments=arguments)
 
-        result = asyncio.run(self._with_session(run))
+        result   = asyncio.run(self._with_session(run))
         contents = getattr(result, "content", None) or []
         if not contents:
             return None
 
         first = contents[0]
-        text = getattr(first, "text", None)
+        text  = getattr(first, "text", None)
         if text is None and isinstance(first, dict):
             text = first.get("text")
-
         if text is None:
             return str(first)
 
