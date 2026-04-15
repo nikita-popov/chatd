@@ -28,6 +28,18 @@ log = logging.getLogger("chatd.memory")
 # file are not required to share a parent directory.
 _KG_PATH: Path = Path(os.path.expanduser(MEMPALACE_KG_PATH))
 
+# ── temporal filter helpers ───────────────────────────────────────────────────
+
+# Mirrors the filter logic in MemPalace/mempalace knowledge_graph.py
+# (query_entity method). Using >= so a triple whose valid_to = today is
+# still considered current for the rest of the day, consistent with how
+# mempalace.query_entity() behaves. Adding valid_from guard to exclude
+# future-dated triples that are not yet effective.
+_TEMPORAL_WHERE = (
+    "(t.valid_from IS NULL OR t.valid_from <= date('now'))"
+    " AND (t.valid_to IS NULL OR t.valid_to >= date('now'))"
+)
+
 # ── L1: in-process KG dict ────────────────────────────────────────────────────
 
 # Populated on first access via _load_kg_dict().
@@ -50,7 +62,7 @@ def _load_kg_dict() -> None:
             " FROM triples t"
             " JOIN entities s ON t.subject = s.id"
             " JOIN entities o ON t.object  = o.id"
-            " WHERE (t.valid_to IS NULL OR t.valid_to > date('now'))"
+            f" WHERE {_TEMPORAL_WHERE}"
         ).fetchall()
         con.close()
         _KG_DICT = {
@@ -136,7 +148,7 @@ def _read_kg_block(limit: int = 60) -> str:
             " FROM triples t"
             " JOIN entities s ON t.subject = s.id"
             " JOIN entities o ON t.object  = o.id"
-            " WHERE (t.valid_to IS NULL OR t.valid_to > date('now'))"
+            f" WHERE {_TEMPORAL_WHERE}"
             " ORDER BY t.extracted_at DESC"
             " LIMIT ?",
             (limit,),
