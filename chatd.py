@@ -94,19 +94,50 @@ TOOL_DESCRIPTION_OVERRIDES = {
         "Search Memos notes by text query. "
         "Call ONLY when the user asks to find or list their notes."
     ),
-    "mempalace_search": (
-        "Semantic search in long-term memory archive. "
-        "Call when mempalace_kg_query returned no results and the user asks "
-        "about personal preferences, habits, or stored facts."
+    "mempalace_status": (
+        "Returns palace overview (wings, rooms, drawer count), AAAK dialect spec, "
+        "and memory protocol instructions. "
+        "Call ONCE at the start of every session before using any other memory tool. "
+        "The returned protocol tells you how to correctly use add_drawer and search."
     ),
-    "mempalace_kg_add": (
-        "Add a fact to knowledge graph memory. "
-        "Call ONLY when the user EXPLICITLY asks you to remember something."
+    "mempalace_search": (
+        "Semantic vector search over all stored memories (drawers). "
+        "Call when the user asks about their preferences, habits, past decisions, "
+        "or any personal fact not present in the current conversation. "
+        "Use the 'wing' and 'room' filters to narrow results when the topic is clear "
+        "(e.g. wing='Person', room='preferences'). "
+        "Fall back to this if mempalace_kg_query returned no results."
+    ),
+    "mempalace_add_drawer": (
+        "File verbatim text into the palace (writes to ChromaDB, persists long-term). "
+        "Use for ANY content longer than a short phrase: paragraphs, user bios, "
+        "conversation summaries, decisions, preferences in natural language. "
+        "Required args: "
+        "'wing' (domain, e.g. 'wing_general' or 'wing_person'), "
+        "'room' (topic, e.g. 'hall_preferences' or 'hall_facts'), "
+        "'content' (the verbatim text to store, in AAAK dialect if possible). "
+        "Call after EVERY turn where the user shared personal facts worth keeping. "
+        "Do NOT call for greetings or transient context."
     ),
     "mempalace_kg_query": (
-        "Query knowledge graph for a specific stored fact (fast, structured). "
-        "Call FIRST when the user asks about their preferences, name, habits, or tools. "
-        "Fall back to mempalace_search only if this returns nothing."
+        "Query the structured knowledge graph for facts about a named entity. "
+        "Call FIRST (before mempalace_search) when the user asks about their own "
+        "attributes: favorite tools, location, job, language, etc. "
+        "Required arg: 'entity' (e.g. 'user'). "
+        "Returns subject→predicate→object triples with temporal validity. "
+        "If result is empty, follow up with mempalace_search."
+    ),
+    "mempalace_kg_add": (
+        "Add ONE atomic subject→predicate→object triple to the knowledge graph. "
+        "Use for short, structured facts ONLY: single values, not sentences or paragraphs. "
+        "Args MUST be ASCII, no Cyrillic, no spaces in values. "
+        "Good: subject='user', predicate='favorite_editor', object='emacs'. "
+        "Good: subject='user', predicate='location', object='Omsk'. "
+        "BAD: object='Enthusiast of computer networks, programs in C, Go...' — "
+        "use mempalace_add_drawer for multi-sentence content instead. "
+        "When given a block of text with multiple facts: decompose into individual "
+        "triples (one call per fact) AND also file the full text via add_drawer. "
+        "Call ONLY when the user EXPLICITLY asks you to remember a specific fact."
     ),
 }
 
@@ -124,9 +155,14 @@ DEFAULT_OPTIONS: Dict[str, Any] = {
 }
 
 MEMPALACE_ALLOWED_TOOLS = {
+    "mempalace_status",
     "mempalace_search",
-    "mempalace_kg_add",
+    "mempalace_add_drawer",
     "mempalace_kg_query",
+    # second priority — add when needed:
+    # "mempalace_list_wings",
+    "mempalace_kg_add",
+    # "mempalace_memories_filed_away",
 }
 
 # Tools that write to memory and require wake-up cache invalidation afterward.
@@ -171,7 +207,7 @@ def make_keepalive(model: str) -> bytes:
 
 
 def proxy_get(path: str) -> Response:
-    r = requests.get(f"{OLLAMA_API}{path}", timeout=60)
+    r = requests.get(f"{OLLAMA_API}{path}", timeout=600)
     return Response(
         r.content,
         status=r.status_code,
@@ -252,9 +288,9 @@ def load_tools():
     tools = []
     registry = {}
     servers = {
-        "monitor":   MCPClient(MCP_MONITOR_CMD),
-        "notes":     MCPClient(MCP_NOTES_CMD),
-        "alerts":    MCPClient(MCP_ALERTS_CMD),
+        #"monitor":   MCPClient(MCP_MONITOR_CMD),
+        #"notes":     MCPClient(MCP_NOTES_CMD),
+        #"alerts":    MCPClient(MCP_ALERTS_CMD),
         "mempalace": MCPClient(MCP_MEMPALACE_CMD),
     }
     for source, client in servers.items():
@@ -425,7 +461,7 @@ def chat_stream_generator(
                 r = requests.post(
                     f"{OLLAMA_API}/api/chat",
                     json=payload,
-                    timeout=600,
+                    timeout=3600,
                     stream=True,
                 )
                 r.raise_for_status()
@@ -602,7 +638,7 @@ def chat():
                 r = requests.post(
                     f"{OLLAMA_API}/api/chat",
                     json=ollama_payload,
-                    timeout=600,
+                    timeout=3600,
                 )
                 r.raise_for_status()
                 resp = r.json()
