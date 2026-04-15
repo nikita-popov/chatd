@@ -35,7 +35,7 @@ def _get_kg() -> Optional[KnowledgeGraph]:
     if _kg is None:
         kg_path = os.path.expanduser(MEMPALACE_KG_PATH)
         if not Path(kg_path).exists():
-            log.warning("KG database not found: %s", kg_path)
+            log.warning("FastMemory: KG database not found: %s", kg_path)
             return None
         try:
             _kg = KnowledgeGraph(db_path=kg_path)
@@ -108,8 +108,6 @@ def _read_kg_block(limit: int = 60) -> str:
     if kg is None:
         return ""
     try:
-        # timeline() returns triples ordered by valid_from ASC; we want
-        # most-recent-first, so reverse and take the first *limit* entries.
         triples = kg.timeline()
         today = date.today().isoformat()
         current = [
@@ -180,6 +178,77 @@ def wake_up() -> str:
 
 # ── Bootstrap ─────────────────────────────────────────────────────────────────
 
+def _check_palace(palace_path: str) -> bool:
+    """Verify that the palace directory exists and contains at least one wing.
+
+    A freshly initialised palace has at minimum a README or a wing subdirectory.
+    Returns True when the palace looks healthy, False otherwise.
+    """
+    p = Path(palace_path)
+    if not p.exists():
+        log.warning("mempalace: palace directory missing: %s", palace_path)
+        return False
+    if not p.is_dir():
+        log.warning("mempalace: palace path is not a directory: %s", palace_path)
+        return False
+    children = list(p.iterdir())
+    if not children:
+        log.warning("mempalace: palace directory is empty (not initialised?): %s", palace_path)
+        return False
+    log.info("mempalace: palace OK — %s (%d entries)", palace_path, len(children))
+    return True
+
+
+def _check_kg(kg_path: str) -> bool:
+    """Verify that the KG SQLite file exists and KnowledgeGraph can open it.
+
+    Returns True when the KG is healthy, False otherwise.
+    """
+    p = Path(kg_path)
+    if not p.exists():
+        log.warning("mempalace: KG database missing: %s", kg_path)
+        log.warning(
+            "mempalace: run 'python -m mempalace init' to create the database"
+        )
+        return False
+    try:
+        kg = KnowledgeGraph(db_path=kg_path)
+        count = len(kg.timeline())
+        kg.close()
+        log.info("mempalace: KG OK — %s (%d triples)", kg_path, count)
+        return True
+    except Exception as e:
+        log.warning("mempalace: KG open failed: %s — %s", kg_path, e)
+        return False
+
+
 def init() -> None:
-    """Open KnowledgeGraph at startup so the first request pays no init cost."""
-    _get_kg()
+    """Run startup health checks and open the KnowledgeGraph connection.
+
+    Logs the status of every required path.  Emits WARNING (not an exception)
+    when something is missing so the service can still start in degraded mode
+    (e.g. answers without memory context until the user initialises mempalace).
+    """
+    from mempalace import __version__ as mp_version
+    log.info("mempalace: version %s", mp_version)
+
+    palace_path = os.path.expanduser(MEMPALACE_PALACE_PATH)
+    kg_path     = os.path.expanduser(MEMPALACE_KG_PATH)
+
+    palace_ok = _check_palace(palace_path)
+    kg_ok     = _check_kg(kg_path)
+
+    if palace_ok and kg_ok:
+        log.info("mempalace: all checks passed, opening KnowledgeGraph")
+        _get_kg()  # warm up the connection at startup
+    else:
+        issues = []
+        if not palace_ok:
+            issues.append(f"palace not found at {palace_path}")
+        if not kg_ok:
+            issues.append(f"KG not found at {kg_path}")
+        log.warning(
+            "mempalace: degraded mode — %s. "
+            "Memory context will be empty until mempalace is initialised.",
+            "; ".join(issues),
+        )
