@@ -6,7 +6,7 @@ After=network.target
 Type=simple
 User=chatd
 WorkingDirectory=/opt/chatd
-Environment="MEMPALACE_PALACE_PATH=/var/lib/mempalace"
+EnvironmentFile=/etc/default/chatd
 ExecStart=/opt/chatd/venv/bin/gunicorn \
     --bind 0.0.0.0:5001 \
     --worker-class gthread \
