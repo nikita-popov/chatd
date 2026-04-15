@@ -18,12 +18,17 @@ import sqlite3
 from pathlib import Path
 from typing import Optional
 
+from config import MEMPALACE_PALACE_PATH
+
 log = logging.getLogger("chatd.memory")
 
-# Default KG path matches mempalace's own DEFAULT_KG_PATH.
-# Override with MEMPALACE_KG_PATH env var if the palace lives elsewhere.
-_DEFAULT_KG_PATH = os.path.expanduser("~/.mempalace/knowledge_graph.sqlite3")
-_KG_PATH: str = os.environ.get("MEMPALACE_KG_PATH", _DEFAULT_KG_PATH)
+# ── paths ─────────────────────────────────────────────────────────────────────
+
+# MEMPALACE_PALACE_PATH points to the palace directory, e.g.
+# ~/.mempalace/palace.  MemPalace keeps knowledge_graph.sqlite3 in the
+# *parent* of that directory (~/.mempalace/).
+_PALACE_DIR: Path = Path(os.path.expanduser(MEMPALACE_PALACE_PATH))
+_KG_PATH: Path = _PALACE_DIR.parent / "knowledge_graph.sqlite3"
 
 # ── L1: in-process KG dict ────────────────────────────────────────────────────
 
@@ -36,13 +41,12 @@ _KG_LOADED: bool = False
 def _load_kg_dict() -> None:
     """Read all current KG triples from SQLite into _KG_DICT."""
     global _KG_DICT, _KG_LOADED
-    path = Path(_KG_PATH)
-    if not path.exists():
+    if not _KG_PATH.exists():
         log.warning("KG database not found: %s", _KG_PATH)
         _KG_LOADED = True
         return
     try:
-        con = sqlite3.connect(str(path), timeout=5, check_same_thread=False)
+        con = sqlite3.connect(str(_KG_PATH), timeout=5, check_same_thread=False)
         rows = con.execute(
             "SELECT s.name, t.predicate, o.name"
             " FROM triples t"
@@ -125,11 +129,10 @@ def _read_identity() -> str:
 
 def _read_kg_block(limit: int = 60) -> str:
     """Read the most recent KG triples directly from SQLite as a text block."""
-    path = Path(_KG_PATH)
-    if not path.exists():
+    if not _KG_PATH.exists():
         return ""
     try:
-        con = sqlite3.connect(str(path), timeout=5, check_same_thread=False)
+        con = sqlite3.connect(str(_KG_PATH), timeout=5, check_same_thread=False)
         rows = con.execute(
             "SELECT s.name, t.predicate, o.name"
             " FROM triples t"
@@ -155,8 +158,7 @@ def _run_wakeup_subprocess() -> str:
     import subprocess
 
     venv_python = os.environ.get("CHATD_MCP_MEMPALACE", "").split()[0] or "python3"
-    palace_path = os.environ.get("MEMPALACE_PALACE_PATH", "~/.mempalace/palace")
-    env = {**os.environ, "MEMPALACE_PALACE_PATH": palace_path}
+    env = {**os.environ, "MEMPALACE_PALACE_PATH": MEMPALACE_PALACE_PATH}
     try:
         result = subprocess.run(
             [venv_python, "-m", "mempalace", "wake-up"],
