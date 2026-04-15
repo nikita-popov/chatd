@@ -1,0 +1,44 @@
+# /etc/default/chatd
+# Environment file for the chatd systemd service.
+#
+# Install:
+#   sudo cp chatd.default /etc/default/chatd
+#   sudo chmod 640 /etc/default/chatd
+#   sudo chown root:chatd /etc/default/chatd
+#
+# After editing:
+#   sudo systemctl daemon-reload && sudo systemctl restart chatd
+#
+# This file is NOT tracked by git once deployed.
+# Keep secrets (tokens, passwords) out of the repository.
+
+# ── Ollama ────────────────────────────────────────────────────────────────────
+OLLAMA_API=http://127.0.0.1:11434
+
+# ── MCP servers ───────────────────────────────────────────────────────────────
+# Each CHATD_MCP_<NAME> variable registers one MCP server.
+# Value is a shell command; chatd discovers all CHATD_MCP_* vars at startup.
+CHATD_MCP_MONITOR=/opt/chatd/venv/bin/python /opt/chatd/mcp-monitor.py
+CHATD_MCP_ALERTS=/opt/chatd/venv/bin/python /opt/chatd/mcp-alerts.py
+CHATD_MCP_NOTES=/opt/chatd/venv/bin/python /opt/chatd/mcp-notes.py
+CHATD_MCP_MEMPALACE=/opt/chatd/venv/bin/python -m mempalace.mcp_server
+
+# ── MemPalace ─────────────────────────────────────────────────────────────────
+MEMPALACE_PALACE_PATH=/var/lib/mempalace
+
+# ── Notes (Memos) ─────────────────────────────────────────────────────────────
+MEMOS_URL=http://localhost:5230
+MEMOS_TOKEN=
+
+# ── Monitoring ────────────────────────────────────────────────────────────────
+ALERTMANAGER_URL=http://localhost:9093
+VICTORIA_URL=http://localhost:8428
+
+# ── Sampling (optional, uncomment to override defaults) ─────────────────────
+#CHATD_THINKING=false
+#CHATD_TEMPERATURE=0.3
+#CHATD_TOP_P=0.9
+#CHATD_TOP_K=40
+#CHATD_REPEAT_PENALTY=1.05
+#CHATD_NUM_CTX=8192
+#CHATD_NUM_PREDICT=768
