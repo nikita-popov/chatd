@@ -34,6 +34,12 @@ MEMOS_TOKEN=
 ALERTMANAGER_URL=http://localhost:9093
 VICTORIA_URL=http://localhost:8428
 
+# ── Tool descriptions ────────────────────────────────────────────────────────────
+# Optional: path to a local INI file that overrides tool_descriptions.ini.
+# Useful when you want to tune descriptions without modifying the repo.
+# Also loaded automatically from /etc/chatd/tool_descriptions.ini if it exists.
+#CHATD_TOOL_DESCRIPTIONS=/etc/chatd/tool_descriptions.ini
+
 # ── Sampling (optional, uncomment to override defaults) ─────────────────────
 #CHATD_THINKING=false
 #CHATD_TEMPERATURE=0.3
