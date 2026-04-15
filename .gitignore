@@ -5,3 +5,4 @@ venv/
 .env
 .env.local
 identity.local.txt
+!mcp/.gitkeep
