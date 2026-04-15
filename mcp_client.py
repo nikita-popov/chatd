@@ -9,6 +9,8 @@ from typing import Any
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
+from config import MCP_ENV_PREFIX
+
 # ---------------------------------------------------------------------------
 # MCP server auto-discovery
 #
@@ -21,8 +23,6 @@ from mcp.client.stdio import stdio_client
 #
 # Set these in .env or the systemd unit Environment= directives.
 # ---------------------------------------------------------------------------
-
-MCP_ENV_PREFIX = "CHATD_MCP_"
 
 
 def discover_mcp_servers() -> dict[str, list[str]]:

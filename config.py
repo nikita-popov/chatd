@@ -10,15 +10,15 @@ import os
 from pathlib import Path
 from typing import Any, Dict, Set
 
-# ── Ollama ───────────────────────────────────────────────────────────────────────
+# ── Ollama ────────────────────────────────────────────────────────────────────
 OLLAMA_API: str = os.environ.get("OLLAMA_API", "http://127.0.0.1:11434")
 
-# ── Thinking mode ───────────────────────────────────────────────────────────────
+# ── Thinking mode ─────────────────────────────────────────────────────────────
 # When True, ThinkingRemapper wraps model's thinking tokens in <think>...</think>.
 # Keep False for qwen3 tool-calling (thinking mode degrades JSON fidelity).
 THINKING: bool = os.environ.get("CHATD_THINKING", "false").lower() == "true"
 
-# ── Sampling ────────────────────────────────────────────────────────────────────
+# ── Sampling ──────────────────────────────────────────────────────────────────
 # Tuned for qwen3 8B non-thinking tool-calling.
 # Raise temperature to 0.7–1.0 when THINKING=true.
 DEFAULT_OPTIONS: Dict[str, Any] = {
@@ -30,9 +30,11 @@ DEFAULT_OPTIONS: Dict[str, Any] = {
     "repeat_penalty": float(os.environ.get("CHATD_REPEAT_PENALTY", "1.05")),
 }
 
-# ── MemPalace ───────────────────────────────────────────────────────────────────
+# ── MemPalace ─────────────────────────────────────────────────────────────────
 # Tools to expose to the model.  All others are loaded into TOOL_REGISTRY
 # (for call_tool) but hidden from the model context to save tokens.
+MEMPALACE_PALACE_PATH = os.environ.get("MEMPALACE_PALACE_PATH", "~/.mempalace/palace")
+
 _default_allowed = (
     "mempalace_status,mempalace_search,mempalace_add_drawer,"
     "mempalace_kg_query,mempalace_kg_add"
@@ -47,10 +49,10 @@ MEMPALACE_WRITE_TOOLS: Set[str] = {
     "mempalace_add_drawer",
 }
 
-# ── MCP auto-discovery prefix ───────────────────────────────────────────────────────
+# ── MCP auto-discovery prefix ─────────────────────────────────────────────────
 MCP_ENV_PREFIX: str = "CHATD_MCP_"
 
-# ── Tool description overrides ──────────────────────────────────────────────────────
+# ── Tool description overrides ────────────────────────────────────────────────
 # Loaded from INI files in this order (later files override earlier ones):
 #   1. tool_descriptions.ini  (next to this file, shipped with the repo)
 #   2. /etc/chatd/tool_descriptions.ini  (system-local, not in git)

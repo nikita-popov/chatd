@@ -18,6 +18,7 @@ from config import (
     OLLAMA_API,
     THINKING,
     DEFAULT_OPTIONS,
+    MEMPALACE_PALACE_PATH,
     MEMPALACE_ALLOWED_TOOLS,
     MEMPALACE_WRITE_TOOLS,
     TOOL_DESCRIPTION_OVERRIDES,
@@ -25,7 +26,7 @@ from config import (
 from mcp_client import MCPClient, discover_mcp_servers
 from think_remapper import ThinkingRemapper
 
-# ── logging ────────────────────────────────────────────────────────────────────
+# ── logging ───────────────────────────────────────────────────────────────────
 
 logging.basicConfig(
     level=logging.DEBUG,
@@ -34,15 +35,12 @@ logging.basicConfig(
 )
 log = logging.getLogger("chatd")
 
-# ── mempalace wake-up ────────────────────────────────────────────────────────────
+# ── mempalace wake-up ─────────────────────────────────────────────────────────
 
 def _run_wakeup() -> str:
     """Execute mempalace wake-up and return raw stdout (L0 + L1 text)."""
-    palace_path = os.environ.get("MEMPALACE_PALACE_PATH", "~/.local/share/mempalace")
-    venv_python = os.environ.get(
-        "CHATD_MCP_MEMPALACE", ""
-    ).split()[0] or "python3"
-    env = {**os.environ, "MEMPALACE_PALACE_PATH": palace_path}
+    venv_python = os.environ.get("CHATD_MCP_MEMPALACE", "").split()[0] or "python3"
+    env = {**os.environ, "MEMPALACE_PALACE_PATH": MEMPALACE_PALACE_PATH}
     try:
         result = subprocess.run(
             [venv_python, "-m", "mempalace", "wake-up"],
@@ -73,7 +71,7 @@ def invalidate_wakeup_cache() -> None:
     log.info("wake-up cache invalidated")
 
 
-# ── app ───────────────────────────────────────────────────────────────────────────
+# ── app ───────────────────────────────────────────────────────────────────────
 
 TOOLS: List[Dict] = []
 TOOL_REGISTRY: Dict[str, MCPClient] = {}
@@ -81,7 +79,7 @@ TOOL_REGISTRY: Dict[str, MCPClient] = {}
 app = Flask(__name__)
 
 
-# ── helpers ──────────────────────────────────────────────────────────────────────
+# ── helpers ───────────────────────────────────────────────────────────────────
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f") + "000Z"
@@ -165,7 +163,7 @@ def make_ollama_payload(
     return payload
 
 
-# ── CORS ────────────────────────────────────────────────────────────────────────
+# ── CORS ──────────────────────────────────────────────────────────────────────
 
 @app.after_request
 def add_cors(response: Response) -> Response:
@@ -181,7 +179,7 @@ def options_chat():
     return Response(status=204)
 
 
-# ── tools ────────────────────────────────────────────────────────────────────────
+# ── tools ─────────────────────────────────────────────────────────────────────
 
 def load_tools():
     tools    = []
@@ -245,14 +243,14 @@ def call_tool(name: str, arguments: Dict[str, Any]) -> Any:
     return result
 
 
-# ── stream yield helper ────────────────────────────────────────────────────────────
+# ── stream yield helper ───────────────────────────────────────────────────────
 
 def _log_yield(req_id: str, label: str, data: bytes) -> bytes:
     log.debug("[%s] yield %-12s %d bytes", req_id, label, len(data))
     return data
 
 
-# ── routes ───────────────────────────────────────────────────────────────────────
+# ── routes ────────────────────────────────────────────────────────────────────
 
 @app.get("/health")
 @app.get("/api/health")
@@ -358,7 +356,7 @@ def chat_stream_generator(
                 log.info("[%s] stream complete, no more tool rounds", req_id)
                 break
 
-            # ── loop detection ────────────────────────────────────────────────────────────
+            # ── loop detection ────────────────────────────────────────────────
             current_tool_names = [
                 (tc.get("function") or {}).get("name") for tc in last_tool_calls
             ]
@@ -373,7 +371,7 @@ def chat_stream_generator(
                 repeat_count = 0
             prev_tool_names = current_tool_names
 
-            # ── tool execution ────────────────────────────────────────────────────────────
+            # ── tool execution ────────────────────────────────────────────────
             messages.append({
                 "role":       "assistant",
                 "content":    remapper.content_acc,
@@ -515,7 +513,7 @@ def chat():
     )
 
 
-# ── entry point ───────────────────────────────────────────────────────────────────
+# ── entry point ───────────────────────────────────────────────────────────────
 
 init_tools()
 

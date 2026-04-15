@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ThinkingRemapper — convert Ollama thinking tokens to <think>...</think> in content.
+"""ThinkingRemapper - convert Ollama thinking tokens to <think>...</think> in content.
 
 Ollama streams qwen3 thinking as a separate ``message.thinking`` field.
 Frontends that only read ``message.content`` (e.g. ollama-gui) never see it.
