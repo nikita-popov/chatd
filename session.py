@@ -136,7 +136,7 @@ def get_session(session_id: str) -> Session:
 
 def record_turn(session: Session, user_msg: str, assistant_msg: str) -> None:
     """Append a Q/A pair to raw_turns and immediately persist to disk."""
-    session.raw_turns.append({"user": user_msg[:1000], "assistant": assistant_msg[:1000]})
+    session.raw_turns.append({"user": user_msg, "assistant": assistant_msg})
     log.debug(
         "[session:%s] recorded turn (raw_turns=%d, total_chars=%d)",
         session.session_id,
