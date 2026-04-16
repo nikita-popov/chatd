@@ -299,7 +299,7 @@ def _compress_summary(session: sess.Session) -> None:
         "options":  {"num_predict": 300, "temperature": 0.2},
     }
     try:
-        r = requests.post(f"{OLLAMA_API}/api/chat", json=payload, timeout=120)
+        r = requests.post(f"{OLLAMA_API}/api/chat", json=payload, timeout=600)
         r.raise_for_status()
         new_summary = (r.json().get("message") or {}).get("content", "").strip()
         if new_summary:
