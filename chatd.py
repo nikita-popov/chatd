@@ -39,7 +39,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("chatd")
 
-# ── app ─────────────────────────────────────────────────────────────────────────────
+# ── app ───────────────────────────────────────────────────────────────────────────
 
 TOOLS: List[Dict] = []
 TOOL_REGISTRY: Dict[str, MCPClient] = {}
@@ -47,7 +47,7 @@ TOOL_REGISTRY: Dict[str, MCPClient] = {}
 app = Flask(__name__)
 
 
-# ── helpers ───────────────────────────────────────────────────────────────────
+# ── helpers ───────────────────────────────────────────────────────────────────────
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f") + "000Z"
@@ -197,7 +197,7 @@ def make_ollama_payload(
     return payload
 
 
-# ── CORS ──────────────────────────────────────────────────────────────────────────
+# ── CORS ─────────────────────────────────────────────────────────────────────────────
 
 @app.after_request
 def add_cors(response: Response) -> Response:
@@ -213,7 +213,7 @@ def options_chat():
     return Response(status=204)
 
 
-# ── tools ───────────────────────────────────────────────────────────────────────
+# ── tools ─────────────────────────────────────────────────────────────────────────
 
 def load_tools():
     tools    = []
@@ -296,7 +296,7 @@ def call_tool(name: str, arguments: Dict[str, Any]) -> Any:
     return result
 
 
-# ── L1.5: rolling summary ─────────────────────────────────────────────────────
+# ── L1.5: rolling summary ─────────────────────────────────────────────────────────
 
 _SUMMARIZE_SYSTEM = (
     "You are a memory compressor for a personal AI assistant.\n"
@@ -369,14 +369,14 @@ def maybe_compress_async(session: sess.Session) -> None:
     log.debug("[session:%s] compression thread started", session.session_id)
 
 
-# ── stream yield helper ──────────────────────────────────────────────────────────────────
+# ── stream yield helper ─────────────────────────────────────────────────────────────────────
 
 def _log_yield(req_id: str, label: str, data: bytes) -> bytes:
     log.debug("[%s] yield %-12s %d bytes", req_id, label, len(data))
     return data
 
 
-# ── routes ───────────────────────────────────────────────────────────────────────
+# ── routes ──────────────────────────────────────────────────────────────────────────
 
 @app.get("/health")
 @app.get("/api/health")
@@ -490,7 +490,7 @@ def chat_stream_generator(
                 log.info("[%s] stream complete, no more tool rounds", req_id)
                 break
 
-            # ── loop detection ───────────────────────────────────────────────────────────────
+            # ── loop detection ───────────────────────────────────────────────────────────────────────
             current_tool_names = [
                 (tc.get("function") or {}).get("name") for tc in last_tool_calls
             ]
@@ -505,7 +505,7 @@ def chat_stream_generator(
                 repeat_count = 0
             prev_tool_names = current_tool_names
 
-            # ── tool execution ─────────────────────────────────────────────────────────────────
+            # ── tool execution ──────────────────────────────────────────────────────────────────────────────
             messages.append({
                 "role":       "assistant",
                 "content":    remapper.content_acc,
@@ -542,17 +542,30 @@ def chat_stream_generator(
 
         log.debug("[%s] generator exiting normally", req_id)
 
-    except GeneratorExit:
-        log.warning("[%s] GeneratorExit: client disconnected", req_id)
     except Exception as e:
         log.error("[%s] unhandled exception: %s", req_id, traceback.format_exc())
         yield make_chunk(model, f"\n[internal error: {e}]\n", done=True)
-        return
 
-    # ── record turn + maybe compress (fire-and-forget) ───────────────────────
-    if session and last_user_msg and final_assistant_content:
-        sess.record_turn(session, last_user_msg, final_assistant_content)
-        maybe_compress_async(session)
+    finally:
+        # Always runs: on normal exit, GeneratorExit (client disconnect), or Exception.
+        # GeneratorExit is a BaseException thrown by the WSGI server when the client
+        # drops the connection — we cannot yield after it, but we CAN save state.
+        if session and last_user_msg and final_assistant_content:
+            log.debug(
+                "[%s] [finally] saving turn: session=%s user=%d chars assistant=%d chars",
+                req_id, session.session_id,
+                len(last_user_msg), len(final_assistant_content),
+            )
+            sess.record_turn(session, last_user_msg, final_assistant_content)
+            maybe_compress_async(session)
+        else:
+            log.debug(
+                "[%s] [finally] skipping save: session=%s user_empty=%s answer_empty=%s",
+                req_id,
+                session.session_id if session else "None",
+                not last_user_msg,
+                not final_assistant_content,
+            )
 
 
 @app.post("/chat")
@@ -571,7 +584,7 @@ def chat():
     options     = merge_options(original_payload.get("options"))
     want_stream = original_payload.get("stream", True)
 
-    # ── session / L1.5 ───────────────────────────────────────────────────────
+    # ── session / L1.5 ─────────────────────────────────────────────────────────
     chat_id = extract_chat_id(messages)
     session = sess.get_session(chat_id) if chat_id else None
     summary = session.summary if session else ""
@@ -642,6 +655,10 @@ def chat():
             if session and answer:
                 last_user = _last_user_text(messages)
                 if last_user:
+                    log.debug(
+                        "[%s] non-stream: saving turn session=%s user=%d chars answer=%d chars",
+                        req_id, session.session_id, len(last_user), len(answer),
+                    )
                     sess.record_turn(session, last_user, answer)
                     maybe_compress_async(session)
 
@@ -669,7 +686,7 @@ def chat():
     )
 
 
-# ── entry point ──────────────────────────────────────────────────────────────────────
+# ── entry point ──────────────────────────────────────────────────────────────────────────────
 
 init_tools()
 memory.init()
