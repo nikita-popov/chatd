@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import re
+import threading
 import traceback
 import uuid
 from datetime import datetime, timezone
@@ -13,6 +14,7 @@ from requests.exceptions import ReadTimeout
 from flask import Flask, request, Response, jsonify, stream_with_context
 
 import memory
+import session as sess
 from config import (
     OLLAMA_API,
     THINKING,
@@ -22,6 +24,8 @@ from config import (
     MEMPALACE_WRITE_TOOLS,
     TOOL_OVERRIDE,
     TOOL_DESCRIPTION_OVERRIDES,
+    CHATD_SUMMARY_MODEL,
+    CHATD_COMPRESS_EVERY,
 )
 from mcp_client import MCPClient, discover_mcp_servers
 from think_remapper import ThinkingRemapper
@@ -82,17 +86,44 @@ def merge_options(client_options: Optional[Dict]) -> Dict[str, Any]:
     return opts
 
 
-def ensure_system_prompt(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    system_prompt = memory.wake_up()
+def extract_chat_id(messages: List[Dict]) -> Optional[str]:
+    """Return chatId from the first message that carries it, or None."""
+    for m in messages:
+        chat_id = m.get("chatId")
+        if chat_id is not None:
+            return str(chat_id)
+    return None
+
+
+def ensure_system_prompt(
+    messages: List[Dict[str, Any]],
+    summary: str = "",
+) -> List[Dict[str, Any]]:
+    """Replace or prepend the system message with the full L0+L1+L1.5 block."""
+    system_prompt = memory.wake_up(summary=summary)
     if not isinstance(messages, list) or not messages:
         return [{"role": "system", "content": system_prompt}]
     if messages[0].get("role") != "system":
         return [{"role": "system", "content": system_prompt}] + messages
-    return messages
+    # Replace whatever system prompt ollama-gui sent with ours.
+    return [{"role": "system", "content": system_prompt}] + messages[1:]
 
 
-def build_model_messages(raw_messages: List[Dict]) -> List[Dict]:
-    result = []
+def build_model_messages(
+    raw_messages: List[Dict],
+    max_history_turns: int = 20,
+) -> List[Dict]:
+    """Sanitise messages for the Ollama API.
+
+    - Strip fields unknown to Ollama (chatId, id, createdAt, updatedAt …).
+    - Remove <think>…</think> blocks from previous assistant turns.
+    - Keep system message as-is (already assembled by ensure_system_prompt).
+    - Limit history to *max_history_turns* user+assistant pairs to prevent
+      context-window overflow.  The system message is never trimmed.
+    """
+    system: Optional[Dict] = None
+    turns: List[Dict] = []
+
     for m in raw_messages:
         role = m.get("role")
         if role not in ("system", "user", "assistant", "tool"):
@@ -100,10 +131,24 @@ def build_model_messages(raw_messages: List[Dict]) -> List[Dict]:
         content = m.get("content", "") or ""
         if role == "assistant":
             content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
+
+        if role == "system":
+            system = {"role": "system", "content": content}
+            continue
+
         entry: Dict[str, Any] = {"role": role, "content": content}
         if role == "assistant" and m.get("tool_calls"):
             entry["tool_calls"] = m["tool_calls"]
-        result.append(entry)
+        turns.append(entry)
+
+    # Trim non-system turns: keep last N user+assistant pairs.
+    if len(turns) > max_history_turns * 2:
+        turns = turns[-(max_history_turns * 2):]
+
+    result = []
+    if system:
+        result.append(system)
+    result.extend(turns)
     return result
 
 
@@ -174,7 +219,7 @@ def load_tools():
 
             # Hide non-whitelisted tools from model context.
             if TOOLS_FILTER:
-                if name not in ALLOWED_TOOLS:
+                if name not in TOOLS_ALLOWED:
                     log.debug("[tools] hiding from model context: %s", name)
                     continue
 
@@ -212,6 +257,79 @@ def call_tool(name: str, arguments: Dict[str, Any]) -> Any:
     return result
 
 
+# ── L1.5: rolling summary ─────────────────────────────────────────────────────
+
+_SUMMARIZE_SYSTEM = (
+    "You are a memory compressor for a personal AI assistant.\n"
+    "Given the previous conversation summary and a new Q/A exchange, "
+    "produce an updated concise summary.\n"
+    "Rules:\n"
+    "- Keep facts, decisions, preferences, open questions.\n"
+    "- Drop pleasantries, tool call details, repetitions.\n"
+    "- Max 200 words.\n"
+    "- Plain text only, no markdown."
+)
+
+
+def _compress_summary(session: sess.Session) -> None:
+    """Blocking compress call — meant to run in a background thread.
+
+    Reads raw_turns from session, calls CHATD_SUMMARY_MODEL, updates
+    session.summary and persists to disk.  Clears raw_turns on success.
+    """
+    if not session.raw_turns:
+        return
+
+    turns_text = "\n".join(
+        f"User: {t['user']}\nAssistant: {t['assistant']}"
+        for t in session.raw_turns
+    )
+    messages = [
+        {"role": "system",  "content": _SUMMARIZE_SYSTEM},
+        {"role": "user",    "content": (
+            f"Previous summary:\n{session.summary or '(empty)'}\n\n"
+            f"New exchanges:\n{turns_text}"
+        )},
+    ]
+    payload = {
+        "model":    CHATD_SUMMARY_MODEL,
+        "messages": messages,
+        "stream":   False,
+        "think":    False,
+        "options":  {"num_predict": 300, "temperature": 0.2},
+    }
+    try:
+        r = requests.post(f"{OLLAMA_API}/api/chat", json=payload, timeout=120)
+        r.raise_for_status()
+        new_summary = (r.json().get("message") or {}).get("content", "").strip()
+        if new_summary:
+            session.summary = new_summary
+            session.raw_turns.clear()
+            session.save()
+            log.info(
+                "[session:%s] summary updated (%d chars)",
+                session.session_id, len(new_summary),
+            )
+        else:
+            log.warning("[session:%s] summariser returned empty content", session.session_id)
+    except Exception as e:
+        log.warning("[session:%s] compress failed: %s", session.session_id, e)
+
+
+def maybe_compress_async(session: sess.Session) -> None:
+    """Fire-and-forget compression after every CHATD_COMPRESS_EVERY turns."""
+    if len(session.raw_turns) < CHATD_COMPRESS_EVERY:
+        return
+    t = threading.Thread(
+        target=_compress_summary,
+        args=(session,),
+        daemon=True,
+        name=f"compress-{session.session_id}",
+    )
+    t.start()
+    log.debug("[session:%s] compression thread started", session.session_id)
+
+
 # ── stream yield helper ──────────────────────────────────────────────────────────────────
 
 def _log_yield(req_id: str, label: str, data: bytes) -> bytes:
@@ -237,15 +355,25 @@ def chat_stream_generator(
     model: str,
     messages: List[Dict],
     options: Dict[str, Any],
+    session: Optional[sess.Session],
     req_id: str = "-",
 ) -> Generator[bytes, None, None]:
     MAX_TOOL_ROUNDS = 5
     prev_tool_names: Optional[List[str]] = None
     repeat_count = 0
 
+    # Extract the last user message for session recording.
+    last_user_msg = ""
+    for m in reversed(messages):
+        if m.get("role") == "user":
+            last_user_msg = (m.get("content") or "")[:1000]
+            break
+
     data = make_keepalive(model)
     log.debug("[%s] yield %-12s %d bytes", req_id, "keepalive/0", len(data))
     yield data
+
+    final_assistant_content = ""
 
     try:
         for round_num in range(MAX_TOOL_ROUNDS):
@@ -307,6 +435,8 @@ def chat_stream_generator(
                         if last_tool_calls:
                             yield _log_yield(req_id, "keepalive/tc", make_keepalive(model))
                         else:
+                            # Final assistant response — record for L1.5.
+                            final_assistant_content = remapper.content_acc
                             yield _log_yield(req_id, "done", remapper.feed(line))
                         break
 
@@ -382,6 +512,12 @@ def chat_stream_generator(
     except Exception as e:
         log.error("[%s] unhandled exception: %s", req_id, traceback.format_exc())
         yield make_chunk(model, f"\n[internal error: {e}]\n", done=True)
+        return
+
+    # ── record turn + maybe compress (fire-and-forget) ───────────────────────
+    if session and last_user_msg and final_assistant_content:
+        sess.record_turn(session, last_user_msg, final_assistant_content)
+        maybe_compress_async(session)
 
 
 @app.post("/chat")
@@ -400,7 +536,13 @@ def chat():
     options     = merge_options(original_payload.get("options"))
     want_stream = original_payload.get("stream", True)
 
-    messages = ensure_system_prompt(messages)
+    # ── session / L1.5 ───────────────────────────────────────────────────────
+    chat_id = extract_chat_id(messages)
+    session = sess.get_session(chat_id) if chat_id else None
+    summary = session.summary if session else ""
+    log.info("[%s] chat_id=%s summary_len=%d", req_id, chat_id, len(summary))
+
+    messages = ensure_system_prompt(messages, summary=summary)
 
     log.info("[%s] POST /api/chat model=%s stream=%s messages=%d options=%s",
              req_id, model, want_stream, len(messages), options)
@@ -460,6 +602,18 @@ def chat():
 
             msg    = resp.get("message") or {}
             answer = (msg.get("content") or "").strip() or "[пустой ответ]"
+
+            # Record turn for non-stream path too.
+            if session and answer:
+                last_user = ""
+                for m in reversed(messages):
+                    if m.get("role") == "user":
+                        last_user = (m.get("content") or "")[:1000]
+                        break
+                if last_user:
+                    sess.record_turn(session, last_user, answer)
+                    maybe_compress_async(session)
+
             log.info("[%s] non-stream done, answer_len=%d", req_id, len(answer))
             return jsonify({"model": model, "answer": answer, "raw": resp})
 
@@ -472,7 +626,9 @@ def chat():
 
     log.info("[%s] starting stream generator", req_id)
     return Response(
-        stream_with_context(chat_stream_generator(model, messages, options, req_id)),
+        stream_with_context(
+            chat_stream_generator(model, messages, options, session, req_id)
+        ),
         content_type="application/x-ndjson",
         headers={
             "X-Accel-Buffering": "no",
