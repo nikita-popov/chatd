@@ -1,6 +1,6 @@
 # chatd
 
-A minimal chat backend that connects [Ollama](https://ollama.com) to MCP tool servers and a long-term memory system ([MemPalace](https://github.com/MemPalace/mempalace)).
+A minimal bridge that connects [Ollama](https://ollama.com) to MCP tool servers and a long-term memory system ([MemPalace](https://github.com/MemPalace/mempalace)).
 
 Sits between a static frontend (e.g. [ollama-gui](https://github.com/ollama-webui/ollama-webui)) and Ollama, adding:
 
@@ -16,10 +16,8 @@ browser
   └── nginx (chat.example.com)
         ├── /          → ollama-gui  (static frontend, :8080)
         ├── /api/      → chatd       (:5001, this repo)
-        │     ├── MCP: mcp-monitor.py   (VictoriaMetrics)
-        │     ├── MCP: mcp-alerts.py    (Alertmanager)
-        │     ├── MCP: mcp-notes.py     (Memos)
-        │     └── MCP: mempalace.mcp_server (long-term memory)
+        │     ├── MCP
+        │     └── MemPalace (long-term memory)
         └── /api/ollama/ → Ollama    (:11434)
 ```
 
@@ -27,46 +25,27 @@ browser
 
 - Python 3.11+
 - [Ollama](https://ollama.com) running locally on `:11434`
-- [MemPalace](https://github.com/MemPalace/mempalace) installed and initialised
-- Memos instance (for notes MCP, optional)
-- VictoriaMetrics + Alertmanager (for monitoring MCPs, optional)
 
 ## Setup
 
 ```sh
-git clone https://github.com/nikita-popov/chatd /opt/chatd
-cd /opt/chatd
+git clone https://github.com/nikita-popov/chatd
+cd chatd
 
 python3 -m venv venv
 . venv/bin/activate
 pip install -r requirements.txt
-
-# Initialise MemPalace
-MEMPALACE_PALACE_PATH=/var/lib/mempalace mempalace init
 ```
 
-Edit `mcp_client.py` to point MCP commands at your venv and scripts:
+Edit `ENV` to point MCP commands:
 
-```python
-MCP_ALERTS_CMD    = ["/opt/chatd/venv/bin/python", "/opt/chatd/mcp-alerts.py"]
-MCP_MONITOR_CMD   = ["/opt/chatd/venv/bin/python", "/opt/chatd/mcp-monitor.py"]
-MCP_NOTES_CMD     = ["/opt/chatd/venv/bin/python", "/opt/chatd/mcp-notes.py"]
-MCP_MEMPALACE_CMD = ["/opt/chatd/venv/bin/python", "-m", "mempalace.mcp_server"]
+```plain
+CHATD_MCP_MONITOR=/path/to/venv/bin/python /path/to/mcp-monitor.py
 ```
 
-Set environment variables required by the MCP servers (`MEMOS_URL`, `MEMOS_TOKEN`,
-`ALERTMANAGER_URL`, `VICTORIA_URL`) in the systemd unit or shell environment.
+And set environment variables required by the MCP servers.
 
 ## Running
-
-**Development:**
-
-```sh
-. venv/bin/activate
-MEMPALACE_PALACE_PATH=/var/lib/mempalace python chatd.py
-```
-
-**Production (systemd):**
 
 ```sh
 cp chatd.service /etc/systemd/system/
@@ -108,25 +87,6 @@ Proxied directly to Ollama. Used by the frontend to list available models.
 
 Returns `{"ok": true}`.
 
-## MCP Tools
-
-Tools exposed to the model (filtered subset of what each MCP server provides):
-
-| Tool | Server | When called |
-|------|--------|-------------|
-| `monitor_query` | mcp-monitor.py | User asks for metrics (CPU, RAM, uptime) |
-| `alerts_list` | mcp-alerts.py | User asks about firing alerts |
-| `alerts_summary` | mcp-alerts.py | User asks for alert overview |
-| `notes_search` | mcp-notes.py | User asks to find notes |
-| `mempalace_status` | mempalace | Once per session - loads memory protocol |
-| `mempalace_search` | mempalace | Semantic search in long-term memory |
-| `mempalace_add_drawer` | mempalace | Filing new facts into ChromaDB |
-| `mempalace_kg_query` | mempalace | Structured fact lookup (fast) |
-| `mempalace_kg_add` | mempalace | Adding triples on explicit user request |
-
-Tool arguments for `mempalace_kg_add` are sanitised server-side:
-Cyrillic is transliterated to Latin, spaces replaced with underscores.
-
 ## Identity
 
 The assistant identity and tool usage rules live in `identity.txt`.
@@ -135,11 +95,11 @@ The file is loaded by MemPalace `wake-up` as L0 context on every request.
 
 ## Configuration
 
-Key constants in `chatd.py`:
+Key constants in `ENV`:
 
 | Constant | Default | Description |
 |----------|---------|-------------|
-| `THINKING` | `False` | Enable Qwen3 extended thinking (`<think>`) |
+| `THINKING` | `False` | Enable model extended thinking (`<think>`) |
 | `DEFAULT_OPTIONS` | see code | Ollama sampling params (temp, top_k, etc.) |
 | `MEMPALACE_ALLOWED_TOOLS` | see code | MemPalace tools visible to the model |
 | `MEMPALACE_WRITE_TOOLS` | see code | Tools that trigger wake-up cache invalidation |
