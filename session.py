@@ -10,6 +10,7 @@ Schema (JSON on disk)::
     {
         "session_id": "42",
         "summary":    "User prefers Emacs.  Working on chatd memory layers.",
+        "raw_turns":  [{"user": "...", "assistant": "..."}],
         "updated_at": "2026-04-16T15:00:00Z"
     }
 """
@@ -43,19 +44,24 @@ class Session:
         return d / f"{self.session_id}.json"
 
     def save(self) -> None:
-        """Persist summary to disk.  raw_turns are in-memory only."""
+        """Persist summary and raw_turns to disk."""
         data = {
             "session_id": self.session_id,
             "summary":    self.summary,
+            "raw_turns":  self.raw_turns,
             "updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         }
+        path = self._path()
         try:
-            self._path().write_text(
+            path.write_text(
                 json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
             )
-            log.debug("[session:%s] saved (%d chars)", self.session_id, len(self.summary))
+            log.debug(
+                "[session:%s] saved to %s (summary=%d chars, raw_turns=%d)",
+                self.session_id, path, len(self.summary), len(self.raw_turns),
+            )
         except Exception as e:
-            log.warning("[session:%s] save failed: %s", self.session_id, e)
+            log.warning("[session:%s] save failed (path=%s): %s", self.session_id, path, e)
 
     @classmethod
     def load(cls, session_id: str) -> "Session":
@@ -64,14 +70,19 @@ class Session:
         if path.exists():
             try:
                 data = json.loads(path.read_text(encoding="utf-8"))
-                s = cls(session_id=session_id, summary=data.get("summary", ""))
+                s = cls(
+                    session_id=session_id,
+                    summary=data.get("summary", ""),
+                    raw_turns=data.get("raw_turns", []),
+                )
                 log.info(
-                    "[session:%s] loaded from disk (%d chars)",
-                    session_id, len(s.summary),
+                    "[session:%s] loaded from %s (summary=%d chars, raw_turns=%d)",
+                    session_id, path, len(s.summary), len(s.raw_turns),
                 )
                 return s
             except Exception as e:
-                log.warning("[session:%s] load failed: %s", session_id, e)
+                log.warning("[session:%s] load failed (path=%s): %s", session_id, path, e)
+        log.debug("[session:%s] no file at %s, starting fresh", session_id, path)
         return cls(session_id=session_id)
 
 
@@ -83,6 +94,12 @@ def get_session(session_id: str) -> Session:
 
 
 def record_turn(session: Session, user_msg: str, assistant_msg: str) -> None:
-    """Append a Q/A pair to the session's raw_turns buffer."""
+    """Append a Q/A pair to raw_turns and immediately persist to disk."""
     session.raw_turns.append({"user": user_msg[:1000], "assistant": assistant_msg[:1000]})
-    log.debug("[session:%s] raw_turns=%d", session.session_id, len(session.raw_turns))
+    log.debug(
+        "[session:%s] recorded turn (raw_turns=%d, total_chars=%d)",
+        session.session_id,
+        len(session.raw_turns),
+        sum(len(t["user"]) + len(t["assistant"]) for t in session.raw_turns),
+    )
+    session.save()
