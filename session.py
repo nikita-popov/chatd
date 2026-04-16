@@ -68,7 +68,7 @@ class Session:
             log.warning("[session:%s] save failed (path=%s): %s", self.session_id, path, e)
             return
 
-        self._save_chatlog()
+        #self._save_chatlog()
 
     def _save_chatlog(self) -> None:
         """Write raw_turns as Claude Code JSONL for ``mempalace mine --mode convos``.
@@ -103,6 +103,23 @@ class Session:
                 "[session:%s] chatlog write failed (path=%s): %s",
                 self.session_id, log_path, e,
             )
+
+    def append_chatlog(self, user: str, assistant: str) -> None:
+        """Append one turn to the persistent chatlog — never truncates."""
+        log_path = self._path().with_suffix(".jsonl")
+        lines = [
+            json.dumps({"type": "human",
+                        "message": {"role": "human", "content": user}},
+                       ensure_ascii=False),
+            json.dumps({"type": "assistant",
+                        "message": {"role": "assistant", "content": assistant}},
+                       ensure_ascii=False),
+        ]
+        try:
+            with log_path.open("a", encoding="utf-8") as f:
+                f.write("\n".join(lines) + "\n")
+        except Exception as e:
+            log.warning("[session:%s] chatlog append failed: %s", self.session_id, e)
 
     @classmethod
     def load(cls, session_id: str) -> "Session":
@@ -143,4 +160,5 @@ def record_turn(session: Session, user_msg: str, assistant_msg: str) -> None:
         len(session.raw_turns),
         sum(len(t["user"]) + len(t["assistant"]) for t in session.raw_turns),
     )
+    session.append_chatlog(user_msg, assistant_msg)
     session.save()
