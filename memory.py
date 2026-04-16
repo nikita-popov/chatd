@@ -29,6 +29,13 @@ log = logging.getLogger("chatd.memory")
 
 _kg: Optional[KnowledgeGraph] = None
 
+# Words to skip when extracting entity candidates from free text.
+_STOPWORDS = frozenset({
+    "что", "как", "где", "это", "мне", "ты", "я", "он", "она", "они",
+    "мой", "моя", "моё", "мои", "the", "and", "for", "you", "are",
+    "that", "this", "with", "from", "have", "what", "when", "where",
+})
+
 
 def _get_kg() -> Optional[KnowledgeGraph]:
     """Return a shared KnowledgeGraph instance, initialised lazily."""
@@ -72,6 +79,54 @@ def kg_recall(entity: str) -> Optional[str]:
         if t.get("current")
     ]
     return "\n".join(lines) if lines else None
+
+
+def kg_recall_from_text(text: str, max_results: int = 5) -> Optional[str]:
+    """Extract entity candidates from *text* and query KG for each.
+
+    Scans the user message for words that might be KG subjects/entities,
+    queries each one via kg_recall(), and returns a deduplicated fact block.
+    Returns None when nothing is found — caller decides whether to fall back
+    to mempalace_kg_query MCP tool.
+
+    Heuristic: words longer than 3 chars that are not in _STOPWORDS.
+    At most 8 entity candidates are checked to bound latency.
+    """
+    words = {
+        w.lower().strip(".,!?:;\"'()")
+        for w in text.split()
+        if len(w) > 3 and w.lower().strip(".,!?:;\"'()") not in _STOPWORDS
+    }
+    if not words:
+        return None
+
+    kg = _get_kg()
+    if kg is None:
+        return None
+
+    today = date.today().isoformat()
+    lines: list[str] = []
+    seen: set[str] = set()
+
+    for word in sorted(words)[:8]:
+        try:
+            triples = kg.query_entity(word, as_of=today)
+        except Exception as e:
+            log.debug("FastMemory: kg_recall_from_text entity=%s failed: %s", word, e)
+            continue
+        for t in triples:
+            key = f"{t['subject']}|{t['predicate']}|{t['object']}"
+            if key not in seen and t.get("current"):
+                seen.add(key)
+                lines.append(f"{t['subject']} {t['predicate']} {t['object']}")
+        if len(lines) >= max_results:
+            break
+
+    if not lines:
+        return None
+    result = "\n".join(lines[:max_results])
+    log.debug("FastMemory: kg_recall_from_text found %d facts", len(lines))
+    return result
 
 
 def invalidate() -> None:

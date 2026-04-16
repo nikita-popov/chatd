@@ -95,12 +95,37 @@ def extract_chat_id(messages: List[Dict]) -> Optional[str]:
     return None
 
 
+def _last_user_text(messages: List[Dict]) -> str:
+    """Return the content of the most recent user message, or empty string."""
+    for m in reversed(messages):
+        if m.get("role") == "user":
+            return (m.get("content") or "")[:1000]
+    return ""
+
+
 def ensure_system_prompt(
     messages: List[Dict[str, Any]],
     summary: str = "",
 ) -> List[Dict[str, Any]]:
-    """Replace or prepend the system message with the full L0+L1+L1.5 block."""
-    system_prompt = memory.wake_up(summary=summary)
+    """Replace or prepend the system message with the full L0+L1+L1.5 block.
+
+    Also performs a sidecar L1 enrichment: extracts entity candidates from
+    the last user message and appends any matching KG facts as a
+    '# Recalled facts' section.  This lets the model use those facts
+    without a tool call round-trip.
+    """
+    base_prompt = memory.wake_up(summary=summary)
+
+    # Sidecar: enrich system prompt with entity-specific KG recall.
+    last_user = _last_user_text(messages)
+    if last_user:
+        extra = memory.kg_recall_from_text(last_user)
+        if extra:
+            log.debug("[sidecar] injecting %d-char KG recall into system prompt", len(extra))
+            base_prompt = f"{base_prompt}\n\n# Recalled facts\n{extra}"
+
+    system_prompt = base_prompt
+
     if not isinstance(messages, list) or not messages:
         return [{"role": "system", "content": system_prompt}]
     if messages[0].get("role") != "system":
@@ -244,6 +269,20 @@ def init_tools():
 
 
 def call_tool(name: str, arguments: Dict[str, Any]) -> Any:
+    # Fast-path intercept: serve mempalacekgquery from in-process KG when
+    # possible.  Avoids MCP subprocess round-trip for cache-hot entities.
+    if name == "mempalacekgquery":
+        entity = arguments.get("entity", "")
+        if entity:
+            fast = memory.kg_recall(entity)
+            if fast:
+                log.info(
+                    "[tool] mempalacekgquery intercepted by FastMemory (entity=%s)",
+                    entity,
+                )
+                return {"facts": fast, "source": "fast_memory"}
+        # Cache miss — fall through to MCP.
+
     client = TOOL_REGISTRY.get(name)
     if client is None:
         raise RuntimeError(f"Unknown tool: {name}")
@@ -363,11 +402,7 @@ def chat_stream_generator(
     repeat_count = 0
 
     # Extract the last user message for session recording.
-    last_user_msg = ""
-    for m in reversed(messages):
-        if m.get("role") == "user":
-            last_user_msg = (m.get("content") or "")[:1000]
-            break
+    last_user_msg = _last_user_text(messages)
 
     data = make_keepalive(model)
     log.debug("[%s] yield %-12s %d bytes", req_id, "keepalive/0", len(data))
@@ -605,11 +640,7 @@ def chat():
 
             # Record turn for non-stream path too.
             if session and answer:
-                last_user = ""
-                for m in reversed(messages):
-                    if m.get("role") == "user":
-                        last_user = (m.get("content") or "")[:1000]
-                        break
+                last_user = _last_user_text(messages)
                 if last_user:
                     sess.record_turn(session, last_user, answer)
                     maybe_compress_async(session)
