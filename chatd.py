@@ -338,6 +338,7 @@ def _compress_summary(session: sess.Session) -> None:
         "options":  {"num_predict": 300, "temperature": 0.2},
     }
     try:
+        log.debug("[session:%s] compression model: %s", session.session_id, CHATD_SUMMARY_MODEL)
         r = requests.post(f"{OLLAMA_API}/api/chat", json=payload, timeout=600)
         r.raise_for_status()
         new_summary = (r.json().get("message") or {}).get("content", "").strip()
