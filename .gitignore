@@ -7,3 +7,4 @@ venv/
 identity.local.txt
 mcp/*
 !mcp/.gitkeep
+tool_descriptions.ini
