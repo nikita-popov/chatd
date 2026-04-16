@@ -13,6 +13,10 @@ Schema (JSON on disk)::
         "raw_turns":  [{"user": "...", "assistant": "..."}],
         "updated_at": "2026-04-16T15:00:00Z"
     }
+
+Alongside each .json file a .jsonl sibling is written in Claude Code JSONL
+format so the session can be ingested by ``mempalace mine --mode convos``
+without any extra conversion step.
 """
 import json
 import logging
@@ -44,7 +48,7 @@ class Session:
         return d / f"{self.session_id}.json"
 
     def save(self) -> None:
-        """Persist summary and raw_turns to disk."""
+        """Persist summary and raw_turns to disk, then refresh the JSONL chatlog."""
         data = {
             "session_id": self.session_id,
             "summary":    self.summary,
@@ -62,6 +66,43 @@ class Session:
             )
         except Exception as e:
             log.warning("[session:%s] save failed (path=%s): %s", self.session_id, path, e)
+            return
+
+        self._save_chatlog()
+
+    def _save_chatlog(self) -> None:
+        """Write raw_turns as Claude Code JSONL for ``mempalace mine --mode convos``.
+
+        Format: one JSON object per line, alternating human/assistant turns.
+        normalize.py in mempalace detects this schema via the ``type`` field
+        and applies strip_noise + tool_use capture automatically.
+        """
+        if not self.raw_turns:
+            return
+        log_path = self._path().with_suffix(".jsonl")
+        lines = []
+        for turn in self.raw_turns:
+            lines.append(json.dumps(
+                {"type": "human",
+                 "message": {"role": "human", "content": turn["user"]}},
+                ensure_ascii=False,
+            ))
+            lines.append(json.dumps(
+                {"type": "assistant",
+                 "message": {"role": "assistant", "content": turn["assistant"]}},
+                ensure_ascii=False,
+            ))
+        try:
+            log_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            log.debug(
+                "[session:%s] chatlog jsonl written to %s (%d turns)",
+                self.session_id, log_path, len(self.raw_turns),
+            )
+        except Exception as e:
+            log.warning(
+                "[session:%s] chatlog write failed (path=%s): %s",
+                self.session_id, log_path, e,
+            )
 
     @classmethod
     def load(cls, session_id: str) -> "Session":
