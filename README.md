@@ -99,11 +99,14 @@ Key constants in `ENV`:
 
 | Constant | Default | Description |
 |----------|---------|-------------|
-| `THINKING` | `False` | Enable model extended thinking (`<think>`) |
-| `DEFAULT_OPTIONS` | see code | Ollama sampling params (temp, top_k, etc.) |
-| `MEMPALACE_ALLOWED_TOOLS` | see code | MemPalace tools visible to the model |
-| `MEMPALACE_WRITE_TOOLS` | see code | Tools that trigger wake-up cache invalidation |
-| `TOOL_DESCRIPTION_OVERRIDES` | see code | Per-tool descriptions sent to the model |
+| `OLLAMA_API` | `http://127.0.0.1:11434` | Ollama endpoint |
+| `CHATD_THINKING` | `False` | Enable model extended thinking (`<think>`) |
+| `CHATD_TOOLS_FILTER` | `False` | Enable filtering of tools available to the model |
+| `CHATD_TOOLS_ALLOWED` | see code | Tools visible to the model |
+| `CHATD_TOOL_OVERRIDE` | `False` | Enable overwriting tool descriptions |
+| `CHATD_TOOL_DESCRIPTIONS` | see code | Per-tool descriptions sent to the model |
+| `MEMPALACE_PALACE_PATH` | `~/.local/share/mempalace` | Path to the palace directory |
+| `MEMPALACE_KG_PATH` | `~/.mempalace/knowledge_graph.sqlite3` | Path to knowledge graph |
 
 ## License
 
