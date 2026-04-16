@@ -2,10 +2,11 @@
 """memory.py — fast in-process memory abstraction for chatd.
 
 Layered memory model:
-  L0  identity.txt injected at startup (handled by chatd.py, not here)
-  L1  FastMemory: KG triples via KnowledgeGraph.query_entity() — no MCP
-  L2  wake_up(): L0 + L1 text assembled for system prompt injection
-  L3  mempalace_search MCP tool — ChromaDB semantic search, called on demand
+  L0   identity.txt injected at startup
+  L1   FastMemory: KG triples via KnowledgeGraph.query_entity() — no MCP
+  L1.5 rolling summary maintained by session.py, passed in via wake_up()
+  L2   wake_up(): L0 + L1 + L1.5 text assembled for system prompt injection
+  L3   mempalace_search MCP tool — ChromaDB semantic search, called on demand
 
 This module owns the hot path.  MCP tools (mempalace_kg_query,
 mempalace_search) remain available as LLM tool calls for the cold path and
@@ -168,12 +169,20 @@ def _wakeup_cached() -> str:
     return text
 
 
-def wake_up() -> str:
-    """Return the system-prompt context block (L0 + L1).
+def wake_up(summary: str = "") -> str:
+    """Return the full system-prompt context block (L0 + L1 + optional L1.5).
 
-    Cheap on repeated calls — result is cached until invalidate() is called.
+    Parameters
+    ----------
+    summary:
+        L1.5 rolling summary text produced by session.py.  Injected after
+        the L0/L1 block when non-empty.  Callers obtain it from
+        ``session.get_session(chat_id).summary``.
     """
-    return _wakeup_cached()
+    base = _wakeup_cached()  # L0 + L1, cached
+    if not summary:
+        return base
+    return f"{base}\n\n## Conversation summary\n{summary}"
 
 
 # ── Bootstrap ─────────────────────────────────────────────────────────────────

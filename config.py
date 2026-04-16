@@ -62,6 +62,19 @@ MEMPALACE_WRITE_TOOLS: Set[str] = {
     "mempalace_add_drawer",
 }
 
+# ── Session / L1.5 rolling summary ────────────────────────────────────────────
+# Directory where per-chat session JSON files are stored.
+CHATD_SESSION_DIR: str = os.environ.get(
+    "CHATD_SESSION_DIR", "~/.local/share/chatd/sessions"
+)
+
+# Ollama model used for compressing the rolling summary (L1.5).
+# A small, fast model is preferable — the main model is not needed here.
+CHATD_SUMMARY_MODEL: str = os.environ.get("CHATD_SUMMARY_MODEL", "qwen2.5:1.5b")
+
+# Number of new Q/A turns to accumulate before triggering a compression pass.
+CHATD_COMPRESS_EVERY: int = int(os.environ.get("CHATD_COMPRESS_EVERY", "5"))
+
 # ── MCP auto-discovery prefix ─────────────────────────────────────────────────────────
 MCP_ENV_PREFIX: str = "CHATD_MCP_"
 
