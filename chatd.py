@@ -16,9 +16,11 @@ import memory
 from config import (
     OLLAMA_API,
     THINKING,
+    TOOLS_FILTER,
+    TOOLS_ALLOWED,
     DEFAULT_OPTIONS,
-    MEMPALACE_ALLOWED_TOOLS,
     MEMPALACE_WRITE_TOOLS,
+    TOOL_OVERRIDE,
     TOOL_DESCRIPTION_OVERRIDES,
 )
 from mcp_client import MCPClient, discover_mcp_servers
@@ -165,13 +167,16 @@ def load_tools():
                 log.warning("[tools] %s: skipping tool without name/schema: %r", source, t)
                 continue
 
-            description = TOOL_DESCRIPTION_OVERRIDES.get(name, description)
+            if TOOL_OVERRIDE and name in TOOL_DESCRIPTION_OVERRIDES:
+                description = TOOL_DESCRIPTION_OVERRIDES.get(name, description)
+
             registry[name] = client
 
-            # Hide non-whitelisted mempalace tools from model context.
-            if source == "mempalace" and name not in MEMPALACE_ALLOWED_TOOLS:
-                log.debug("[tools] mempalace: hiding from model context: %s", name)
-                continue
+            # Hide non-whitelisted tools from model context.
+            if TOOLS_FILTER:
+                if name not in ALLOWED_TOOLS:
+                    log.debug("[tools] hiding from model context: %s", name)
+                    continue
 
             tools.append({
                 "type": "function",
@@ -354,7 +359,7 @@ def chat_stream_generator(
                         tool_args = {}
 
                 log.info("[%s] executing tool: %s(%s)", req_id, tool_name, tool_args)
-                yield _log_yield(req_id, "tool/ann", make_chunk(model, f"\n[→ {tool_name}]\n"))
+                yield _log_yield(req_id, "tool/ann", make_chunk(model, f"\n[→ {tool_name}]\n\n"))
 
                 try:
                     tool_result = call_tool(tool_name, tool_args)

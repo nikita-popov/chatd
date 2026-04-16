@@ -18,6 +18,20 @@ OLLAMA_API: str = os.environ.get("OLLAMA_API", "http://127.0.0.1:11434")
 # Keep False for qwen3 tool-calling (thinking mode degrades JSON fidelity).
 THINKING: bool = os.environ.get("CHATD_THINKING", "false").lower() == "true"
 
+# ── Tools ─────────────────────────────────────────────────────────────────
+# Enable filtering of the list of tools available to the model.
+TOOLS_FILTER: bool = os.environ.get("CHATD_TOOLS_FILTER", "false").lower() == "true"
+
+# Tools to expose to the model.  All others are loaded into TOOL_REGISTRY
+# (for call_tool) but hidden from the model context to save tokens.
+_default_allowed = (
+    "mempalace_status,mempalace_search,mempalace_add_drawer,"
+    "mempalace_kg_query,mempalace_kg_add"
+)
+TOOLS_ALLOWED: Set[str] = set(
+    os.environ.get("CHATD_TOOLS_ALLOWED", _default_allowed).split(",")
+)
+
 # ── Sampling ────────────────────────────────────────────────────────────────────
 # Tuned for qwen3 8B non-thinking tool-calling.
 # Raise temperature to 0.7–1.0 when THINKING=true.
@@ -36,20 +50,10 @@ MEMPALACE_PALACE_PATH: str = os.environ.get(
     "MEMPALACE_PALACE_PATH", "~/.local/share/mempalace"
 )
 
-# Path to knowledge_graph.sqlite3.  The KG file is NOT necessarily a sibling
+# Path to knowledge_graph.sqlite3. The KG file is NOT necessarily a sibling
 # of PALACE_PATH — set this explicitly when they live in different directories.
 MEMPALACE_KG_PATH: str = os.environ.get(
     "MEMPALACE_KG_PATH", "~/.mempalace/knowledge_graph.sqlite3"
-)
-
-# Tools to expose to the model.  All others are loaded into TOOL_REGISTRY
-# (for call_tool) but hidden from the model context to save tokens.
-_default_allowed = (
-    "mempalace_status,mempalace_search,mempalace_add_drawer,"
-    "mempalace_kg_query,mempalace_kg_add"
-)
-MEMPALACE_ALLOWED_TOOLS: Set[str] = set(
-    os.environ.get("CHATD_MEMPALACE_TOOLS", _default_allowed).split(",")
 )
 
 # Tools that write to memory → wake-up cache must be invalidated after.
@@ -67,6 +71,8 @@ MCP_ENV_PREFIX: str = "CHATD_MCP_"
 #   2. /etc/chatd/tool_descriptions.ini  (system-local, not in git)
 #   3. ~/.config/chatd/tool_descriptions.ini  (user-local, not in git)
 #   4. $CHATD_TOOL_DESCRIPTIONS  (runtime override, arbitrary path)
+
+TOOL_OVERRIDE: bool = os.environ.get("CHATD_TOOL_OVERRIDE", "false").lower() == "true"
 
 def _load_tool_descriptions() -> Dict[str, str]:
     cfg = configparser.ConfigParser()
