@@ -298,17 +298,6 @@ def call_tool(name: str, arguments: Dict[str, Any]) -> Any:
 
 # ── L1.5: rolling summary ─────────────────────────────────────────────────────────
 
-#_SUMMARIZE_SYSTEM = (
-#    "You are a memory compressor for a personal AI assistant.\n"
-#    "Given the previous conversation summary and a new Q/A exchange, "
-#    "produce an updated concise summary.\n"
-#    "Rules:\n"
-#    "- Keep facts, decisions, preferences, open questions.\n"
-#    "- Drop pleasantries, tool call details, repetitions.\n"
-#    "- Max 1200 words.\n"
-#    "- Plain text only, no markdown."
-#)
-
 _SUMMARIZE_SYSTEM = (
     "You are a memory compressor for a personal AI assistant.\n"
     "Task: given an existing summary and new conversation turns, "
@@ -334,7 +323,7 @@ def _compress_summary(session: sess.Session) -> None:
 
     turns_text = "\n".join(
         f"User: {t['user']}\nAssistant: {t['assistant']}"
-        for t in session.raw_turns
+        for t in session.raw_turns[-CHATD_COMPRESS_EVERY:]
     )
     messages = [
         {"role": "system",  "content": _SUMMARIZE_SYSTEM},
@@ -365,6 +354,8 @@ def _compress_summary(session: sess.Session) -> None:
             )
         else:
             log.warning("[session:%s] summariser returned empty content", session.session_id)
+            session.raw_turns.clear()
+            session.save()
     except Exception as e:
         log.warning("[session:%s] compress failed: %s", session.session_id, e)
 
@@ -381,6 +372,37 @@ def maybe_compress_async(session: sess.Session) -> None:
     )
     t.start()
     log.debug("[session:%s] compression thread started", session.session_id)
+
+
+def _backfill_session(session: sess.Session, messages: List[Dict]) -> None:
+    """Seed raw_turns from incoming history when the session is blank.
+
+    Fires async compression immediately so the first real turn already
+    benefits from a pre-built summary.  Full message text is preserved
+    here (no truncation) since it goes straight to the compressor.
+    """
+    if session.raw_turns or session.summary:
+        return
+    pairs: List[Dict] = []
+    last_user: Optional[str] = None
+    for m in messages:
+        role = m.get("role")
+        if role == "user":
+            last_user = (m.get("content") or "")
+        elif role == "assistant" and last_user is not None:
+            pairs.append({
+                "user":      last_user,
+                "assistant": (m.get("content") or ""),
+            })
+            last_user = None
+    if not pairs:
+        return
+    session.raw_turns = pairs[-10:]  # cap: no more than 10 pairs
+    log.info(
+        "[session:%s] backfilled %d turns from incoming history",
+        session.session_id, len(session.raw_turns),
+    )
+    maybe_compress_async(session)
 
 
 # ── stream yield helper ─────────────────────────────────────────────────────────────────────
@@ -601,7 +623,19 @@ def chat():
     # ── session / L1.5 ─────────────────────────────────────────────────────────
     chat_id = extract_chat_id(messages)
     session = sess.get_session(chat_id) if chat_id else None
-    summary = session.summary if session else ""
+
+    # Variant 1: backfill blank session from incoming history.
+    if session:
+        _backfill_session(session, messages)
+
+    # Variant 2: suppress stale summary for a fresh single-message chat.
+    history_depth = sum(1 for m in messages if m.get("role") in ("user", "assistant"))
+    if history_depth <= 1:
+        summary = ""
+        log.debug("[%s] fresh chat (depth=%d), suppressing summary", req_id, history_depth)
+    else:
+        summary = session.summary if session else ""
+
     log.info("[%s] chat_id=%s summary_len=%d", req_id, chat_id, len(summary))
 
     messages = ensure_system_prompt(messages, summary=summary)
