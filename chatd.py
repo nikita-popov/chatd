@@ -99,7 +99,7 @@ def _last_user_text(messages: List[Dict]) -> str:
     """Return the content of the most recent user message, or empty string."""
     for m in reversed(messages):
         if m.get("role") == "user":
-            return (m.get("content") or "")[:1000]
+            return (m.get("content") or "")
     return ""
 
 
@@ -298,15 +298,28 @@ def call_tool(name: str, arguments: Dict[str, Any]) -> Any:
 
 # ── L1.5: rolling summary ─────────────────────────────────────────────────────────
 
+#_SUMMARIZE_SYSTEM = (
+#    "You are a memory compressor for a personal AI assistant.\n"
+#    "Given the previous conversation summary and a new Q/A exchange, "
+#    "produce an updated concise summary.\n"
+#    "Rules:\n"
+#    "- Keep facts, decisions, preferences, open questions.\n"
+#    "- Drop pleasantries, tool call details, repetitions.\n"
+#    "- Max 1200 words.\n"
+#    "- Plain text only, no markdown."
+#)
+
 _SUMMARIZE_SYSTEM = (
     "You are a memory compressor for a personal AI assistant.\n"
-    "Given the previous conversation summary and a new Q/A exchange, "
-    "produce an updated concise summary.\n"
+    "Task: given an existing summary and new conversation turns, "
+    "produce an UPDATED summary that merges both.\n"
     "Rules:\n"
-    "- Keep facts, decisions, preferences, open questions.\n"
-    "- Drop pleasantries, tool call details, repetitions.\n"
-    "- Max 200 words.\n"
-    "- Plain text only, no markdown."
+    "- Do NOT repeat facts already in the existing summary verbatim.\n"
+    "- Add only NEW facts, decisions, preferences, open questions from the new turns.\n"
+    "- If a new turn contradicts the summary, update the fact (do not keep both).\n"
+    "- Drop: greetings, tool call details, apologies, filler phrases.\n"
+    "- Output: plain text, max 1250 words, no markdown, no bullet points.\n"
+    "- Language: match the language of the conversation (Russian if Russian)."
 )
 
 
@@ -335,14 +348,14 @@ def _compress_summary(session: sess.Session) -> None:
         "messages": messages,
         "stream":   False,
         "think":    False,
-        "options":  {"num_predict": 300, "temperature": 0.2},
+        "options":  {"num_predict": 1500, "temperature": 0.2},
     }
     try:
         log.debug("[session:%s] compression model: %s", session.session_id, CHATD_SUMMARY_MODEL)
         r = requests.post(f"{OLLAMA_API}/api/chat", json=payload, timeout=600)
         r.raise_for_status()
         new_summary = (r.json().get("message") or {}).get("content", "").strip()
-        if new_summary:
+        if new_summary and len(new_summary) >= 20:
             session.summary = new_summary
             session.raw_turns.clear()
             session.save()
