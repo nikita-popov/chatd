@@ -14,6 +14,7 @@ from requests.exceptions import ReadTimeout
 from flask import Flask, request, Response, jsonify, stream_with_context
 
 import memory
+import rag
 import session as sess
 from config import (
     OLLAMA_API,
@@ -106,17 +107,16 @@ def _last_user_text(messages: List[Dict]) -> str:
 def ensure_system_prompt(
     messages: List[Dict[str, Any]],
     summary: str = "",
+    global_summary: str = "",
 ) -> List[Dict[str, Any]]:
-    """Replace or prepend the system message with the full L0+L1+L1.5 block.
+    """Replace or prepend the system message with the full L0+L0.5+L1+L1.5 block.
 
-    Also performs a sidecar L1 enrichment: extracts entity candidates from
-    the last user message and appends any matching KG facts as a
-    '# Recalled facts' section.  This lets the model use those facts
-    without a tool call round-trip.
+    Also performs two sidecar enrichments for the last user message:
+    1. KG recall for entity-like facts.
+    2. External RAG retrieval for semantically related past turns.
     """
-    base_prompt = memory.wake_up(summary=summary)
+    base_prompt = memory.wake_up(summary=summary, global_summary=global_summary)
 
-    # Sidecar: enrich system prompt with entity-specific KG recall.
     last_user = _last_user_text(messages)
     if last_user:
         extra = memory.kg_recall_from_text(last_user)
@@ -124,13 +124,17 @@ def ensure_system_prompt(
             log.debug("[sidecar] injecting %d-char KG recall into system prompt", len(extra))
             base_prompt = f"{base_prompt}\n\n# Recalled facts\n{extra}"
 
+        rag_ctx = rag.retrieve(last_user)
+        if rag_ctx:
+            log.debug("[sidecar] injecting %d-char RAG recall into system prompt", len(rag_ctx))
+            base_prompt = f"{base_prompt}\n\n# Relevant past context\n{rag_ctx}"
+
     system_prompt = base_prompt
 
     if not isinstance(messages, list) or not messages:
         return [{"role": "system", "content": system_prompt}]
     if messages[0].get("role") != "system":
         return [{"role": "system", "content": system_prompt}] + messages
-    # Replace whatever system prompt ollama-gui sent with ours.
     return [{"role": "system", "content": system_prompt}] + messages[1:]
 
 
@@ -166,7 +170,6 @@ def build_model_messages(
             entry["tool_calls"] = m["tool_calls"]
         turns.append(entry)
 
-    # Trim non-system turns: keep last N user+assistant pairs.
     if len(turns) > max_history_turns * 2:
         turns = turns[-(max_history_turns * 2):]
 
@@ -242,7 +245,6 @@ def load_tools():
 
             registry[name] = client
 
-            # Hide non-whitelisted tools from model context.
             if TOOLS_FILTER:
                 if name not in TOOLS_ALLOWED:
                     log.debug("[tools] hiding from model context: %s", name)
@@ -269,8 +271,6 @@ def init_tools():
 
 
 def call_tool(name: str, arguments: Dict[str, Any]) -> Any:
-    # Fast-path intercept: serve mempalacekgquery from in-process KG when
-    # possible.  Avoids MCP subprocess round-trip for cache-hot entities.
     if name == "mempalacekgquery":
         entity = arguments.get("entity", "")
         if entity:
@@ -281,7 +281,6 @@ def call_tool(name: str, arguments: Dict[str, Any]) -> Any:
                     entity,
                 )
                 return {"facts": fast, "source": "fast_memory"}
-        # Cache miss — fall through to MCP.
 
     client = TOOL_REGISTRY.get(name)
     if client is None:
@@ -290,13 +289,11 @@ def call_tool(name: str, arguments: Dict[str, Any]) -> Any:
     result = client.call_tool(name, arguments)
     log.debug("[tool] %s result: %s", name, str(result)[:200])
     if name in MEMPALACE_WRITE_TOOLS:
-        # Invalidate the in-process KnowledgeGraph connection and wake-up
-        # cache so the next request sees the freshly written data.
         memory.invalidate()
     return result
 
 
-# ── L1.5: rolling summary ─────────────────────────────────────────────────────────
+# ── L1.5: rolling summary + external RAG indexing ─────────────────────────────
 
 _SUMMARIZE_SYSTEM = (
     "You are a memory compressor for a personal AI assistant.\n"
@@ -311,24 +308,25 @@ _SUMMARIZE_SYSTEM = (
     "- Language: match the language of the conversation (Russian if Russian)."
 )
 
+_GLOBAL_SUMMARIZE_SYSTEM = (
+    "You are a global activity compressor for a personal AI assistant.\n"
+    "Task: merge the previous global summary with new conversation turns and "
+    "keep only stable medium-term context about recent work, ongoing themes, "
+    "and repeated user interests.\n"
+    "Rules:\n"
+    "- Keep it compact and factual.\n"
+    "- Prefer persistent patterns over one-off details.\n"
+    "- Remove stale or superseded facts.\n"
+    "- Output: plain text, max 900 words, no markdown, no bullet points.\n"
+    "- Language: match the language of the conversation (Russian if Russian)."
+)
 
-def _compress_summary(session: sess.Session) -> None:
-    """Blocking compress call — meant to run in a background thread.
 
-    Reads raw_turns from session, calls CHATD_SUMMARY_MODEL, updates
-    session.summary and persists to disk.  Clears raw_turns on success.
-    """
-    if not session.raw_turns:
-        return
-
-    turns_text = "\n".join(
-        f"User: {t['user']}\nAssistant: {t['assistant']}"
-        for t in session.raw_turns[-CHATD_COMPRESS_EVERY:]
-    )
+def _summarize_text(system_prompt: str, previous_summary: str, turns_text: str) -> str:
     messages = [
-        {"role": "system",  "content": _SUMMARIZE_SYSTEM},
-        {"role": "user",    "content": (
-            f"Previous summary:\n{session.summary or '(empty)'}\n\n"
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": (
+            f"Previous summary:\n{previous_summary or '(empty)'}\n\n"
             f"New exchanges:\n{turns_text}"
         )},
     ]
@@ -339,13 +337,44 @@ def _compress_summary(session: sess.Session) -> None:
         "think":    False,
         "options":  {"num_predict": 1500, "temperature": 0.2},
     }
+    r = requests.post(f"{OLLAMA_API}/api/chat", json=payload, timeout=600)
+    r.raise_for_status()
+    return ((r.json().get("message") or {}).get("content") or "").strip()
+
+
+def _update_global_summary(turns_text: str) -> None:
+    previous = memory.read_global_summary()
+    try:
+        new_summary = _summarize_text(_GLOBAL_SUMMARIZE_SYSTEM, previous, turns_text)
+        if new_summary and len(new_summary) >= 20:
+            memory.write_global_summary(new_summary)
+            log.info("[global-summary] updated (%d chars)", len(new_summary))
+    except Exception as e:
+        log.warning("[global-summary] update failed: %s", e)
+
+
+def _compress_summary(session: sess.Session) -> None:
+    """Blocking compress call — meant to run in a background thread."""
+    if not session.raw_turns:
+        return
+
+    turns = session.raw_turns[-CHATD_COMPRESS_EVERY:]
+    turns_text = "\n".join(
+        f"User: {t['user']}\nAssistant: {t['assistant']}"
+        for t in turns
+    )
     try:
         log.debug("[session:%s] compression model: %s", session.session_id, CHATD_SUMMARY_MODEL)
-        r = requests.post(f"{OLLAMA_API}/api/chat", json=payload, timeout=600)
-        r.raise_for_status()
-        new_summary = (r.json().get("message") or {}).get("content", "").strip()
+        new_summary = _summarize_text(_SUMMARIZE_SYSTEM, session.summary, turns_text)
         if new_summary and len(new_summary) >= 20:
             session.summary = new_summary
+            for turn in turns:
+                rag.index_turn(
+                    source=f"session:{session.session_id}",
+                    user=turn["user"],
+                    assistant=turn["assistant"],
+                )
+            _update_global_summary(turns_text)
             session.raw_turns.clear()
             session.save()
             log.info(
@@ -361,7 +390,6 @@ def _compress_summary(session: sess.Session) -> None:
 
 
 def maybe_compress_async(session: sess.Session) -> None:
-    """Fire-and-forget compression after every CHATD_COMPRESS_EVERY turns."""
     if len(session.raw_turns) < CHATD_COMPRESS_EVERY:
         return
     t = threading.Thread(
@@ -375,12 +403,6 @@ def maybe_compress_async(session: sess.Session) -> None:
 
 
 def _backfill_session(session: sess.Session, messages: List[Dict]) -> None:
-    """Seed raw_turns from incoming history when the session is blank.
-
-    Fires async compression immediately so the first real turn already
-    benefits from a pre-built summary.  Full message text is preserved
-    here (no truncation) since it goes straight to the compressor.
-    """
     if session.raw_turns or session.summary:
         return
     pairs: List[Dict] = []
@@ -397,7 +419,7 @@ def _backfill_session(session: sess.Session, messages: List[Dict]) -> None:
             last_user = None
     if not pairs:
         return
-    session.raw_turns = pairs[-10:]  # cap: no more than 10 pairs
+    session.raw_turns = pairs[-10:]
     log.info(
         "[session:%s] backfilled %d turns from incoming history",
         session.session_id, len(session.raw_turns),
@@ -405,14 +427,10 @@ def _backfill_session(session: sess.Session, messages: List[Dict]) -> None:
     maybe_compress_async(session)
 
 
-# ── stream yield helper ─────────────────────────────────────────────────────────────────────
-
 def _log_yield(req_id: str, label: str, data: bytes) -> bytes:
     log.debug("[%s] yield %-12s %d bytes", req_id, label, len(data))
     return data
 
-
-# ── routes ──────────────────────────────────────────────────────────────────────────
 
 @app.get("/health")
 @app.get("/api/health")
@@ -437,7 +455,6 @@ def chat_stream_generator(
     prev_tool_names: Optional[List[str]] = None
     repeat_count = 0
 
-    # Extract the last user message for session recording.
     last_user_msg = _last_user_text(messages)
 
     data = make_keepalive(model)
@@ -506,7 +523,6 @@ def chat_stream_generator(
                         if last_tool_calls:
                             yield _log_yield(req_id, "keepalive/tc", make_keepalive(model))
                         else:
-                            # Final assistant response — record for L1.5.
                             final_assistant_content = remapper.content_acc
                             yield _log_yield(req_id, "done", remapper.feed(line))
                         break
@@ -526,7 +542,6 @@ def chat_stream_generator(
                 log.info("[%s] stream complete, no more tool rounds", req_id)
                 break
 
-            # ── loop detection ───────────────────────────────────────────────────────────────────────
             current_tool_names = [
                 (tc.get("function") or {}).get("name") for tc in last_tool_calls
             ]
@@ -541,7 +556,6 @@ def chat_stream_generator(
                 repeat_count = 0
             prev_tool_names = current_tool_names
 
-            # ── tool execution ──────────────────────────────────────────────────────────────────────────────
             messages.append({
                 "role":       "assistant",
                 "content":    remapper.content_acc,
@@ -583,9 +597,6 @@ def chat_stream_generator(
         yield make_chunk(model, f"\n[internal error: {e}]\n", done=True)
 
     finally:
-        # Always runs: on normal exit, GeneratorExit (client disconnect), or Exception.
-        # GeneratorExit is a BaseException thrown by the WSGI server when the client
-        # drops the connection — we cannot yield after it, but we CAN save state.
         if session and last_user_msg and final_assistant_content:
             log.debug(
                 "[%s] [finally] saving turn: session=%s user=%d chars assistant=%d chars",
@@ -620,15 +631,12 @@ def chat():
     options     = merge_options(original_payload.get("options"))
     want_stream = original_payload.get("stream", True)
 
-    # ── session / L1.5 ─────────────────────────────────────────────────────────
     chat_id = extract_chat_id(messages)
     session = sess.get_session(chat_id) if chat_id else None
 
-    # Variant 1: backfill blank session from incoming history.
     if session:
         _backfill_session(session, messages)
 
-    # Variant 2: suppress stale summary for a fresh single-message chat.
     history_depth = sum(1 for m in messages if m.get("role") in ("user", "assistant"))
     if history_depth <= 1:
         summary = ""
@@ -636,9 +644,11 @@ def chat():
     else:
         summary = session.summary if session else ""
 
-    log.info("[%s] chat_id=%s summary_len=%d", req_id, chat_id, len(summary))
+    global_summary = memory.read_global_summary()
 
-    messages = ensure_system_prompt(messages, summary=summary)
+    log.info("[%s] chat_id=%s summary_len=%d global_summary_len=%d", req_id, chat_id, len(summary), len(global_summary))
+
+    messages = ensure_system_prompt(messages, summary=summary, global_summary=global_summary)
 
     log.info("[%s] POST /api/chat model=%s stream=%s messages=%d options=%s",
              req_id, model, want_stream, len(messages), options)
@@ -699,7 +709,6 @@ def chat():
             msg    = resp.get("message") or {}
             answer = (msg.get("content") or "").strip() or "[пустой ответ]"
 
-            # Record turn for non-stream path too.
             if session and answer:
                 last_user = _last_user_text(messages)
                 if last_user:
@@ -734,10 +743,9 @@ def chat():
     )
 
 
-# ── entry point ──────────────────────────────────────────────────────────────────────────────
-
 init_tools()
 memory.init()
+rag.init()
 
 if __name__ == "__main__":
     log.info("started")
