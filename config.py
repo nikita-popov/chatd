@@ -62,18 +62,32 @@ MEMPALACE_WRITE_TOOLS: Set[str] = {
     "mempalace_add_drawer",
 }
 
-# ── Session / L1.5 rolling summary ────────────────────────────────────────────
+# ── Session / summaries ────────────────────────────────────────────────────────
 # Directory where per-chat session JSON files are stored.
 CHATD_SESSION_DIR: str = os.environ.get(
     "CHATD_SESSION_DIR", "~/.local/share/chatd/sessions"
 )
 
-# Ollama model used for compressing the rolling summary (L1.5).
+# Global compressed activity summary injected as L0.5.
+CHATD_GLOBAL_SUMMARY_PATH: str = os.environ.get(
+    "CHATD_GLOBAL_SUMMARY_PATH", "~/.local/share/chatd/global_summary.txt"
+)
+
+# Ollama model used for compressing summaries.
 # A small, fast model is preferable — the main model is not needed here.
 CHATD_SUMMARY_MODEL: str = os.environ.get("CHATD_SUMMARY_MODEL", "qwen2.5:1.5b")
 
 # Number of new Q/A turns to accumulate before triggering a compression pass.
 CHATD_COMPRESS_EVERY: int = int(os.environ.get("CHATD_COMPRESS_EVERY", "5"))
+
+# ── External RAG store ─────────────────────────────────────────────────────────
+RAG_DB_PATH: str = os.environ.get(
+    "CHATD_RAG_DB_PATH", "~/.local/share/chatd/rag.sqlite3"
+)
+RAG_EMBED_MODEL: str = os.environ.get("CHATD_RAG_EMBED_MODEL", "nomic-embed-text")
+RAG_TOP_K: int = int(os.environ.get("CHATD_RAG_TOP_K", "4"))
+RAG_MAX_CHARS_PER_CHUNK: int = int(os.environ.get("CHATD_RAG_MAX_CHARS_PER_CHUNK", "4000"))
+RAG_MIN_SCORE: float = float(os.environ.get("CHATD_RAG_MIN_SCORE", "0.25"))
 
 # ── MCP auto-discovery prefix ─────────────────────────────────────────────────────────
 MCP_ENV_PREFIX: str = "CHATD_MCP_"
