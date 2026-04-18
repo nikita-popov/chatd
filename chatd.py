@@ -106,20 +106,28 @@ def _last_user_text(messages: List[Dict]) -> str:
 
 def ensure_system_prompt(
     messages: List[Dict[str, Any]],
-    summary: str = "",
+    per_chat_summary: str = "",
     global_summary: str = "",
 ) -> List[Dict[str, Any]]:
-    """Replace or prepend the system message with the always-loaded memory block.
+    """Assemble the always-loaded memory block and prepend it as system message.
 
-    Effective stack in prompt assembly:
-    - L0: mempalace identity / model identity.txt
-    - L0.5: compressed summary from chatd
-    - L1: mempalace Essential Story / wake-up context
-    - L1.5: chatd sidecars for current request (KG recall + external RAG)
+    Layer assembly order:
+      L0   mempalace identity.txt
+      L0.5 chatd composed layer:
+             – global compressed summary  (cross-chat activity)
+             – per-chat compressed summary (this session arc)
+      L1   mempalace Essential Story / wake-up context
+      L1.5 chatd request-scoped sidecars:
+             – KG recall from user message text
+             – external RAG context from rag.retrieve()
 
-    mempalace L2/L3 remain tool-driven and are not auto-injected here.
+    mempalace L2 (Room Recall) and L3 (Deep Search) are tool-driven
+    and are NOT auto-injected here.
     """
-    base_prompt = memory.wake_up(summary=summary, global_summary=global_summary)
+    base_prompt = memory.wake_up(
+        per_chat_summary=per_chat_summary,
+        global_summary=global_summary,
+    )
 
     last_user = _last_user_text(messages)
     if last_user:
@@ -436,10 +444,16 @@ def _log_yield(req_id: str, label: str, data: bytes) -> bytes:
     return data
 
 
+@app.get("/version")
+@app.get("/api/version")
+def version():
+    return jsonify({"version": "chatd-1.0", "ollama": "proxied"})
+
+
 @app.get("/health")
 @app.get("/api/health")
 def health():
-    return jsonify({"ok": True})
+    return jsonify({"ok": True, "tools": len(TOOLS)})
 
 
 @app.get("/tags")
@@ -652,7 +666,11 @@ def chat():
 
     log.info("[%s] chat_id=%s summary_len=%d global_summary_len=%d", req_id, chat_id, len(summary), len(global_summary))
 
-    messages = ensure_system_prompt(messages, summary=summary, global_summary=global_summary)
+    messages = ensure_system_prompt(
+        messages,
+        per_chat_summary=summary,
+        global_summary=global_summary,
+    )
 
     log.info("[%s] POST /api/chat model=%s stream=%s messages=%d options=%s",
              req_id, model, want_stream, len(messages), options)

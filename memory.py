@@ -2,15 +2,17 @@
 """memory.py — fast in-process memory abstraction for chatd.
 
 Layered memory model:
-  L0   mempalace: model identity.txt — always loaded
-  L0.5 chatd: compressed summary (per-chat now, global planned) — always loaded
-  L1   mempalace: Essential Story / wake-up context — always loaded
-  L1.5 chatd: external RAG context for the current request — always loaded
-  L2   mempalace: Room Recall (filtered retrieval) — when topic comes up
-  L3   mempalace: Deep Search (semantic search via MCP) — when explicitly asked
+  L0   mempalace : model identity.txt — always loaded
+  L0.5 chatd     : composed layer — per-chat compressed summary +
+                   global compressed summary — always loaded
+  L1   mempalace : Essential Story (wake-up context) — always loaded
+  L1.5 chatd     : request-scoped sidecar — KG recall + external RAG
+                   injected per request — always loaded
+  L2   mempalace : Room Recall (filtered retrieval) — when topic comes up
+  L3   mempalace : Deep Search (full semantic query) — when explicitly asked
 
-This module owns the hot path for always-loaded context. mempalace stays
-untouched; chatd adds only external overlays around it.
+mempalace layers (L0, L1, L2, L3) are never modified here.
+chatd layers (L0.5, L1.5) are purely additive overlays.
 """
 import functools
 import logging
@@ -250,23 +252,26 @@ def _wakeup_cached() -> str:
     return text
 
 
-def wake_up(summary: str = "", global_summary: str = "") -> str:
-    """Return the full always-loaded system-prompt context block.
+def wake_up(per_chat_summary: str = "", global_summary: str = "") -> str:
+    """Assemble the always-loaded system-prompt block.
+
+    L0.5 is a composed layer: both per_chat_summary and global_summary
+    are part of it. They are emitted separately so the model can
+    distinguish chat-scoped context from broader activity context.
 
     Parameters
     ----------
-    summary:
-        Compressed summary injected as L0.5 when non-empty.
+    per_chat_summary:
+        Per-chat rolling compressed summary (L0.5 chat part).
     global_summary:
-        Reserved for future broader activity summary; currently also injected
-        into the always-loaded block when provided.
+        Cross-chat activity summary (L0.5 global part).
     """
-    base = _wakeup_cached()  # mempalace always-loaded block, cached
+    base = _wakeup_cached()   # L0 + L1, mempalace, cached
     parts = [base]
     if global_summary:
-        parts.append(f"## Recent activity\n{global_summary}")
-    if summary:
-        parts.append(f"## Conversation summary\n{summary}")
+        parts.append(f"## Recent activity (global)\n{global_summary}")
+    if per_chat_summary:
+        parts.append(f"## Conversation summary\n{per_chat_summary}")
     return "\n\n".join(p for p in parts if p)
 
 

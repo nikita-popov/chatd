@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
-"""rag.py — external semantic recall store for chatd.
+"""rag.py — L1.5 external semantic recall store for chatd.
 
-This module implements an external RAG layer that does not interfere with
-mempalace internals.  It stores assistant/user conversation chunks in a local
-SQLite database and retrieves semantically similar chunks for the current
-request.
+Implements the request-scoped RAG sidecar layer (L1.5) — a chatd-owned
+SQLite store completely separate from mempalace. Conversation turns are
+embedded via Ollama and retrieved by cosine similarity for the current
+user message.
+
+L1.5 is always injected into the system prompt alongside KG recall.
+It does not replace or modify any mempalace layer.
 """
 import json
 import logging
@@ -41,7 +44,7 @@ def _connect() -> sqlite3.Connection:
 
 
 def init() -> None:
-    """Initialise the external RAG store."""
+    """Initialise the L1.5 external RAG store (chatd-owned, separate from mempalace)."""
     conn = _connect()
     try:
         conn.execute("""
@@ -101,7 +104,7 @@ def _cosine_similarity(a: List[float], b: List[float]) -> float:
 
 
 def index_turn(source: str, user: str, assistant: str) -> None:
-    """Store one conversation turn in the external RAG database."""
+    """Index one conversation turn into the L1.5 RAG store."""
     chunk = _chunk_turn(user, assistant)
     if not chunk:
         return
@@ -134,7 +137,7 @@ def index_turn(source: str, user: str, assistant: str) -> None:
 
 
 def retrieve(query: str, top_k: int = RAG_TOP_K) -> Optional[str]:
-    """Retrieve the most relevant past chunks for *query*."""
+    """Return L1.5 RAG context: top-k semantically similar past turns for *query*."""
     query = (query or "").strip()
     if not query:
         return None
