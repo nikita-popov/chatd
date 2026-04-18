@@ -2,16 +2,15 @@
 """memory.py — fast in-process memory abstraction for chatd.
 
 Layered memory model:
-  L0   identity.txt injected at startup
-  L0.5 global compressed summary injected at startup
-  L1   FastMemory: KG triples via KnowledgeGraph.query_entity() — no MCP
-  L1.5 per-chat rolling summary maintained by session.py, passed in via wake_up()
-  L2   wake_up(): L0 + L0.5 + L1 + L1.5 text assembled for system prompt injection
-  L3   mempalace_search MCP tool — ChromaDB semantic search, called on demand
+  L0   mempalace: model identity.txt — always loaded
+  L0.5 chatd: compressed summary (per-chat now, global planned) — always loaded
+  L1   mempalace: Essential Story / wake-up context — always loaded
+  L1.5 chatd: external RAG context for the current request — always loaded
+  L2   mempalace: Room Recall (filtered retrieval) — when topic comes up
+  L3   mempalace: Deep Search (semantic search via MCP) — when explicitly asked
 
-This module owns the hot path.  MCP tools (mempalace_kg_query,
-mempalace_search) remain available as LLM tool calls for the cold path and
-for write operations.
+This module owns the hot path for always-loaded context. mempalace stays
+untouched; chatd adds only external overlays around it.
 """
 import functools
 import logging
@@ -173,7 +172,7 @@ def invalidate() -> None:
     log.info("FastMemory: cache invalidated")
 
 
-# ── L2: wake-up assembly ──────────────────────────────────────────────────────
+# ── wake-up assembly ──────────────────────────────────────────────────────
 
 def _read_identity() -> str:
     """Read identity.txt relative to this file."""
@@ -233,7 +232,7 @@ def _run_wakeup_subprocess() -> str:
 
 @functools.lru_cache(maxsize=1)
 def _wakeup_cached() -> str:
-    """Assemble L0 + L1 context block (cached, single slot).
+    """Assemble always-loaded mempalace block (cached, single slot).
 
     Prefer KnowledgeGraph reads over subprocess to avoid spawn overhead.
     Falls back to subprocess only when KG file is missing.
@@ -252,17 +251,17 @@ def _wakeup_cached() -> str:
 
 
 def wake_up(summary: str = "", global_summary: str = "") -> str:
-    """Return the full system-prompt context block.
+    """Return the full always-loaded system-prompt context block.
 
     Parameters
     ----------
     summary:
-        Per-chat rolling summary text produced by session.py.  Injected after
-        the L0/L0.5/L1 block when non-empty.
+        Compressed summary injected as L0.5 when non-empty.
     global_summary:
-        Global activity summary injected as L0.5 when non-empty.
+        Reserved for future broader activity summary; currently also injected
+        into the always-loaded block when provided.
     """
-    base = _wakeup_cached()  # L0 + L1, cached
+    base = _wakeup_cached()  # mempalace always-loaded block, cached
     parts = [base]
     if global_summary:
         parts.append(f"## Recent activity\n{global_summary}")
