@@ -109,11 +109,15 @@ def ensure_system_prompt(
     summary: str = "",
     global_summary: str = "",
 ) -> List[Dict[str, Any]]:
-    """Replace or prepend the system message with the full L0+L0.5+L1+L1.5 block.
+    """Replace or prepend the system message with the always-loaded memory block.
 
-    Also performs two sidecar enrichments for the last user message:
-    1. KG recall for entity-like facts.
-    2. External RAG retrieval for semantically related past turns.
+    Effective stack in prompt assembly:
+    - L0: mempalace identity / model identity.txt
+    - L0.5: compressed summary from chatd
+    - L1: mempalace Essential Story / wake-up context
+    - L1.5: chatd sidecars for current request (KG recall + external RAG)
+
+    mempalace L2/L3 remain tool-driven and are not auto-injected here.
     """
     base_prompt = memory.wake_up(summary=summary, global_summary=global_summary)
 
@@ -293,7 +297,7 @@ def call_tool(name: str, arguments: Dict[str, Any]) -> Any:
     return result
 
 
-# ── L1.5: rolling summary + external RAG indexing ─────────────────────────────
+# ── compressed summary + external RAG indexing ─────────────────────────────
 
 _SUMMARIZE_SYSTEM = (
     "You are a memory compressor for a personal AI assistant.\n"
