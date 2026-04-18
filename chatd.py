@@ -42,6 +42,8 @@ log = logging.getLogger("chatd")
 
 # ── app ───────────────────────────────────────────────────────────────────────────
 
+VERSION = "1.0.0"
+
 TOOLS: List[Dict] = []
 TOOL_REGISTRY: Dict[str, MCPClient] = {}
 
@@ -447,7 +449,10 @@ def _log_yield(req_id: str, label: str, data: bytes) -> bytes:
 @app.get("/version")
 @app.get("/api/version")
 def version():
-    return jsonify({"version": "chatd-1.0", "ollama": "proxied"})
+    res = requests.get(f"{OLLAMA_API}/api/version")
+    ollama_version = res.json()['version']
+    log.debug("ollama version: %s", ollama_version)
+    return jsonify({"chatd": f"{VERSION}", "ollama": f"{ollama_version}"})
 
 
 @app.get("/health")
