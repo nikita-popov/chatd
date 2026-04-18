@@ -3,9 +3,10 @@
 
 Layered memory model:
   L0   identity.txt injected at startup
+  L0.5 global compressed summary injected at startup
   L1   FastMemory: KG triples via KnowledgeGraph.query_entity() — no MCP
-  L1.5 rolling summary maintained by session.py, passed in via wake_up()
-  L2   wake_up(): L0 + L1 + L1.5 text assembled for system prompt injection
+  L1.5 per-chat rolling summary maintained by session.py, passed in via wake_up()
+  L2   wake_up(): L0 + L0.5 + L1 + L1.5 text assembled for system prompt injection
   L3   mempalace_search MCP tool — ChromaDB semantic search, called on demand
 
 This module owns the hot path.  MCP tools (mempalace_kg_query,
@@ -21,7 +22,11 @@ from typing import Optional
 
 from mempalace.knowledge_graph import KnowledgeGraph
 
-from config import MEMPALACE_KG_PATH, MEMPALACE_PALACE_PATH
+from config import (
+    CHATD_GLOBAL_SUMMARY_PATH,
+    MEMPALACE_KG_PATH,
+    MEMPALACE_PALACE_PATH,
+)
 
 log = logging.getLogger("chatd.memory")
 
@@ -129,6 +134,28 @@ def kg_recall_from_text(text: str, max_results: int = 5) -> Optional[str]:
     return result
 
 
+def read_global_summary() -> str:
+    """Read L0.5 global activity summary from disk."""
+    path = Path(os.path.expanduser(CHATD_GLOBAL_SUMMARY_PATH))
+    try:
+        return path.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return ""
+    except Exception as e:
+        log.warning("global summary read failed: %s", e)
+        return ""
+
+
+def write_global_summary(summary: str) -> None:
+    """Persist L0.5 global activity summary to disk."""
+    path = Path(os.path.expanduser(CHATD_GLOBAL_SUMMARY_PATH))
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(summary.strip(), encoding="utf-8")
+    except Exception as e:
+        log.warning("global summary write failed: %s", e)
+
+
 def invalidate() -> None:
     """Close the KnowledgeGraph connection and clear the wake-up cache.
 
@@ -224,20 +251,24 @@ def _wakeup_cached() -> str:
     return text
 
 
-def wake_up(summary: str = "") -> str:
-    """Return the full system-prompt context block (L0 + L1 + optional L1.5).
+def wake_up(summary: str = "", global_summary: str = "") -> str:
+    """Return the full system-prompt context block.
 
     Parameters
     ----------
     summary:
-        L1.5 rolling summary text produced by session.py.  Injected after
-        the L0/L1 block when non-empty.  Callers obtain it from
-        ``session.get_session(chat_id).summary``.
+        Per-chat rolling summary text produced by session.py.  Injected after
+        the L0/L0.5/L1 block when non-empty.
+    global_summary:
+        Global activity summary injected as L0.5 when non-empty.
     """
     base = _wakeup_cached()  # L0 + L1, cached
-    if not summary:
-        return base
-    return f"{base}\n\n## Conversation summary\n{summary}"
+    parts = [base]
+    if global_summary:
+        parts.append(f"## Recent activity\n{global_summary}")
+    if summary:
+        parts.append(f"## Conversation summary\n{summary}")
+    return "\n\n".join(p for p in parts if p)
 
 
 # ── Bootstrap ─────────────────────────────────────────────────────────────────
