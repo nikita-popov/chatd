@@ -6,12 +6,24 @@ Embed: not supported (raises RuntimeError).
 
 Model name convention: strip "or/" prefix before sending to OpenRouter.
 Example: "or/mistralai/mistral-7b-instruct:free" -> "mistralai/mistral-7b-instruct:free"
+
+tool_call_id contract
+---------------------
+OpenAI requires that every tool_call in an assistant message carries a
+unique `id`, and that the subsequent `tool` message echoes that id as
+`tool_call_id`.  chatd uses a simple internal format that does NOT carry
+ids through the message list, so we generate/preserve ids here:
+
+  _finalise_tool_calls()  — keeps the `id` collected during SSE streaming
+  _to_openai()            — converts assistant/tool messages to OpenAI wire
+                            format, injecting generated ids where missing
 """
 from __future__ import annotations
 
 import json
 import logging
 import os
+import uuid
 from typing import Any, Dict, Generator, List, Optional
 
 import requests
@@ -25,8 +37,6 @@ log = logging.getLogger("chatd.backends.openrouter")
 
 _PREFIX: str = OPENROUTER_PREFIX
 
-# In-process cache: model_id (without prefix) -> raw OR model object.
-# Populated lazily on the first /api/tags request; lives until process restart.
 _model_cache: Dict[str, Dict[str, Any]] = {}
 _model_cache_loaded: bool = False
 
@@ -82,12 +92,86 @@ def supports_tools(model_with_prefix: str) -> bool:
     return "tools" in params
 
 
+def _make_tc_id() -> str:
+    """Generate a short tool_call id compatible with OpenAI format."""
+    return "call_" + uuid.uuid4().hex[:16]
+
+
 def _to_openai(payload: Dict[str, Any], stream: bool) -> Dict[str, Any]:
+    """Convert Ollama-format payload to OpenAI wire format.
+
+    Key invariant: every assistant message that has tool_calls must have an
+    `id` on each call, and the immediately following tool messages must echo
+    those ids as `tool_call_id`.  We do a single pass over messages, assigning
+    ids as we go so that assistant and tool messages stay in sync.
+    """
     model = payload["model"]
     opts = payload.get("options", {})
+
+    # ── convert messages ──────────────────────────────────────────────────────
+    raw_messages: List[Dict] = payload.get("messages", [])
+    converted: List[Dict] = []
+    # Maps positional index in last assistant tool_calls → id, so the next
+    # batch of tool messages can pick up the right tool_call_id.
+    pending_tc_ids: List[str] = []
+    pending_tc_index: int = 0   # which id to assign to the next tool message
+
+    for m in raw_messages:
+        role = m.get("role")
+
+        if role == "assistant":
+            tcs = m.get("tool_calls") or []
+            if tcs:
+                # Build OpenAI-format tool_calls with ids.
+                openai_tcs = []
+                pending_tc_ids = []
+                pending_tc_index = 0
+                for tc in tcs:
+                    fn = tc.get("function") or {}
+                    args = fn.get("arguments") or {}
+                    if isinstance(args, dict):
+                        args = json.dumps(args, ensure_ascii=False)
+                    tc_id = tc.get("id") or _make_tc_id()
+                    pending_tc_ids.append(tc_id)
+                    openai_tcs.append({
+                        "id":       tc_id,
+                        "type":     "function",
+                        "function": {
+                            "name":      fn.get("name", ""),
+                            "arguments": args,
+                        },
+                    })
+                converted.append({
+                    "role":       "assistant",
+                    "content":    m.get("content") or "",
+                    "tool_calls": openai_tcs,
+                })
+            else:
+                pending_tc_ids = []
+                pending_tc_index = 0
+                converted.append({"role": "assistant", "content": m.get("content") or ""})
+
+        elif role == "tool":
+            # Pair each tool result with the id from the preceding assistant turn.
+            if pending_tc_index < len(pending_tc_ids):
+                tc_id = pending_tc_ids[pending_tc_index]
+                pending_tc_index += 1
+            else:
+                # Fallback: generate a fresh id (shouldn't happen in normal flow).
+                tc_id = _make_tc_id()
+                log.warning("[openrouter] tool message without matching assistant tool_call_id")
+            converted.append({
+                "role":         "tool",
+                "tool_call_id": tc_id,
+                "content":      m.get("content") or "",
+            })
+
+        else:
+            converted.append({"role": role, "content": m.get("content") or ""})
+
     result: Dict[str, Any] = {
         "model":    _strip(model),
-        "messages": payload.get("messages", []),
+        "messages": converted,
         "stream":   stream,
     }
     if "num_predict" in opts:
@@ -108,34 +192,16 @@ def _to_openai(payload: Dict[str, Any], stream: bool) -> Dict[str, Any]:
     return result
 
 
-def _normalize_tool_calls(raw: List[Dict]) -> List[Dict]:
-    result = []
-    for tc in raw:
-        fn = tc.get("function") or {}
-        args = fn.get("arguments") or "{}"
-        if isinstance(args, str):
-            try:
-                args = json.loads(args)
-            except json.JSONDecodeError:
-                args = {}
-        result.append({"function": {"name": fn.get("name", ""), "arguments": args}})
-    return result
-
-
 def _merge_tool_call_deltas(acc: List[Dict], deltas: List[Dict]) -> List[Dict]:
-    """Merge a tool_calls delta into the accumulator.
+    """Accumulate streaming tool_call delta fragments by index.
 
-    OpenAI streaming sends tool_calls in fragments:
+    OpenAI streaming sends tool_calls across multiple chunks:
       chunk 1: [{index:0, id:"call_x", function:{name:"foo", arguments:""}}]
       chunk 2: [{index:0, function:{arguments:'{"k":'}}]
       chunk 3: [{index:0, function:{arguments:'"v"}'}}]
-
-    We accumulate by index, concatenating the arguments strings, and taking
-    the first non-empty name/id we see.
     """
     for delta in deltas:
         idx = delta.get("index", 0)
-        # Extend accumulator to cover this index.
         while len(acc) <= idx:
             acc.append({"id": "", "type": "function", "function": {"name": "", "arguments": ""}})
         entry = acc[idx]
@@ -150,7 +216,7 @@ def _merge_tool_call_deltas(acc: List[Dict], deltas: List[Dict]) -> List[Dict]:
 
 
 def _finalise_tool_calls(acc: List[Dict]) -> List[Dict]:
-    """Parse accumulated argument strings and normalise to chatd internal format."""
+    """Parse accumulated argument strings; preserve id for tool_call_id matching."""
     result = []
     for entry in acc:
         fn = entry.get("function") or {}
@@ -160,7 +226,10 @@ def _finalise_tool_calls(acc: List[Dict]) -> List[Dict]:
         except json.JSONDecodeError:
             log.warning("[openrouter] failed to parse tool_call arguments: %r", args_str[:200])
             args = {}
-        result.append({"function": {"name": fn.get("name", ""), "arguments": args}})
+        result.append({
+            "id":       entry.get("id") or _make_tc_id(),
+            "function": {"name": fn.get("name", ""), "arguments": args},
+        })
     return result
 
 
@@ -177,14 +246,8 @@ def _extract_or_error(response: requests.Response) -> str:
 
 def _or_response_meta(r: requests.Response) -> str:
     parts = []
-    provider = (
-        r.headers.get("X-OR-Provider")
-        or r.headers.get("x-or-provider")
-    )
-    gen_id = (
-        r.headers.get("X-OR-Generation-ID")
-        or r.headers.get("x-or-generation-id")
-    )
+    provider = r.headers.get("X-OR-Provider") or r.headers.get("x-or-provider")
+    gen_id   = r.headers.get("X-OR-Generation-ID") or r.headers.get("x-or-generation-id")
     if provider:
         parts.append(f"provider={provider}")
     if gen_id:
@@ -213,7 +276,6 @@ def _log_http_error(exc: HTTPError) -> str:
         log.warning(msg)
     else:
         log.error(msg)
-
     return detail
 
 
@@ -232,14 +294,12 @@ def _sse_to_ndjson(
     """Convert OpenAI SSE stream to Ollama NDJSON bytes.
 
     Tool call handling:
-      OpenAI streams tool_calls as delta fragments across multiple chunks
-      (each chunk adds a piece of the function name or arguments string).
-      We accumulate all fragments in `_tc_acc` and emit them only once in
-      the final done=True chunk.  This prevents chatd.py from seeing dozens
-      of intermediate chunks with empty names and from picking up an
-      incomplete last-delta as the resolved tool call.
+      OpenAI streams tool_calls as delta fragments.  We accumulate all
+      fragments in `_tc_acc` and emit them only once in the final done=True
+      chunk.  The assembled entries preserve the `id` field so that
+      _to_openai() can correctly pair subsequent tool messages.
     """
-    _tc_acc: List[Dict] = []   # accumulates raw delta fragments
+    _tc_acc: List[Dict] = []
     content_acc: str = ""
 
     for raw in response.iter_lines():
@@ -247,7 +307,6 @@ def _sse_to_ndjson(
             continue
         line = raw.decode("utf-8").removeprefix("data: ")
         if line.strip() == "[DONE]":
-            # Emit a single terminal chunk with the fully assembled tool_calls.
             out: Dict[str, Any] = {
                 "model":   model,
                 "message": {"role": "assistant", "content": ""},
@@ -258,21 +317,22 @@ def _sse_to_ndjson(
                 finalised = _finalise_tool_calls(_tc_acc)
                 out["message"]["tool_calls"] = finalised
                 log.debug(
-                    "[openrouter] assembled %d tool_call(s): %s",
+                    "[openrouter] assembled %d tool_call(s) at [DONE]: %s",
                     len(finalised),
                     [tc["function"]["name"] for tc in finalised],
                 )
             yield (json.dumps(out, ensure_ascii=False) + "\n").encode()
             return
+
         try:
             chunk = json.loads(line)
         except json.JSONDecodeError:
             continue
+
         choice = (chunk.get("choices") or [{}])[0]
         delta  = choice.get("delta") or {}
         finish = choice.get("finish_reason")
 
-        # Accumulate tool_call fragments silently — do NOT yield intermediate chunks.
         if delta.get("tool_calls"):
             _merge_tool_call_deltas(_tc_acc, delta["tool_calls"])
             continue
@@ -288,8 +348,6 @@ def _sse_to_ndjson(
         }
         if finish:
             out["done_reason"] = finish
-            # If finish arrived without [DONE] and we have accumulated tool calls,
-            # attach them to this final chunk.
             if _tc_acc:
                 finalised = _finalise_tool_calls(_tc_acc)
                 out["message"]["tool_calls"] = finalised
@@ -345,7 +403,21 @@ class OpenRouterBackend:
             "done":    True, "done_reason": "stop",
         }
         if msg.get("tool_calls"):
-            result["message"]["tool_calls"] = _normalize_tool_calls(msg["tool_calls"])
+            # Sync path: normalise preserving id.
+            tcs = []
+            for tc in msg["tool_calls"]:
+                fn   = tc.get("function") or {}
+                args = fn.get("arguments") or "{}"
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args)
+                    except json.JSONDecodeError:
+                        args = {}
+                tcs.append({
+                    "id":       tc.get("id") or _make_tc_id(),
+                    "function": {"name": fn.get("name", ""), "arguments": args},
+                })
+            result["message"]["tool_calls"] = tcs
         return result
 
     def embed(self, text: str, model: str) -> List[float]:

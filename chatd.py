@@ -7,7 +7,7 @@ import threading
 import traceback
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Dict, Generator, List, Optional
+from typing import Any, Dict, Generator, List, Optional, Tuple
 
 import requests
 from requests.exceptions import ReadTimeout
@@ -52,8 +52,6 @@ TOOL_REGISTRY: Dict[str, MCPClient] = {}
 
 app = Flask(__name__)
 
-# Serialises concurrent writes to global_summary.txt that may come from
-# multiple compress-{session_id} threads running at the same time.
 _GLOBAL_SUMMARY_LOCK = threading.Lock()
 
 
@@ -76,7 +74,6 @@ def make_chunk(model: str, content: str, done: bool = False) -> bytes:
 
 
 def make_keepalive(model: str) -> bytes:
-    """Empty content chunk — keeps the HTTP connection alive while tools run."""
     return make_chunk(model, "")
 
 
@@ -97,7 +94,6 @@ def merge_options(client_options: Optional[Dict]) -> Dict[str, Any]:
 
 
 def extract_chat_id(messages: List[Dict]) -> Optional[str]:
-    """Return chatId from the first message that carries it, or None."""
     for m in messages:
         chat_id = m.get("chatId")
         if chat_id is not None:
@@ -106,19 +102,28 @@ def extract_chat_id(messages: List[Dict]) -> Optional[str]:
 
 
 def _last_user_text(messages: List[Dict]) -> str:
-    """Return the content of the most recent user message, or empty string."""
     for m in reversed(messages):
         if m.get("role") == "user":
             return (m.get("content") or "")
     return ""
 
 
+# ── system prompt assembly ─────────────────────────────────────────────────────
+
 def ensure_system_prompt(
     messages: List[Dict[str, Any]],
     per_chat_summary: str = "",
     global_summary: str = "",
-) -> List[Dict[str, Any]]:
+) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
     """Assemble the always-loaded memory block and prepend it as system message.
+
+    Returns (messages, layer_sizes) where layer_sizes maps layer name to char count:
+      L0        mempalace identity + wake-up base
+      L0.5g     global compressed summary
+      L0.5p     per-chat compressed summary
+      L1        mempalace Essential Story (included in wake_up base)
+      L1.5_kg   KG recall sidecar
+      L1.5_rag  RAG recall sidecar
 
     Layer assembly order:
       L0   mempalace identity.txt
@@ -137,26 +142,37 @@ def ensure_system_prompt(
         per_chat_summary=per_chat_summary,
         global_summary=global_summary,
     )
+    layer_sizes: Dict[str, int] = {
+        "L0+L1":   len(base_prompt),
+        "L0.5g":   len(global_summary),
+        "L0.5p":   len(per_chat_summary),
+        "L1.5_kg": 0,
+        "L1.5_rag": 0,
+    }
 
     last_user = _last_user_text(messages)
     if last_user:
         extra = memory.kg_recall_from_text(last_user)
         if extra:
+            layer_sizes["L1.5_kg"] = len(extra)
             log.debug("[sidecar] injecting %d-char KG recall into system prompt", len(extra))
             base_prompt = f"{base_prompt}\n\n# Recalled facts\n{extra}"
 
         rag_ctx = rag.retrieve(last_user)
         if rag_ctx:
+            layer_sizes["L1.5_rag"] = len(rag_ctx)
             log.debug("[sidecar] injecting %d-char RAG recall into system prompt", len(rag_ctx))
             base_prompt = f"{base_prompt}\n\n# Relevant past context\n{rag_ctx}"
 
     system_prompt = base_prompt
 
     if not isinstance(messages, list) or not messages:
-        return [{"role": "system", "content": system_prompt}]
+        return [{"role": "system", "content": system_prompt}], layer_sizes
     if messages[0].get("role") != "system":
-        return [{"role": "system", "content": system_prompt}] + messages
-    return [{"role": "system", "content": system_prompt}] + messages[1:]
+        result = [{"role": "system", "content": system_prompt}] + messages
+    else:
+        result = [{"role": "system", "content": system_prompt}] + messages[1:]
+    return result, layer_sizes
 
 
 def build_model_messages(
@@ -167,9 +183,10 @@ def build_model_messages(
 
     - Strip fields unknown to Ollama (chatId, id, createdAt, updatedAt …).
     - Remove <think>…</think> blocks from previous assistant turns.
+    - Preserve tool_calls and id fields on assistant messages (needed for
+      tool_call_id pairing in openrouter._to_openai).
     - Keep system message as-is (already assembled by ensure_system_prompt).
-    - Limit history to *max_history_turns* user+assistant pairs to prevent
-      context-window overflow.  The system message is never trimmed.
+    - Limit history to *max_history_turns* user+assistant pairs.
     """
     system: Optional[Dict] = None
     turns: List[Dict] = []
@@ -188,7 +205,7 @@ def build_model_messages(
 
         entry: Dict[str, Any] = {"role": role, "content": content}
         if role == "assistant" and m.get("tool_calls"):
-            entry["tool_calls"] = m["tool_calls"]
+            entry["tool_calls"] = m["tool_calls"]  # preserves id field
         turns.append(entry)
 
     if len(turns) > max_history_turns * 2:
@@ -201,11 +218,24 @@ def build_model_messages(
     return result
 
 
-def _log_payload_sizes(req_id: str, messages: List[Dict], tools_count: int) -> None:
-    """Log character counts for each message role in the outgoing payload.
+def _log_payload_sizes(
+    req_id: str,
+    messages: List[Dict],
+    tools_count: int,
+    layer_sizes: Optional[Dict[str, int]] = None,
+) -> None:
+    """Log character counts for each message role + system prompt layer breakdown.
 
-    Helps diagnose context-window pressure and oversized system prompts.
-    Format:  [req_id] payload sizes: system=N user=N assistant=N tool=N  total_chars=N  tools=N
+    System prompt breakdown (when layer_sizes provided):
+      L0+L1     identity + wake-up base (mempalace)
+      L0.5g     global summary
+      L0.5p     per-chat summary
+      L1.5_kg   KG sidecar
+      L1.5_rag  RAG sidecar
+
+    Output example:
+      [req_id] system layers: L0+L1=3100 L0.5g=420 L0.5p=0 L1.5_kg=0 L1.5_rag=3121  total=6641
+      [req_id] payload sizes: system=6641 user=76 assistant=0 tool=0  total_chars=6717  tools=29
     """
     sizes: Dict[str, int] = {"system": 0, "user": 0, "assistant": 0, "tool": 0}
     for m in messages:
@@ -213,6 +243,18 @@ def _log_payload_sizes(req_id: str, messages: List[Dict], tools_count: int) -> N
         content = m.get("content") or ""
         sizes[role] = sizes.get(role, 0) + len(content)
     total = sum(sizes.values())
+
+    if layer_sizes:
+        log.debug(
+            "[%s] system layers: L0+L1=%d L0.5g=%d L0.5p=%d L1.5_kg=%d L1.5_rag=%d  total=%d",
+            req_id,
+            layer_sizes.get("L0+L1", 0),
+            layer_sizes.get("L0.5g", 0),
+            layer_sizes.get("L0.5p", 0),
+            layer_sizes.get("L1.5_kg", 0),
+            layer_sizes.get("L1.5_rag", 0),
+            sizes.get("system", 0),
+        )
     log.debug(
         "[%s] payload sizes: system=%d user=%d assistant=%d tool=%d  total_chars=%d  tools=%d",
         req_id,
@@ -231,7 +273,6 @@ def make_ollama_payload(
         options: Dict[str, Any],
         stream: bool,
 ) -> Dict[str, Any]:
-    """Build an Ollama-format payload, respecting the global THINKING flag."""
     payload: Dict[str, Any] = {
         "model":    model,
         "messages": messages,
@@ -316,6 +357,16 @@ def init_tools():
 
 
 def call_tool(name: str, arguments: Dict[str, Any]) -> Any:
+    """Invoke a tool by name.
+
+    Returns the tool result dict on success.  On failure (unknown tool,
+    MCP error, exception) returns an error dict so the model can see what
+    went wrong and potentially correct its call:
+      {"error": "<reason>", "tool": "<name>", "args": {…}}
+
+    Callers should NOT raise on the returned error dict — they must append
+    it as a tool message so the model gets the feedback.
+    """
     if name == "mempalacekgquery":
         entity = arguments.get("entity", "")
         if entity:
@@ -329,10 +380,29 @@ def call_tool(name: str, arguments: Dict[str, Any]) -> Any:
 
     client = TOOL_REGISTRY.get(name)
     if client is None:
-        raise RuntimeError(f"Unknown tool: {name}")
+        log.error("[tool] unknown tool requested: %s", name)
+        return {"error": f"Unknown tool: {name}", "tool": name, "args": arguments}
+
     log.debug("[tool] calling %s with args: %s", name, arguments)
-    result = client.call_tool(name, arguments)
-    log.debug("[tool] %s result: %s", name, str(result)[:200])
+    try:
+        result = client.call_tool(name, arguments)
+    except Exception as exc:
+        log.error("[tool] %s raised exception: %s", name, exc)
+        return {"error": str(exc), "tool": name, "args": arguments}
+
+    log.debug("[tool] %s result: %s", name, str(result)[:300])
+
+    # Surface MCP-level errors explicitly so the model sees them.
+    if isinstance(result, dict) and result.get("success") is False:
+        err_msg = result.get("error") or "unknown MCP error"
+        log.warning("[tool] %s returned MCP error: %s", name, err_msg)
+        return {
+            "error":       err_msg,
+            "tool":        name,
+            "args":        arguments,
+            "mcp_result":  result,
+        }
+
     if name in MEMPALACE_WRITE_TOOLS:
         memory.invalidate()
     return result
@@ -388,11 +458,6 @@ def _summarize_text(system_prompt: str, previous_summary: str, turns_text: str) 
 
 
 def _update_global_summary(turns_text: str) -> None:
-    """Merge turns_text into the global L0.5 summary.
-
-    Protected by _GLOBAL_SUMMARY_LOCK so concurrent compress threads
-    (one per chat) always do a read-modify-write atomically.
-    """
     with _GLOBAL_SUMMARY_LOCK:
         previous = memory.read_global_summary()
         try:
@@ -405,7 +470,6 @@ def _update_global_summary(turns_text: str) -> None:
 
 
 def _compress_summary(session: sess.Session) -> None:
-    """Blocking compress call — meant to run in a background thread."""
     if not session.raw_turns:
         return
 
@@ -443,8 +507,6 @@ def _compress_summary(session: sess.Session) -> None:
 def maybe_compress_async(session: sess.Session) -> None:
     if len(session.raw_turns) < CHATD_COMPRESS_EVERY:
         return
-    # Non-blocking acquire: if a compress thread is already running for this
-    # session, skip rather than queue a second one that would race on raw_turns.
     if not session._compress_lock.acquire(blocking=False):
         log.debug("[session:%s] compress already running, skipping", session.session_id)
         return
@@ -465,19 +527,6 @@ def maybe_compress_async(session: sess.Session) -> None:
 
 
 def _backfill_session(session: sess.Session, messages: List[Dict]) -> None:
-    """Seed session.raw_turns from GUI history on the very first request.
-
-    This runs only when the session has no existing data on disk (both
-    raw_turns and summary are empty).  It takes up to 10 recent user/assistant
-    pairs from the incoming messages array and immediately triggers async
-    compression to build an initial summary.
-
-    NOTE (known behaviour): compression runs in a background thread, so
-    session.summary will still be empty for *this* request.  The summary
-    becomes available starting from the next request.  This is acceptable
-    because backfill only fires on the very first interaction with a fresh
-    session — subsequent requests will have the summary already on disk.
-    """
     if session.raw_turns or session.summary:
         return
     pairs: List[Dict] = []
@@ -596,6 +645,7 @@ def chat_stream_generator(
     messages: List[Dict],
     options: Dict[str, Any],
     session: Optional[sess.Session],
+    layer_sizes: Dict[str, int],
     req_id: str = "-",
 ) -> Generator[bytes, None, None]:
     MAX_TOOL_ROUNDS = 5
@@ -617,7 +667,9 @@ def chat_stream_generator(
 
             built_messages = build_model_messages(messages)
             payload = make_ollama_payload(model, built_messages, options, stream=True)
-            _log_payload_sizes(req_id, built_messages, len(TOOLS))
+            # Layer sizes only meaningful on round 0; subsequent rounds have tool messages.
+            _log_payload_sizes(req_id, built_messages, len(TOOLS),
+                               layer_sizes if round_num == 0 else None)
             log.debug(
                 "[%s] -> backend payload (messages=%d, tools=%d, options=%s, think=%s)",
                 req_id, len(built_messages), len(TOOLS), options, THINKING,
@@ -701,7 +753,7 @@ def chat_stream_generator(
             messages.append({
                 "role":       "assistant",
                 "content":    remapper.content_acc,
-                "tool_calls": last_tool_calls,
+                "tool_calls": last_tool_calls,  # preserves id from finalise_tool_calls
             })
 
             for tc in last_tool_calls:
@@ -718,11 +770,14 @@ def chat_stream_generator(
                 log.info("[%s] executing tool: %s(%s)", req_id, tool_name, tool_args)
                 yield _log_yield(req_id, "tool/ann", make_chunk(model, f"\n[→ {tool_name}]\n\n"))
 
-                try:
-                    tool_result = call_tool(tool_name, tool_args)
-                except Exception as e:
-                    log.error("[%s] tool %s failed: %s", req_id, tool_name, e)
-                    tool_result = {"error": str(e)}
+                # call_tool never raises — errors are returned as dicts.
+                tool_result = call_tool(tool_name, tool_args)
+
+                if isinstance(tool_result, dict) and "error" in tool_result:
+                    log.warning(
+                        "[%s] tool %s error (passed to model): %s",
+                        req_id, tool_name, tool_result["error"],
+                    )
 
                 messages.append({
                     "role":    "tool",
@@ -788,9 +843,10 @@ def chat():
 
     global_summary = memory.read_global_summary()
 
-    log.info("[%s] chat_id=%s summary_len=%d global_summary_len=%d", req_id, chat_id, len(summary), len(global_summary))
+    log.info("[%s] chat_id=%s summary_len=%d global_summary_len=%d",
+             req_id, chat_id, len(summary), len(global_summary))
 
-    messages = ensure_system_prompt(
+    messages, layer_sizes = ensure_system_prompt(
         messages,
         per_chat_summary=summary,
         global_summary=global_summary,
@@ -810,7 +866,8 @@ def chat():
             for i in range(MAX_TOOL_ROUNDS):
                 built_messages = build_model_messages(messages)
                 payload = make_ollama_payload(model, built_messages, options, stream=False)
-                _log_payload_sizes(req_id, built_messages, len(TOOLS))
+                _log_payload_sizes(req_id, built_messages, len(TOOLS),
+                                   layer_sizes if i == 0 else None)
                 log.debug("[%s] non-stream round %d, think=%s", req_id, i, THINKING)
                 resp       = backend.chat_sync(payload)
                 msg        = resp.get("message") or {}
@@ -842,10 +899,12 @@ def chat():
                     tool_args = fn.get("arguments") or {}
                     if isinstance(tool_args, str):
                         tool_args = json.loads(tool_args)
-                    try:
-                        tool_result = call_tool(tool_name, tool_args)
-                    except Exception as e:
-                        tool_result = {"error": str(e)}
+                    tool_result = call_tool(tool_name, tool_args)
+                    if isinstance(tool_result, dict) and "error" in tool_result:
+                        log.warning(
+                            "[%s] non-stream tool %s error (passed to model): %s",
+                            req_id, tool_name, tool_result["error"],
+                        )
                     messages.append({
                         "role":    "tool",
                         "content": json.dumps(tool_result, ensure_ascii=False),
@@ -877,7 +936,7 @@ def chat():
     log.info("[%s] starting stream generator", req_id)
     return Response(
         stream_with_context(
-            chat_stream_generator(model, messages, options, session, req_id)
+            chat_stream_generator(model, messages, options, session, layer_sizes, req_id)
         ),
         content_type="application/x-ndjson",
         headers={
