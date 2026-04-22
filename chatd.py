@@ -54,6 +54,10 @@ app = Flask(__name__)
 
 _GLOBAL_SUMMARY_LOCK = threading.Lock()
 
+# How much to boost num_predict for tool follow-up rounds.
+# After tool execution the context is heavier; the model needs more room to answer.
+TOOL_ROUND_NUM_PREDICT_BOOST = 1024
+
 
 # ── helpers ────────────────────────────────────────────────────────────────────
 
@@ -656,6 +660,23 @@ def tags():
     return jsonify(data)
 
 
+def _options_for_round(options: Dict[str, Any], round_num: int) -> Dict[str, Any]:
+    """Return options dict adjusted for the current tool round.
+
+    For round 0 (initial user turn) options are used as-is.
+    For round 1+ (tool follow-up) num_predict is boosted by
+    TOOL_ROUND_NUM_PREDICT_BOOST so the model has enough room to
+    synthesise a full answer after the (heavier) tool context.
+    """
+    if round_num == 0:
+        return options
+    boosted = dict(options)
+    base = boosted.get("num_predict", 512)
+    boosted["num_predict"] = base + TOOL_ROUND_NUM_PREDICT_BOOST
+    log.debug("tool round %d: num_predict %d -> %d", round_num, base, boosted["num_predict"])
+    return boosted
+
+
 def chat_stream_generator(
     model: str,
     messages: List[Dict],
@@ -681,13 +702,14 @@ def chat_stream_generator(
         for round_num in range(MAX_TOOL_ROUNDS):
             log.info("[%s] stream round %d, messages=%d", req_id, round_num, len(messages))
 
+            round_options = _options_for_round(options, round_num)
             built_messages = build_model_messages(messages)
-            payload = make_ollama_payload(model, built_messages, options, stream=True)
+            payload = make_ollama_payload(model, built_messages, round_options, stream=True)
             _log_payload_sizes(req_id, built_messages, len(TOOLS),
                                layer_sizes if round_num == 0 else None)
             log.debug(
                 "[%s] -> backend payload (messages=%d, tools=%d, options=%s, think=%s)",
-                req_id, len(built_messages), len(TOOLS), options, THINKING,
+                req_id, len(built_messages), len(TOOLS), round_options, THINKING,
             )
 
             last_tool_calls: Optional[List[Dict]] = None
@@ -878,8 +900,9 @@ def chat():
             backend = backends.get_backend(model)
 
             for i in range(MAX_TOOL_ROUNDS):
+                round_options = _options_for_round(options, i)
                 built_messages = build_model_messages(messages)
-                payload = make_ollama_payload(model, built_messages, options, stream=False)
+                payload = make_ollama_payload(model, built_messages, round_options, stream=False)
                 _log_payload_sizes(req_id, built_messages, len(TOOLS),
                                    layer_sizes if i == 0 else None)
                 log.debug("[%s] non-stream round %d, think=%s", req_id, i, THINKING)
