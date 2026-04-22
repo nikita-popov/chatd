@@ -81,10 +81,28 @@ def fetch_model_info(model_with_prefix: str) -> Optional[Dict[str, Any]]:
     return result
 
 
+def supports_tools(model_with_prefix: str) -> bool:
+    """Return True if the OR model declares 'tools' in supported_parameters.
+
+    Falls back to True when the cache is unavailable (safe default: let OR
+    reject the request if needed rather than silently stripping tools from a
+    model that actually supports them).
+    """
+    _load_model_cache()
+    model_id = _strip(model_with_prefix)
+    info = _model_cache.get(model_id)
+    if info is None:
+        # Cache miss: model unknown, assume supported to avoid silent data loss.
+        return True
+    params: List[str] = info.get("supported_parameters") or []
+    return "tools" in params
+
+
 def _to_openai(payload: Dict[str, Any], stream: bool) -> Dict[str, Any]:
+    model = payload["model"]
     opts = payload.get("options", {})
     result: Dict[str, Any] = {
-        "model":    _strip(payload["model"]),
+        "model":    _strip(model),
         "messages": payload.get("messages", []),
         "stream":   stream,
     }
@@ -95,8 +113,11 @@ def _to_openai(payload: Dict[str, Any], stream: bool) -> Dict[str, Any]:
     if "top_p" in opts:
         result["top_p"] = opts["top_p"]
     if payload.get("tools"):
-        result["tools"] = payload["tools"]
-        result["tool_choice"] = "auto"
+        if supports_tools(model):
+            result["tools"] = payload["tools"]
+            result["tool_choice"] = "auto"
+        else:
+            log.debug("[openrouter] stripping tools from payload: %s does not support function calling", _strip(model))
     return result
 
 
