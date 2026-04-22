@@ -15,6 +15,7 @@ import os
 from typing import Any, Dict, Generator, List, Optional
 
 import requests
+from requests.exceptions import HTTPError
 
 OPENROUTER_API_KEY: str = os.environ.get("OPENROUTER_API_KEY", "")
 OPENROUTER_API_BASE: str = os.environ.get("OPENROUTER_API_BASE", "https://openrouter.ai/api/v1")
@@ -117,7 +118,10 @@ def _to_openai(payload: Dict[str, Any], stream: bool) -> Dict[str, Any]:
             result["tools"] = payload["tools"]
             result["tool_choice"] = "auto"
         else:
-            log.debug("[openrouter] stripping tools from payload: %s does not support function calling", _strip(model))
+            log.debug(
+                "[openrouter] stripping tools from payload: %s does not support function calling",
+                _strip(model),
+            )
     return result
 
 
@@ -133,6 +137,54 @@ def _normalize_tool_calls(raw: List[Dict]) -> List[Dict]:
                 args = {}
         result.append({"function": {"name": fn.get("name", ""), "arguments": args}})
     return result
+
+
+def _extract_or_error(response: requests.Response) -> str:
+    """Pull the human-readable message out of an OR error body, or fall back
+    to the raw HTTP status line."""
+    try:
+        body = response.json()
+        err = body.get("error") or {}
+        msg = err.get("message") or ""
+        code = err.get("code")
+        return f"{msg} (code={code})" if code else msg or response.text[:200]
+    except Exception:
+        return response.text[:200]
+
+
+def _log_http_error(exc: HTTPError) -> str:
+    """Log an HTTPError at the appropriate level and return a short description.
+
+    429/503 are transient — WARNING. Everything else is ERROR.
+    Retry-After is extracted and included in the log when present.
+    """
+    r = exc.response
+    status = r.status_code if r is not None else 0
+    detail = _extract_or_error(r) if r is not None else str(exc)
+
+    extra = ""
+    if r is not None and status == 429:
+        retry_after = r.headers.get("Retry-After")
+        if retry_after:
+            extra = f" | Retry-After: {retry_after}s"
+
+    msg = f"[openrouter] HTTP {status}{extra}: {detail}"
+    if status in (429, 503):
+        log.warning(msg)
+    else:
+        log.error(msg)
+
+    return detail
+
+
+def _error_chunk(model: str, detail: str, status: int) -> bytes:
+    """Produce a terminal Ollama-style NDJSON chunk carrying the error text."""
+    return (json.dumps({
+        "model": model,
+        "message": {"role": "assistant", "content": f"[OpenRouter error {status}] {detail}"},
+        "done": True,
+        "done_reason": "error",
+    }, ensure_ascii=False) + "\n").encode()
 
 
 def _sse_to_ndjson(
@@ -175,23 +227,45 @@ class OpenRouterBackend:
     def chat_stream(
         self, payload: Dict[str, Any]
     ) -> Generator[bytes, None, None]:
-        r = requests.post(
-            f"{OPENROUTER_API_BASE}/chat/completions",
-            headers=_headers(),
-            json=_to_openai(payload, stream=True),
-            timeout=3600, stream=True,
-        )
-        r.raise_for_status()
-        yield from _sse_to_ndjson(r, payload["model"])
+        """Stream chat completions from OR, converting SSE to Ollama NDJSON.
+
+        HTTP errors are caught here rather than propagated: the caller receives
+        a terminal error chunk so the session finaliser can run normally.
+        """
+        model = payload["model"]
+        try:
+            r = requests.post(
+                f"{OPENROUTER_API_BASE}/chat/completions",
+                headers=_headers(),
+                json=_to_openai(payload, stream=True),
+                timeout=3600, stream=True,
+            )
+            r.raise_for_status()
+        except HTTPError as exc:
+            detail = _log_http_error(exc)
+            status = exc.response.status_code if exc.response is not None else 0
+            yield _error_chunk(model, detail, status)
+            return
+        yield from _sse_to_ndjson(r, model)
 
     def chat_sync(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        r = requests.post(
-            f"{OPENROUTER_API_BASE}/chat/completions",
-            headers=_headers(),
-            json=_to_openai(payload, stream=False),
-            timeout=3600,
-        )
-        r.raise_for_status()
+        """Non-streaming chat completion (used by sidecar / tool-call loops).
+
+        HTTP errors are re-raised as RuntimeError with a clean message so the
+        caller does not have to handle requests internals.
+        """
+        try:
+            r = requests.post(
+                f"{OPENROUTER_API_BASE}/chat/completions",
+                headers=_headers(),
+                json=_to_openai(payload, stream=False),
+                timeout=3600,
+            )
+            r.raise_for_status()
+        except HTTPError as exc:
+            detail = _log_http_error(exc)
+            status = exc.response.status_code if exc.response is not None else 0
+            raise RuntimeError(f"OpenRouter HTTP {status}: {detail}") from exc
         data   = r.json()
         choice = (data.get("choices") or [{}])[0]
         msg    = choice.get("message") or {}
