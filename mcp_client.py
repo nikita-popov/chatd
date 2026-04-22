@@ -87,7 +87,7 @@ class MCPClient:
         async def _run():
             async with AsyncExitStack() as stack:
                 read, write = await stack.enter_async_context(
-                    stdio_client(StdioServerParameters(command=command, args=args, env=None))
+                    stdio_client(StdioServerParameters(command=command, args=args, env=os.environ.copy()))
                 )
                 session = await stack.enter_async_context(ClientSession(read, write))
                 await session.initialize()
