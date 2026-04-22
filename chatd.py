@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Generator, List, Optional, Tuple
 
 import requests
-from requests.exceptions import ReadTimeout
+from requests.exceptions import ReadTimeout, RequestException
 from flask import Flask, request, Response, jsonify, stream_with_context
 
 import backends
@@ -97,11 +97,28 @@ def merge_options(client_options: Optional[Dict]) -> Dict[str, Any]:
     return opts
 
 
-def extract_chat_id(messages: List[Dict]) -> Optional[str]:
-    for m in messages:
-        chat_id = m.get("chatId")
+def extract_chat_id(flask_request) -> Optional[str]:
+    """Extract chat session ID from the Referer header.
+
+    Hollama sends requests from /sessions/<id> — the browser automatically
+    includes this URL as the Referer header, so we parse it from there.
+    Falls back to scanning messages for a legacy chatId field.
+
+    Example Referer: http://host/sessions/e8unjq  →  "e8unjq"
+    """
+    referer = flask_request.headers.get("Referer", "")
+    if referer:
+        m = re.search(r"/sessions/([^/?#]+)", referer)
+        if m:
+            return m.group(1)
+
+    # Legacy fallback: chatId field in messages (pre-hollama WebUI)
+    messages = flask_request.get_json(silent=True) or {}
+    for msg in (messages.get("messages") or []):
+        chat_id = msg.get("chatId")
         if chat_id is not None:
             return str(chat_id)
+
     return None
 
 
@@ -719,53 +736,63 @@ def chat_stream_generator(
             try:
                 stream = backend.chat_stream(payload)
             except Exception as e:
-                log.error("[%s] backend stream failed: %s", req_id, e)
-                yield make_chunk(model, f"\n[error: {e}]\n", done=True)
+                log.error("[%s] backend stream init failed: %s", req_id, e)
+                yield make_chunk(model, f"\n[Ошибка соединения: {e}]\n", done=True)
                 return
 
-            for line in stream:
-                if not line:
-                    continue
-                try:
-                    chunk = json.loads(line.decode("utf-8") if isinstance(line, bytes) else line)
-                except json.JSONDecodeError as e:
-                    log.warning("[%s] bad JSON line: %s | %r", req_id, e, line[:120])
-                    continue
+            try:
+                for line in stream:
+                    if not line:
+                        continue
+                    try:
+                        chunk = json.loads(line.decode("utf-8") if isinstance(line, bytes) else line)
+                    except json.JSONDecodeError as e:
+                        log.warning("[%s] bad JSON line: %s | %r", req_id, e, line[:120])
+                        continue
 
-                chunk_count += 1
-                msg  = chunk.get("message") or {}
-                done = chunk.get("done", False)
-                tc   = msg.get("tool_calls")
+                    chunk_count += 1
+                    msg  = chunk.get("message") or {}
+                    done = chunk.get("done", False)
+                    tc   = msg.get("tool_calls")
 
-                if tc:
-                    log.info("[%s] tool_calls: %s", req_id,
-                             [c.get("function", {}).get("name") for c in tc])
-                    last_tool_calls = tc
+                    if tc:
+                        log.info("[%s] tool_calls: %s", req_id,
+                                 [c.get("function", {}).get("name") for c in tc])
+                        last_tool_calls = tc
 
-                if done:
-                    log.info(
-                        "[%s] round %d done, chunks=%d, tool_calls=%s, content_len=%d",
-                        req_id, round_num, chunk_count,
-                        bool(last_tool_calls), len(remapper.content_acc),
-                    )
-                    closing = remapper.close()
-                    if closing:
-                        yield _log_yield(req_id, "think/close", closing)
-                    if last_tool_calls:
-                        yield _log_yield(req_id, "keepalive/tc", make_keepalive(model))
-                    else:
-                        final_assistant_content = remapper.content_acc
-                        yield _log_yield(req_id, "done", remapper.feed(line))
-                    break
+                    if done:
+                        log.info(
+                            "[%s] round %d done, chunks=%d, tool_calls=%s, content_len=%d",
+                            req_id, round_num, chunk_count,
+                            bool(last_tool_calls), len(remapper.content_acc),
+                        )
+                        closing = remapper.close()
+                        if closing:
+                            yield _log_yield(req_id, "think/close", closing)
+                        if last_tool_calls:
+                            yield _log_yield(req_id, "keepalive/tc", make_keepalive(model))
+                        else:
+                            final_assistant_content = remapper.content_acc
+                            yield _log_yield(req_id, "done", remapper.feed(line))
+                        break
 
-                out = remapper.feed(line)
-                if not tc:
-                    log.debug(
-                        "[%s] yield %-12s %d bytes: ...%s",
-                        req_id, f"chunk/{chunk_count}", len(out),
-                        out[-60:].decode("utf-8", errors="replace").strip(),
-                    )
-                    yield out
+                    out = remapper.feed(line)
+                    if not tc:
+                        log.debug(
+                            "[%s] yield %-12s %d bytes: ...%s",
+                            req_id, f"chunk/{chunk_count}", len(out),
+                            out[-60:].decode("utf-8", errors="replace").strip(),
+                        )
+                        yield out
+
+            except RequestException as e:
+                log.error("[%s] network error during stream: %s", req_id, e)
+                yield make_chunk(
+                    model,
+                    f"\n[Ошибка сети: {type(e).__name__}: {e}]\n",
+                    done=True,
+                )
+                return
 
             log.debug("[%s] exited stream, last_tool_calls=%s", req_id, bool(last_tool_calls))
 
@@ -864,7 +891,7 @@ def chat():
     options     = merge_options(original_payload.get("options"))
     want_stream = original_payload.get("stream", True)
 
-    chat_id = extract_chat_id(messages)
+    chat_id = extract_chat_id(request)
     session = sess.get_session(chat_id) if chat_id else None
 
     if session:
