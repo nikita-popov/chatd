@@ -470,16 +470,29 @@ def _update_global_summary(turns_text: str) -> None:
 
 
 def _compress_summary(session: sess.Session) -> None:
+    """Compress ALL accumulated raw_turns into session.summary.
+
+    Uses the full raw_turns list (not a tail slice) so no turns are silently
+    dropped between compression cycles.  After a successful compression the
+    list is cleared; on failure the list is also cleared to avoid unbounded
+    growth, but the turns are still indexed into RAG first.
+    """
     if not session.raw_turns:
         return
 
-    turns = session.raw_turns[-CHATD_COMPRESS_EVERY:]
+    # Snapshot the full list — a new turn could be appended concurrently
+    # between here and clear(), but _compress_lock prevents a second compress
+    # thread from running, so in practice this is safe.
+    turns = list(session.raw_turns)
     turns_text = "\n".join(
         f"User: {t['user']}\nAssistant: {t['assistant']}"
         for t in turns
     )
+    log.debug(
+        "[session:%s] compressing %d turns (%d chars) with model %s",
+        session.session_id, len(turns), len(turns_text), CHATD_SUMMARY_MODEL,
+    )
     try:
-        log.debug("[session:%s] compression model: %s", session.session_id, CHATD_SUMMARY_MODEL)
         new_summary = _summarize_text(_SUMMARIZE_SYSTEM, session.summary, turns_text)
         if new_summary and len(new_summary) >= 20:
             session.summary = new_summary
@@ -493,11 +506,14 @@ def _compress_summary(session: sess.Session) -> None:
             session.raw_turns.clear()
             session.save()
             log.info(
-                "[session:%s] summary updated (%d chars)",
-                session.session_id, len(new_summary),
+                "[session:%s] summary updated (%d turns → %d chars)",
+                session.session_id, len(turns), len(new_summary),
             )
         else:
-            log.warning("[session:%s] summariser returned empty content", session.session_id)
+            log.warning(
+                "[session:%s] summariser returned empty content, clearing raw_turns anyway",
+                session.session_id,
+            )
             session.raw_turns.clear()
             session.save()
     except Exception as e:
@@ -667,7 +683,6 @@ def chat_stream_generator(
 
             built_messages = build_model_messages(messages)
             payload = make_ollama_payload(model, built_messages, options, stream=True)
-            # Layer sizes only meaningful on round 0; subsequent rounds have tool messages.
             _log_payload_sizes(req_id, built_messages, len(TOOLS),
                                layer_sizes if round_num == 0 else None)
             log.debug(
@@ -753,7 +768,7 @@ def chat_stream_generator(
             messages.append({
                 "role":       "assistant",
                 "content":    remapper.content_acc,
-                "tool_calls": last_tool_calls,  # preserves id from finalise_tool_calls
+                "tool_calls": last_tool_calls,
             })
 
             for tc in last_tool_calls:
@@ -770,7 +785,6 @@ def chat_stream_generator(
                 log.info("[%s] executing tool: %s(%s)", req_id, tool_name, tool_args)
                 yield _log_yield(req_id, "tool/ann", make_chunk(model, f"\n[→ {tool_name}]\n\n"))
 
-                # call_tool never raises — errors are returned as dicts.
                 tool_result = call_tool(tool_name, tool_args)
 
                 if isinstance(tool_result, dict) and "error" in tool_result:
