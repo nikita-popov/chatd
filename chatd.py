@@ -34,7 +34,7 @@ from backends.openrouter import fetch_model_info, OPENROUTER_PREFIX
 from mcp_client import MCPClient, discover_mcp_servers
 from think_remapper import ThinkingRemapper
 
-# ── logging ───────────────────────────────────────────────────────────────────────────────────
+# ── logging ────────────────────────────────────────────────────────────────────
 
 logging.basicConfig(
     level=logging.DEBUG,
@@ -43,7 +43,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("chatd")
 
-# ── app ───────────────────────────────────────────────────────────────────────────────────────
+# ── app ────────────────────────────────────────────────────────────────────────
 
 VERSION = "1.0.0"
 
@@ -57,7 +57,7 @@ app = Flask(__name__)
 _GLOBAL_SUMMARY_LOCK = threading.Lock()
 
 
-# ── helpers ───────────────────────────────────────────────────────────────────────────────────────
+# ── helpers ────────────────────────────────────────────────────────────────────
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f") + "000Z"
@@ -221,7 +221,7 @@ def make_ollama_payload(
     return payload
 
 
-# ── CORS ────────────────────────────────────────────────────────────────────────────────────────
+# ── CORS ───────────────────────────────────────────────────────────────────────
 
 @app.after_request
 def add_cors(response: Response) -> Response:
@@ -237,7 +237,7 @@ def options_chat():
     return Response(status=204)
 
 
-# ── tools ───────────────────────────────────────────────────────────────────────────────────────
+# ── tools ──────────────────────────────────────────────────────────────────────
 
 def load_tools():
     tools    = []
@@ -314,7 +314,7 @@ def call_tool(name: str, arguments: Dict[str, Any]) -> Any:
     return result
 
 
-# ── compressed summary + external RAG indexing ─────────────────────────────────────────
+# ── compressed summary + external RAG indexing ────────────────────────────────
 
 _SUMMARIZE_SYSTEM = (
     "You are a memory compressor for a personal AI assistant.\n"
@@ -420,9 +420,20 @@ def _compress_summary(session: sess.Session) -> None:
 def maybe_compress_async(session: sess.Session) -> None:
     if len(session.raw_turns) < CHATD_COMPRESS_EVERY:
         return
+    # Non-blocking acquire: if a compress thread is already running for this
+    # session, skip rather than queue a second one that would race on raw_turns.
+    if not session._compress_lock.acquire(blocking=False):
+        log.debug("[session:%s] compress already running, skipping", session.session_id)
+        return
+
+    def _run():
+        try:
+            _compress_summary(session)
+        finally:
+            session._compress_lock.release()
+
     t = threading.Thread(
-        target=_compress_summary,
-        args=(session,),
+        target=_run,
         daemon=True,
         name=f"compress-{session.session_id}",
     )
@@ -431,6 +442,19 @@ def maybe_compress_async(session: sess.Session) -> None:
 
 
 def _backfill_session(session: sess.Session, messages: List[Dict]) -> None:
+    """Seed session.raw_turns from GUI history on the very first request.
+
+    This runs only when the session has no existing data on disk (both
+    raw_turns and summary are empty).  It takes up to 10 recent user/assistant
+    pairs from the incoming messages array and immediately triggers async
+    compression to build an initial summary.
+
+    NOTE (known behaviour): compression runs in a background thread, so
+    session.summary will still be empty for *this* request.  The summary
+    becomes available starting from the next request.  This is acceptable
+    because backfill only fires on the very first interaction with a fresh
+    session — subsequent requests will have the summary already on disk.
+    """
     if session.raw_turns or session.summary:
         return
     pairs: List[Dict] = []
@@ -460,19 +484,9 @@ def _log_yield(req_id: str, label: str, data: bytes) -> bytes:
     return data
 
 
-# ── augmented /api/tags ────────────────────────────────────────────────────────────────────────────────
+# ── augmented /api/tags ────────────────────────────────────────────────────────
 
 def _or_model_to_tag(model_name: str) -> Optional[Dict[str, Any]]:
-    """Fetch OR model metadata and convert to an Ollama-compatible tag entry.
-
-    Returns None if the model cannot be fetched (bad key, unknown id, etc.).
-    The synthetic entry uses:
-      - name / model : model_name as-is (with or/ prefix)
-      - size         : context_length from OR, or 0 if absent
-      - digest       : empty string (not meaningful for cloud models)
-      - modified_at  : current UTC timestamp
-      - details      : family=openrouter, parameter_size from OR pricing label if present
-    """
     info = fetch_model_info(model_name)
     if info is None:
         return None
@@ -498,10 +512,6 @@ def _or_model_to_tag(model_name: str) -> Optional[Dict[str, Any]]:
 
 
 def _build_or_tags() -> List[Dict[str, Any]]:
-    """Return synthetic tag entries for all OPENROUTER_API_MODELS.
-
-    Skips models that cannot be resolved (logged at WARNING level).
-    """
     result = []
     for model_name in OPENROUTER_API_MODELS:
         entry = _or_model_to_tag(model_name)
@@ -531,11 +541,6 @@ def health():
 @app.get("/tags")
 @app.get("/api/tags")
 def tags():
-    """Proxy ollama /api/tags and inject OPENROUTER_API_MODELS entries.
-
-    If OPENROUTER_API_MODELS is empty the response is a plain proxy.
-    OR entries are appended after all local ollama models.
-    """
     r = requests.get(f"{OLLAMA_API}/api/tags", timeout=600)
     if not OPENROUTER_API_MODELS:
         return Response(

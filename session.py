@@ -21,6 +21,7 @@ without any extra conversion step.
 import json
 import logging
 import os
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -39,6 +40,12 @@ class Session:
     summary: str = ""
     # unsummarized turns accumulated since last compression
     raw_turns: list = field(default_factory=list, repr=False)
+    # Prevents two concurrent compress threads from running for the same
+    # session (e.g. two requests arriving before the first compress finishes).
+    # acquire(blocking=False) is used so the second caller just skips.
+    _compress_lock: threading.Lock = field(
+        default_factory=threading.Lock, repr=False, compare=False
+    )
 
     # ── persistence ──────────────────────────────────────────────────────────
 
