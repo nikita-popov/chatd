@@ -44,11 +44,6 @@ def _headers() -> Dict[str, str]:
 
 
 def _load_model_cache() -> None:
-    """Fetch GET /models and populate _model_cache (id -> object).
-
-    No-op if the cache is already loaded. Thread-safety is not critical here:
-    a duplicate fetch on concurrent startup is harmless.
-    """
     global _model_cache, _model_cache_loaded
     if _model_cache_loaded:
         return
@@ -69,11 +64,6 @@ def _load_model_cache() -> None:
 
 
 def fetch_model_info(model_with_prefix: str) -> Optional[Dict[str, Any]]:
-    """Return OR model metadata for *model_with_prefix*, or None if not found.
-
-    Uses the bulk GET /models endpoint (cached in-process) because OR does
-    not expose a per-model GET /models/{id} endpoint.
-    """
     _load_model_cache()
     model_id = _strip(model_with_prefix)
     result = _model_cache.get(model_id)
@@ -83,17 +73,10 @@ def fetch_model_info(model_with_prefix: str) -> Optional[Dict[str, Any]]:
 
 
 def supports_tools(model_with_prefix: str) -> bool:
-    """Return True if the OR model declares 'tools' in supported_parameters.
-
-    Falls back to True when the cache is unavailable (safe default: let OR
-    reject the request if needed rather than silently stripping tools from a
-    model that actually supports them).
-    """
     _load_model_cache()
     model_id = _strip(model_with_prefix)
     info = _model_cache.get(model_id)
     if info is None:
-        # Cache miss: model unknown, assume supported to avoid silent data loss.
         return True
     params: List[str] = info.get("supported_parameters") or []
     return "tools" in params
@@ -139,9 +122,49 @@ def _normalize_tool_calls(raw: List[Dict]) -> List[Dict]:
     return result
 
 
+def _merge_tool_call_deltas(acc: List[Dict], deltas: List[Dict]) -> List[Dict]:
+    """Merge a tool_calls delta into the accumulator.
+
+    OpenAI streaming sends tool_calls in fragments:
+      chunk 1: [{index:0, id:"call_x", function:{name:"foo", arguments:""}}]
+      chunk 2: [{index:0, function:{arguments:'{"k":'}}]
+      chunk 3: [{index:0, function:{arguments:'"v"}'}}]
+
+    We accumulate by index, concatenating the arguments strings, and taking
+    the first non-empty name/id we see.
+    """
+    for delta in deltas:
+        idx = delta.get("index", 0)
+        # Extend accumulator to cover this index.
+        while len(acc) <= idx:
+            acc.append({"id": "", "type": "function", "function": {"name": "", "arguments": ""}})
+        entry = acc[idx]
+        if delta.get("id") and not entry["id"]:
+            entry["id"] = delta["id"]
+        fn = delta.get("function") or {}
+        if fn.get("name") and not entry["function"]["name"]:
+            entry["function"]["name"] = fn["name"]
+        if fn.get("arguments"):
+            entry["function"]["arguments"] += fn["arguments"]
+    return acc
+
+
+def _finalise_tool_calls(acc: List[Dict]) -> List[Dict]:
+    """Parse accumulated argument strings and normalise to chatd internal format."""
+    result = []
+    for entry in acc:
+        fn = entry.get("function") or {}
+        args_str = fn.get("arguments") or "{}"
+        try:
+            args = json.loads(args_str)
+        except json.JSONDecodeError:
+            log.warning("[openrouter] failed to parse tool_call arguments: %r", args_str[:200])
+            args = {}
+        result.append({"function": {"name": fn.get("name", ""), "arguments": args}})
+    return result
+
+
 def _extract_or_error(response: requests.Response) -> str:
-    """Pull the human-readable message out of an OR error body, or fall back
-    to the raw HTTP status line."""
     try:
         body = response.json()
         err = body.get("error") or {}
@@ -153,14 +176,7 @@ def _extract_or_error(response: requests.Response) -> str:
 
 
 def _or_response_meta(r: requests.Response) -> str:
-    """Extract OR-specific response headers useful for debugging.
-
-    OR sets the following headers on every response:
-      X-OR-Provider      - upstream provider that handled the request
-      X-OR-Generation-ID - unique ID cross-referenceable in the OR dashboard
-    """
     parts = []
-    # Header names are case-insensitive in requests; try both casings.
     provider = (
         r.headers.get("X-OR-Provider")
         or r.headers.get("x-or-provider")
@@ -177,11 +193,6 @@ def _or_response_meta(r: requests.Response) -> str:
 
 
 def _log_http_error(exc: HTTPError) -> str:
-    """Log an HTTPError at the appropriate level and return a short description.
-
-    429/503 are transient — WARNING. Everything else is ERROR.
-    Retry-After and OR provider/generation headers are included when present.
-    """
     r = exc.response
     status = r.status_code if r is not None else 0
     detail = _extract_or_error(r) if r is not None else str(exc)
@@ -207,7 +218,6 @@ def _log_http_error(exc: HTTPError) -> str:
 
 
 def _error_chunk(model: str, detail: str, status: int) -> bytes:
-    """Produce a terminal Ollama-style NDJSON chunk carrying the error text."""
     return (json.dumps({
         "model": model,
         "message": {"role": "assistant", "content": f"[OpenRouter error {status}] {detail}"},
@@ -219,17 +229,40 @@ def _error_chunk(model: str, detail: str, status: int) -> bytes:
 def _sse_to_ndjson(
     response: requests.Response, model: str
 ) -> Generator[bytes, None, None]:
-    """Convert OpenAI SSE stream to Ollama NDJSON bytes."""
+    """Convert OpenAI SSE stream to Ollama NDJSON bytes.
+
+    Tool call handling:
+      OpenAI streams tool_calls as delta fragments across multiple chunks
+      (each chunk adds a piece of the function name or arguments string).
+      We accumulate all fragments in `_tc_acc` and emit them only once in
+      the final done=True chunk.  This prevents chatd.py from seeing dozens
+      of intermediate chunks with empty names and from picking up an
+      incomplete last-delta as the resolved tool call.
+    """
+    _tc_acc: List[Dict] = []   # accumulates raw delta fragments
+    content_acc: str = ""
+
     for raw in response.iter_lines():
         if not raw:
             continue
         line = raw.decode("utf-8").removeprefix("data: ")
         if line.strip() == "[DONE]":
-            yield (json.dumps({
-                "model": model,
+            # Emit a single terminal chunk with the fully assembled tool_calls.
+            out: Dict[str, Any] = {
+                "model":   model,
                 "message": {"role": "assistant", "content": ""},
-                "done": True, "done_reason": "stop",
-            }) + "\n").encode()
+                "done":    True,
+                "done_reason": "stop",
+            }
+            if _tc_acc:
+                finalised = _finalise_tool_calls(_tc_acc)
+                out["message"]["tool_calls"] = finalised
+                log.debug(
+                    "[openrouter] assembled %d tool_call(s): %s",
+                    len(finalised),
+                    [tc["function"]["name"] for tc in finalised],
+                )
+            yield (json.dumps(out, ensure_ascii=False) + "\n").encode()
             return
         try:
             chunk = json.loads(line)
@@ -238,15 +271,33 @@ def _sse_to_ndjson(
         choice = (chunk.get("choices") or [{}])[0]
         delta  = choice.get("delta") or {}
         finish = choice.get("finish_reason")
-        out: Dict[str, Any] = {
+
+        # Accumulate tool_call fragments silently — do NOT yield intermediate chunks.
+        if delta.get("tool_calls"):
+            _merge_tool_call_deltas(_tc_acc, delta["tool_calls"])
+            continue
+
+        content = delta.get("content") or ""
+        if content:
+            content_acc += content
+
+        out = {
             "model":   model,
-            "message": {"role": "assistant", "content": delta.get("content") or ""},
+            "message": {"role": "assistant", "content": content},
             "done":    finish is not None,
         }
-        if delta.get("tool_calls"):
-            out["message"]["tool_calls"] = _normalize_tool_calls(delta["tool_calls"])
         if finish:
             out["done_reason"] = finish
+            # If finish arrived without [DONE] and we have accumulated tool calls,
+            # attach them to this final chunk.
+            if _tc_acc:
+                finalised = _finalise_tool_calls(_tc_acc)
+                out["message"]["tool_calls"] = finalised
+                log.debug(
+                    "[openrouter] assembled %d tool_call(s) at finish: %s",
+                    len(finalised),
+                    [tc["function"]["name"] for tc in finalised],
+                )
         yield (json.dumps(out, ensure_ascii=False) + "\n").encode()
 
 
@@ -256,11 +307,6 @@ class OpenRouterBackend:
     def chat_stream(
         self, payload: Dict[str, Any]
     ) -> Generator[bytes, None, None]:
-        """Stream chat completions from OR, converting SSE to Ollama NDJSON.
-
-        HTTP errors are caught here rather than propagated: the caller receives
-        a terminal error chunk so the session finaliser can run normally.
-        """
         model = payload["model"]
         try:
             r = requests.post(
@@ -278,11 +324,6 @@ class OpenRouterBackend:
         yield from _sse_to_ndjson(r, model)
 
     def chat_sync(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        """Non-streaming chat completion (used by sidecar / tool-call loops).
-
-        HTTP errors are re-raised as RuntimeError with a clean message so the
-        caller does not have to handle requests internals.
-        """
         try:
             r = requests.post(
                 f"{OPENROUTER_API_BASE}/chat/completions",

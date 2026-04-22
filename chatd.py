@@ -18,6 +18,7 @@ import memory
 import rag
 import session as sess
 from config import (
+    OLLAMA_API,
     THINKING,
     TOOLS_FILTER,
     TOOLS_ALLOWED,
@@ -29,7 +30,6 @@ from config import (
     CHATD_COMPRESS_EVERY,
     OPENROUTER_API_MODELS,
 )
-from backends.ollama import OLLAMA_API
 from backends.openrouter import fetch_model_info, OPENROUTER_PREFIX
 from mcp_client import MCPClient, discover_mcp_servers
 from think_remapper import ThinkingRemapper
@@ -201,6 +201,30 @@ def build_model_messages(
     return result
 
 
+def _log_payload_sizes(req_id: str, messages: List[Dict], tools_count: int) -> None:
+    """Log character counts for each message role in the outgoing payload.
+
+    Helps diagnose context-window pressure and oversized system prompts.
+    Format:  [req_id] payload sizes: system=N user=N assistant=N tool=N  total_chars=N  tools=N
+    """
+    sizes: Dict[str, int] = {"system": 0, "user": 0, "assistant": 0, "tool": 0}
+    for m in messages:
+        role = m.get("role", "other")
+        content = m.get("content") or ""
+        sizes[role] = sizes.get(role, 0) + len(content)
+    total = sum(sizes.values())
+    log.debug(
+        "[%s] payload sizes: system=%d user=%d assistant=%d tool=%d  total_chars=%d  tools=%d",
+        req_id,
+        sizes.get("system", 0),
+        sizes.get("user", 0),
+        sizes.get("assistant", 0),
+        sizes.get("tool", 0),
+        total,
+        tools_count,
+    )
+
+
 def make_ollama_payload(
         model: str,
         messages: List[Dict],
@@ -344,7 +368,6 @@ _GLOBAL_SUMMARIZE_SYSTEM = (
 
 
 def _summarize_text(system_prompt: str, previous_summary: str, turns_text: str) -> str:
-    """Run a summarisation pass through the backend for CHATD_SUMMARY_MODEL."""
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": (
@@ -592,12 +615,12 @@ def chat_stream_generator(
         for round_num in range(MAX_TOOL_ROUNDS):
             log.info("[%s] stream round %d, messages=%d", req_id, round_num, len(messages))
 
-            payload = make_ollama_payload(
-                model, build_model_messages(messages), options, stream=True,
-            )
+            built_messages = build_model_messages(messages)
+            payload = make_ollama_payload(model, built_messages, options, stream=True)
+            _log_payload_sizes(req_id, built_messages, len(TOOLS))
             log.debug(
                 "[%s] -> backend payload (messages=%d, tools=%d, options=%s, think=%s)",
-                req_id, len(payload["messages"]), len(TOOLS), options, THINKING,
+                req_id, len(built_messages), len(TOOLS), options, THINKING,
             )
 
             last_tool_calls: Optional[List[Dict]] = None
@@ -785,9 +808,9 @@ def chat():
             backend = backends.get_backend(model)
 
             for i in range(MAX_TOOL_ROUNDS):
-                payload = make_ollama_payload(
-                    model, build_model_messages(messages), options, stream=False,
-                )
+                built_messages = build_model_messages(messages)
+                payload = make_ollama_payload(model, built_messages, options, stream=False)
+                _log_payload_sizes(req_id, built_messages, len(TOOLS))
                 log.debug("[%s] non-stream round %d, think=%s", req_id, i, THINKING)
                 resp       = backend.chat_sync(payload)
                 msg        = resp.get("message") or {}
