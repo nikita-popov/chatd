@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 import logging
 import os
-from typing import Any, Dict, Generator, List
+from typing import Any, Dict, Generator, List, Optional
 
 import requests
 
@@ -104,6 +104,26 @@ def _sse_to_ndjson(
         yield (json.dumps(out, ensure_ascii=False) + "\n").encode()
 
 
+def fetch_model_info(model_with_prefix: str) -> Optional[Dict[str, Any]]:
+    """Fetch model metadata from GET /models/{id}.
+
+    Returns the raw OpenRouter model object on success, None on any error.
+    The caller is responsible for stripping the OR prefix before calling.
+    """
+    model_id = _strip(model_with_prefix)
+    try:
+        r = requests.get(
+            f"{OPENROUTER_API_BASE}/models/{model_id}",
+            headers=_headers(),
+            timeout=10,
+        )
+        r.raise_for_status()
+        return r.json()
+    except Exception as exc:
+        log.warning("[openrouter] fetch_model_info(%s) failed: %s", model_id, exc)
+        return None
+
+
 class OpenRouterBackend:
     """OpenRouter cloud runtime. Selected for models prefixed with 'or/'."""
 
@@ -139,7 +159,7 @@ class OpenRouterBackend:
             result["message"]["tool_calls"] = _normalize_tool_calls(msg["tool_calls"])
         return result
 
-    def embed(self, text: str) -> List[float]:
+    def embed(self, text: str, model: str) -> List[float]:
         raise RuntimeError(
             "OpenRouterBackend does not support embed. "
             "Configure RAG_EMBED_MODEL on a local Ollama instance."

@@ -28,11 +28,13 @@ from config import (
     TOOL_DESCRIPTION_OVERRIDES,
     CHATD_SUMMARY_MODEL,
     CHATD_COMPRESS_EVERY,
+    OPENROUTER_API_MODELS,
 )
+from backends.openrouter import fetch_model_info, OPENROUTER_PREFIX
 from mcp_client import MCPClient, discover_mcp_servers
 from think_remapper import ThinkingRemapper
 
-# ── logging ────────────────────────────────────────────────────────────────────────
+# ── logging ───────────────────────────────────────────────────────────────────────────────────
 
 logging.basicConfig(
     level=logging.DEBUG,
@@ -41,7 +43,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("chatd")
 
-# ── app ───────────────────────────────────────────────────────────────────────────
+# ── app ───────────────────────────────────────────────────────────────────────────────────────
 
 VERSION = "1.0.0"
 
@@ -51,7 +53,7 @@ TOOL_REGISTRY: Dict[str, MCPClient] = {}
 app = Flask(__name__)
 
 
-# ── helpers ───────────────────────────────────────────────────────────────────────
+# ── helpers ───────────────────────────────────────────────────────────────────────────────────────
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f") + "000Z"
@@ -215,7 +217,7 @@ def make_ollama_payload(
     return payload
 
 
-# ── CORS ─────────────────────────────────────────────────────────────────────────────
+# ── CORS ────────────────────────────────────────────────────────────────────────────────────────
 
 @app.after_request
 def add_cors(response: Response) -> Response:
@@ -231,7 +233,7 @@ def options_chat():
     return Response(status=204)
 
 
-# ── tools ─────────────────────────────────────────────────────────────────────────
+# ── tools ───────────────────────────────────────────────────────────────────────────────────────
 
 def load_tools():
     tools    = []
@@ -308,7 +310,7 @@ def call_tool(name: str, arguments: Dict[str, Any]) -> Any:
     return result
 
 
-# ── compressed summary + external RAG indexing ─────────────────────────────
+# ── compressed summary + external RAG indexing ─────────────────────────────────────────
 
 _SUMMARIZE_SYSTEM = (
     "You are a memory compressor for a personal AI assistant.\n"
@@ -448,6 +450,59 @@ def _log_yield(req_id: str, label: str, data: bytes) -> bytes:
     return data
 
 
+# ── augmented /api/tags ────────────────────────────────────────────────────────────────────────────────
+
+def _or_model_to_tag(model_name: str) -> Optional[Dict[str, Any]]:
+    """Fetch OR model metadata and convert to an Ollama-compatible tag entry.
+
+    Returns None if the model cannot be fetched (bad key, unknown id, etc.).
+    The synthetic entry uses:
+      - name / model : model_name as-is (with or/ prefix)
+      - size         : context_length from OR, or 0 if absent
+      - digest       : empty string (not meaningful for cloud models)
+      - modified_at  : current UTC timestamp
+      - details      : family=openrouter, parameter_size from OR pricing label if present
+    """
+    info = fetch_model_info(model_name)
+    if info is None:
+        return None
+
+    context_length: int = info.get("context_length") or 0
+    architecture: str   = (info.get("architecture") or {}).get("modality") or "text"
+    description: str    = info.get("description") or ""
+
+    return {
+        "name":        model_name,
+        "model":       model_name,
+        "modified_at": now_iso(),
+        "size":        context_length,
+        "digest":      "",
+        "details": {
+            "family":         "openrouter",
+            "families":       ["openrouter"],
+            "format":         "api",
+            "parameter_size": description[:64] if description else "",
+            "quantization_level": architecture,
+        },
+    }
+
+
+def _build_or_tags() -> List[Dict[str, Any]]:
+    """Return synthetic tag entries for all OPENROUTER_API_MODELS.
+
+    Skips models that cannot be resolved (logged at WARNING level).
+    """
+    result = []
+    for model_name in OPENROUTER_API_MODELS:
+        entry = _or_model_to_tag(model_name)
+        if entry:
+            result.append(entry)
+            log.debug("[tags] OR model added: %s", model_name)
+        else:
+            log.warning("[tags] OR model skipped (fetch failed): %s", model_name)
+    return result
+
+
 @app.get("/version")
 @app.get("/api/version")
 def version():
@@ -466,7 +521,36 @@ def health():
 @app.get("/tags")
 @app.get("/api/tags")
 def tags():
-    return proxy_get("/api/tags")
+    """Proxy ollama /api/tags and inject OPENROUTER_API_MODELS entries.
+
+    If OPENROUTER_API_MODELS is empty the response is a plain proxy.
+    OR entries are appended after all local ollama models.
+    """
+    r = requests.get(f"{OLLAMA_API}/api/tags", timeout=600)
+    if not OPENROUTER_API_MODELS:
+        return Response(
+            r.content,
+            status=r.status_code,
+            content_type=r.headers.get("Content-Type", "application/json"),
+        )
+
+    try:
+        data = r.json()
+    except Exception:
+        return Response(
+            r.content,
+            status=r.status_code,
+            content_type=r.headers.get("Content-Type", "application/json"),
+        )
+
+    or_entries = _build_or_tags()
+    data.setdefault("models", [])
+    data["models"].extend(or_entries)
+    log.info("[tags] ollama=%d or=%d total=%d",
+             len(data["models"]) - len(or_entries),
+             len(or_entries),
+             len(data["models"]))
+    return jsonify(data)
 
 
 def chat_stream_generator(
