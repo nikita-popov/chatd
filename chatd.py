@@ -52,6 +52,10 @@ TOOL_REGISTRY: Dict[str, MCPClient] = {}
 
 app = Flask(__name__)
 
+# Serialises concurrent writes to global_summary.txt that may come from
+# multiple compress-{session_id} threads running at the same time.
+_GLOBAL_SUMMARY_LOCK = threading.Lock()
+
 
 # ── helpers ───────────────────────────────────────────────────────────────────────────────────────
 
@@ -361,14 +365,20 @@ def _summarize_text(system_prompt: str, previous_summary: str, turns_text: str) 
 
 
 def _update_global_summary(turns_text: str) -> None:
-    previous = memory.read_global_summary()
-    try:
-        new_summary = _summarize_text(_GLOBAL_SUMMARIZE_SYSTEM, previous, turns_text)
-        if new_summary and len(new_summary) >= 20:
-            memory.write_global_summary(new_summary)
-            log.info("[global-summary] updated (%d chars)", len(new_summary))
-    except Exception as e:
-        log.warning("[global-summary] update failed: %s", e)
+    """Merge turns_text into the global L0.5 summary.
+
+    Protected by _GLOBAL_SUMMARY_LOCK so concurrent compress threads
+    (one per chat) always do a read-modify-write atomically.
+    """
+    with _GLOBAL_SUMMARY_LOCK:
+        previous = memory.read_global_summary()
+        try:
+            new_summary = _summarize_text(_GLOBAL_SUMMARIZE_SYSTEM, previous, turns_text)
+            if new_summary and len(new_summary) >= 20:
+                memory.write_global_summary(new_summary)
+                log.info("[global-summary] updated (%d chars)", len(new_summary))
+        except Exception as e:
+            log.warning("[global-summary] update failed: %s", e)
 
 
 def _compress_summary(session: sess.Session) -> None:
