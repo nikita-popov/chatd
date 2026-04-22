@@ -39,11 +39,10 @@ class OllamaBackend:
         r.raise_for_status()
         return r.json()
 
-    def embed(self, text: str) -> List[float]:
-        from config import RAG_EMBED_MODEL
+    def embed(self, text: str, model: str) -> List[float]:
         r = requests.post(
             f"{OLLAMA_API}/api/embed",
-            json={"model": RAG_EMBED_MODEL, "input": text},
+            json={"model": model, "input": text},
             timeout=120,
         )
         r.raise_for_status()

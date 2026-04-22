@@ -3,8 +3,8 @@
 
 Implements the request-scoped RAG sidecar layer (L1.5) — a chatd-owned
 SQLite store completely separate from mempalace. Conversation turns are
-embedded via Ollama and retrieved by cosine similarity for the current
-user message.
+embedded via the active backend and retrieved by cosine similarity for
+the current user message.
 
 L1.5 is always injected into the system prompt alongside KG recall.
 It does not replace or modify any mempalace layer.
@@ -17,10 +17,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional
 
-import requests
-
+import backends
 from config import (
-    OLLAMA_API,
     RAG_DB_PATH,
     RAG_EMBED_MODEL,
     RAG_MAX_CHARS_PER_CHUNK,
@@ -63,7 +61,7 @@ def init() -> None:
             "CREATE INDEX IF NOT EXISTS idx_rag_added_at ON rag_chunks(added_at)"
         )
         conn.commit()
-        log.info("RAG: store ready at %s", path := _db_path())
+        log.info("RAG: store ready at %s", _db_path())
     finally:
         conn.close()
 
@@ -82,14 +80,9 @@ def _chunk_turn(user: str, assistant: str) -> str:
 
 
 def _embed(text: str) -> List[float]:
-    payload = {"model": RAG_EMBED_MODEL, "input": text}
-    r = requests.post(f"{OLLAMA_API}/api/embed", json=payload, timeout=120)
-    r.raise_for_status()
-    data = r.json()
-    embeddings = data.get("embeddings") or []
-    if not embeddings:
-        raise RuntimeError("embed API returned no embeddings")
-    return embeddings[0]
+    """Embed *text* using the backend selected for RAG_EMBED_MODEL."""
+    backend = backends.get_backend(RAG_EMBED_MODEL)
+    return backend.embed(text, RAG_EMBED_MODEL)
 
 
 def _cosine_similarity(a: List[float], b: List[float]) -> float:

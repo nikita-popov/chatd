@@ -13,6 +13,7 @@ import requests
 from requests.exceptions import ReadTimeout
 from flask import Flask, request, Response, jsonify, stream_with_context
 
+import backends
 import memory
 import rag
 import session as sess
@@ -156,7 +157,7 @@ def build_model_messages(
     raw_messages: List[Dict],
     max_history_turns: int = 20,
 ) -> List[Dict]:
-    """Sanitise messages for the Ollama API.
+    """Sanitise messages for the backend.
 
     - Strip fields unknown to Ollama (chatId, id, createdAt, updatedAt …).
     - Remove <think>…</think> blocks from previous assistant turns.
@@ -200,7 +201,7 @@ def make_ollama_payload(
         options: Dict[str, Any],
         stream: bool,
 ) -> Dict[str, Any]:
-    """Build an Ollama /api/chat payload, respecting the global THINKING flag."""
+    """Build an Ollama-format payload, respecting the global THINKING flag."""
     payload: Dict[str, Any] = {
         "model":    model,
         "messages": messages,
@@ -337,6 +338,7 @@ _GLOBAL_SUMMARIZE_SYSTEM = (
 
 
 def _summarize_text(system_prompt: str, previous_summary: str, turns_text: str) -> str:
+    """Run a summarisation pass through the backend for CHATD_SUMMARY_MODEL."""
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": (
@@ -351,9 +353,9 @@ def _summarize_text(system_prompt: str, previous_summary: str, turns_text: str) 
         "think":    False,
         "options":  {"num_predict": 1500, "temperature": 0.2},
     }
-    r = requests.post(f"{OLLAMA_API}/api/chat", json=payload, timeout=600)
-    r.raise_for_status()
-    return ((r.json().get("message") or {}).get("content") or "").strip()
+    backend = backends.get_backend(CHATD_SUMMARY_MODEL)
+    resp = backend.chat_sync(payload)
+    return ((resp.get("message") or {}).get("content") or "").strip()
 
 
 def _update_global_summary(turns_text: str) -> None:
@@ -449,8 +451,8 @@ def _log_yield(req_id: str, label: str, data: bytes) -> bytes:
 @app.get("/version")
 @app.get("/api/version")
 def version():
-    res = requests.get(f"{OLLAMA_API}/api/version")
-    ollama_version = res.json()['version']
+    r = requests.get(f"{OLLAMA_API}/api/version")
+    ollama_version = r.json()['version']
     log.debug("ollama version: %s", ollama_version)
     return jsonify({"chatd": f"{VERSION}", "ollama": f"{ollama_version}"})
 
@@ -485,6 +487,7 @@ def chat_stream_generator(
     yield data
 
     final_assistant_content = ""
+    backend = backends.get_backend(model)
 
     try:
         for round_num in range(MAX_TOOL_ROUNDS):
@@ -494,72 +497,66 @@ def chat_stream_generator(
                 model, build_model_messages(messages), options, stream=True,
             )
             log.debug(
-                "[%s] -> Ollama payload (messages=%d, tools=%d, options=%s, think=%s)",
+                "[%s] -> backend payload (messages=%d, tools=%d, options=%s, think=%s)",
                 req_id, len(payload["messages"]), len(TOOLS), options, THINKING,
             )
-
-            try:
-                r = requests.post(
-                    f"{OLLAMA_API}/api/chat",
-                    json=payload, timeout=3600, stream=True,
-                )
-                r.raise_for_status()
-                log.debug("[%s] Ollama HTTP %d, headers: %s", req_id, r.status_code, dict(r.headers))
-            except Exception as e:
-                log.error("[%s] Ollama request failed: %s", req_id, e)
-                yield make_chunk(model, f"\n[error: {e}]\n", done=True)
-                return
 
             last_tool_calls: Optional[List[Dict]] = None
             chunk_count = 0
             remapper = ThinkingRemapper(model)
 
-            with r:
-                for line in r.iter_lines():
-                    if not line:
-                        continue
-                    try:
-                        chunk = json.loads(line.decode("utf-8"))
-                    except json.JSONDecodeError as e:
-                        log.warning("[%s] bad JSON line: %s | %r", req_id, e, line[:120])
-                        continue
+            try:
+                stream = backend.chat_stream(payload)
+            except Exception as e:
+                log.error("[%s] backend stream failed: %s", req_id, e)
+                yield make_chunk(model, f"\n[error: {e}]\n", done=True)
+                return
 
-                    chunk_count += 1
-                    msg  = chunk.get("message") or {}
-                    done = chunk.get("done", False)
-                    tc   = msg.get("tool_calls")
+            for line in stream:
+                if not line:
+                    continue
+                try:
+                    chunk = json.loads(line.decode("utf-8") if isinstance(line, bytes) else line)
+                except json.JSONDecodeError as e:
+                    log.warning("[%s] bad JSON line: %s | %r", req_id, e, line[:120])
+                    continue
 
-                    if tc:
-                        log.info("[%s] tool_calls: %s", req_id,
-                                 [c.get("function", {}).get("name") for c in tc])
-                        last_tool_calls = tc
+                chunk_count += 1
+                msg  = chunk.get("message") or {}
+                done = chunk.get("done", False)
+                tc   = msg.get("tool_calls")
 
-                    if done:
-                        log.info(
-                            "[%s] round %d done, chunks=%d, tool_calls=%s, content_len=%d",
-                            req_id, round_num, chunk_count,
-                            bool(last_tool_calls), len(remapper.content_acc),
-                        )
-                        closing = remapper.close()
-                        if closing:
-                            yield _log_yield(req_id, "think/close", closing)
-                        if last_tool_calls:
-                            yield _log_yield(req_id, "keepalive/tc", make_keepalive(model))
-                        else:
-                            final_assistant_content = remapper.content_acc
-                            yield _log_yield(req_id, "done", remapper.feed(line))
-                        break
+                if tc:
+                    log.info("[%s] tool_calls: %s", req_id,
+                             [c.get("function", {}).get("name") for c in tc])
+                    last_tool_calls = tc
 
-                    out = remapper.feed(line)
-                    if not tc:
-                        log.debug(
-                            "[%s] yield %-12s %d bytes: ...%s",
-                            req_id, f"chunk/{chunk_count}", len(out),
-                            out[-60:].decode("utf-8", errors="replace").strip(),
-                        )
-                        yield out
+                if done:
+                    log.info(
+                        "[%s] round %d done, chunks=%d, tool_calls=%s, content_len=%d",
+                        req_id, round_num, chunk_count,
+                        bool(last_tool_calls), len(remapper.content_acc),
+                    )
+                    closing = remapper.close()
+                    if closing:
+                        yield _log_yield(req_id, "think/close", closing)
+                    if last_tool_calls:
+                        yield _log_yield(req_id, "keepalive/tc", make_keepalive(model))
+                    else:
+                        final_assistant_content = remapper.content_acc
+                        yield _log_yield(req_id, "done", remapper.feed(line))
+                    break
 
-            log.debug("[%s] exited iter_lines, last_tool_calls=%s", req_id, bool(last_tool_calls))
+                out = remapper.feed(line)
+                if not tc:
+                    log.debug(
+                        "[%s] yield %-12s %d bytes: ...%s",
+                        req_id, f"chunk/{chunk_count}", len(out),
+                        out[-60:].decode("utf-8", errors="replace").strip(),
+                    )
+                    yield out
+
+            log.debug("[%s] exited stream, last_tool_calls=%s", req_id, bool(last_tool_calls))
 
             if not last_tool_calls:
                 log.info("[%s] stream complete, no more tool rounds", req_id)
@@ -686,15 +683,14 @@ def chat():
             resp: Dict = {}
             prev_tc_names: Optional[List[str]] = None
             rep = 0
+            backend = backends.get_backend(model)
 
             for i in range(MAX_TOOL_ROUNDS):
                 payload = make_ollama_payload(
                     model, build_model_messages(messages), options, stream=False,
                 )
                 log.debug("[%s] non-stream round %d, think=%s", req_id, i, THINKING)
-                r = requests.post(f"{OLLAMA_API}/api/chat", json=payload, timeout=3600)
-                r.raise_for_status()
-                resp       = r.json()
+                resp       = backend.chat_sync(payload)
                 msg        = resp.get("message") or {}
                 tool_calls = msg.get("tool_calls") or []
 
@@ -750,8 +746,8 @@ def chat():
             return jsonify({"model": model, "answer": answer, "raw": resp})
 
         except ReadTimeout:
-            log.error("[%s] ollama timeout", req_id)
-            return jsonify({"error": "ollama timeout"}), 504
+            log.error("[%s] backend timeout", req_id)
+            return jsonify({"error": "backend timeout"}), 504
         except Exception as e:
             log.error("[%s] non-stream error: %s", req_id, traceback.format_exc())
             return jsonify({"error": str(e)}), 502

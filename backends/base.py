@@ -12,8 +12,9 @@ Chat contract:
     Returns a single Ollama-format response dict.
 
 Embed contract:
-  embed(text) -> list[float]
+  embed(text, model) -> list[float]
     Returns a normalised float vector of fixed dimensionality.
+    model — the embedding model identifier to use.
     Raises RuntimeError if the backend does not support embeddings.
 
 payload is always an Ollama-format dict:
@@ -38,8 +39,8 @@ class Backend(Protocol):
         """Return a single Ollama-format response dict."""
         ...
 
-    def embed(self, text: str) -> List[float]:
-        """Return an embedding vector for *text*.
+    def embed(self, text: str, model: str) -> List[float]:
+        """Return an embedding vector for *text* using *model*.
 
         Raise RuntimeError('embed not supported') if unsupported.
         """
