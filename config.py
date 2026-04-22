@@ -10,9 +10,6 @@ import os
 from pathlib import Path
 from typing import Any, Dict, List, Set
 
-# ── Ollama ──────────────────────────────────────────────────────────────────────────
-OLLAMA_API: str = os.environ.get("OLLAMA_API", "http://127.0.0.1:11434")
-
 # ── Thinking mode ────────────────────────────────────────────────────────────────────────
 THINKING: bool = os.environ.get("CHATD_THINKING", "false").lower() == "true"
 

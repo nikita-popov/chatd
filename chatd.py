@@ -18,7 +18,6 @@ import memory
 import rag
 import session as sess
 from config import (
-    OLLAMA_API,
     THINKING,
     TOOLS_FILTER,
     TOOLS_ALLOWED,
@@ -30,6 +29,7 @@ from config import (
     CHATD_COMPRESS_EVERY,
     OPENROUTER_API_MODELS,
 )
+from backends.ollama import OLLAMA_API
 from backends.openrouter import fetch_model_info, OPENROUTER_PREFIX
 from mcp_client import MCPClient, discover_mcp_servers
 from think_remapper import ThinkingRemapper
