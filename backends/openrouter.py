@@ -152,23 +152,52 @@ def _extract_or_error(response: requests.Response) -> str:
         return response.text[:200]
 
 
+def _or_response_meta(r: requests.Response) -> str:
+    """Extract OR-specific response headers useful for debugging.
+
+    OR sets the following headers on every response:
+      X-OR-Provider      - upstream provider that handled the request
+      X-OR-Generation-ID - unique ID cross-referenceable in the OR dashboard
+    """
+    parts = []
+    # Header names are case-insensitive in requests; try both casings.
+    provider = (
+        r.headers.get("X-OR-Provider")
+        or r.headers.get("x-or-provider")
+    )
+    gen_id = (
+        r.headers.get("X-OR-Generation-ID")
+        or r.headers.get("x-or-generation-id")
+    )
+    if provider:
+        parts.append(f"provider={provider}")
+    if gen_id:
+        parts.append(f"generation={gen_id}")
+    return " ".join(parts)
+
+
 def _log_http_error(exc: HTTPError) -> str:
     """Log an HTTPError at the appropriate level and return a short description.
 
     429/503 are transient — WARNING. Everything else is ERROR.
-    Retry-After is extracted and included in the log when present.
+    Retry-After and OR provider/generation headers are included when present.
     """
     r = exc.response
     status = r.status_code if r is not None else 0
     detail = _extract_or_error(r) if r is not None else str(exc)
 
-    extra = ""
-    if r is not None and status == 429:
-        retry_after = r.headers.get("Retry-After")
-        if retry_after:
-            extra = f" | Retry-After: {retry_after}s"
+    extras: List[str] = []
+    if r is not None:
+        if status == 429:
+            retry_after = r.headers.get("Retry-After")
+            if retry_after:
+                extras.append(f"Retry-After={retry_after}s")
+        meta = _or_response_meta(r)
+        if meta:
+            extras.append(meta)
 
-    msg = f"[openrouter] HTTP {status}{extra}: {detail}"
+    extra_str = " | " + ", ".join(extras) if extras else ""
+    msg = f"[openrouter] HTTP {status}{extra_str}: {detail}"
     if status in (429, 503):
         log.warning(msg)
     else:
