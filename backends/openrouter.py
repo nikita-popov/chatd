@@ -11,15 +11,18 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from typing import Any, Dict, Generator, List
 
 import requests
 
-from config import OPENROUTER_API_KEY, OPENROUTER_API_BASE, OPENROUTER_PREFIX
+OPENROUTER_API_KEY: str = os.environ.get("OPENROUTER_API_KEY", "")
+OPENROUTER_API_BASE: str = os.environ.get("OPENROUTER_API_BASE", "https://openrouter.ai/api/v1")
+OPENROUTER_PREFIX: str = os.environ.get("OPENROUTER_PREFIX", "or/")
 
 log = logging.getLogger("chatd.backends.openrouter")
 
-_PREFIX = OPENROUTER_PREFIX
+_PREFIX: str = OPENROUTER_PREFIX
 
 
 def _strip(model: str) -> str:

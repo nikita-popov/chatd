@@ -6,11 +6,12 @@ Embed: POST /api/embed.
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any, Dict, Generator, List
 
 import requests
 
-from config import OLLAMA_API
+OLLAMA_API: str = os.environ.get("OLLAMA_API", "http://127.0.0.1:11434")
 
 log = logging.getLogger("chatd.backends.ollama")
 
