@@ -24,6 +24,11 @@ log = logging.getLogger("chatd.backends.openrouter")
 
 _PREFIX: str = OPENROUTER_PREFIX
 
+# In-process cache: model_id (without prefix) -> raw OR model object.
+# Populated lazily on the first /api/tags request; lives until process restart.
+_model_cache: Dict[str, Dict[str, Any]] = {}
+_model_cache_loaded: bool = False
+
 
 def _strip(model: str) -> str:
     return model[len(_PREFIX):] if model.startswith(_PREFIX) else model
@@ -35,6 +40,45 @@ def _headers() -> Dict[str, str]:
         "Content-Type": "application/json",
         "HTTP-Referer": "https://github.com/nikita-popov/chatd",
     }
+
+
+def _load_model_cache() -> None:
+    """Fetch GET /models and populate _model_cache (id -> object).
+
+    No-op if the cache is already loaded. Thread-safety is not critical here:
+    a duplicate fetch on concurrent startup is harmless.
+    """
+    global _model_cache, _model_cache_loaded
+    if _model_cache_loaded:
+        return
+    try:
+        r = requests.get(
+            f"{OPENROUTER_API_BASE}/models",
+            headers=_headers(),
+            timeout=15,
+        )
+        r.raise_for_status()
+        data = r.json()
+        models = data.get("data") or []
+        _model_cache = {m["id"]: m for m in models if m.get("id")}
+        _model_cache_loaded = True
+        log.info("[openrouter] model cache loaded: %d models", len(_model_cache))
+    except Exception as exc:
+        log.warning("[openrouter] failed to load model cache: %s", exc)
+
+
+def fetch_model_info(model_with_prefix: str) -> Optional[Dict[str, Any]]:
+    """Return OR model metadata for *model_with_prefix*, or None if not found.
+
+    Uses the bulk GET /models endpoint (cached in-process) because OR does
+    not expose a per-model GET /models/{id} endpoint.
+    """
+    _load_model_cache()
+    model_id = _strip(model_with_prefix)
+    result = _model_cache.get(model_id)
+    if result is None:
+        log.warning("[openrouter] model not found in catalog: %s", model_id)
+    return result
 
 
 def _to_openai(payload: Dict[str, Any], stream: bool) -> Dict[str, Any]:
@@ -102,26 +146,6 @@ def _sse_to_ndjson(
         if finish:
             out["done_reason"] = finish
         yield (json.dumps(out, ensure_ascii=False) + "\n").encode()
-
-
-def fetch_model_info(model_with_prefix: str) -> Optional[Dict[str, Any]]:
-    """Fetch model metadata from GET /models/{id}.
-
-    Returns the raw OpenRouter model object on success, None on any error.
-    The caller is responsible for stripping the OR prefix before calling.
-    """
-    model_id = _strip(model_with_prefix)
-    try:
-        r = requests.get(
-            f"{OPENROUTER_API_BASE}/models/{model_id}",
-            headers=_headers(),
-            timeout=10,
-        )
-        r.raise_for_status()
-        return r.json()
-    except Exception as exc:
-        log.warning("[openrouter] fetch_model_info(%s) failed: %s", model_id, exc)
-        return None
 
 
 class OpenRouterBackend:
