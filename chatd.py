@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import atexit
 import json
 import logging
 import os
@@ -49,6 +50,9 @@ VERSION = "1.0.0"
 
 TOOLS: List[Dict] = []
 TOOL_REGISTRY: Dict[str, MCPClient] = {}
+
+# All started MCP clients — used for clean shutdown via atexit.
+_MCP_CLIENTS: List[MCPClient] = []
 
 app = Flask(__name__)
 
@@ -145,29 +149,7 @@ def ensure_system_prompt(
     per_chat_summary: str = "",
     global_summary: str = "",
 ) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
-    """Assemble the always-loaded memory block and prepend it as system message.
-
-    Returns (messages, layer_sizes) where layer_sizes maps layer name to char count:
-      L0        mempalace identity + wake-up base
-      L0.5g     global compressed summary
-      L0.5p     per-chat compressed summary
-      L1        mempalace Essential Story (included in wake_up base)
-      L1.5_kg   KG recall sidecar
-      L1.5_rag  RAG recall sidecar
-
-    Layer assembly order:
-      L0   mempalace identity.txt
-      L0.5 chatd composed layer:
-             – global compressed summary  (cross-chat activity)
-             – per-chat compressed summary (this session arc)
-      L1   mempalace Essential Story / wake-up context
-      L1.5 chatd request-scoped sidecars:
-             – KG recall from user message text
-             – external RAG context from rag.retrieve()
-
-    mempalace L2 (Room Recall) and L3 (Deep Search) are tool-driven
-    and are NOT auto-injected here.
-    """
+    """Assemble the always-loaded memory block and prepend it as system message."""
     base_prompt = memory.wake_up(
         per_chat_summary=per_chat_summary,
         global_summary=global_summary,
@@ -209,15 +191,7 @@ def build_model_messages(
     raw_messages: List[Dict],
     max_history_turns: int = 20,
 ) -> List[Dict]:
-    """Sanitise messages for the backend.
-
-    - Strip fields unknown to Ollama (chatId, id, createdAt, updatedAt …).
-    - Remove <think>…</think> blocks from previous assistant turns.
-    - Preserve tool_calls and id fields on assistant messages (needed for
-      tool_call_id pairing in openrouter._to_openai).
-    - Keep system message as-is (already assembled by ensure_system_prompt).
-    - Limit history to *max_history_turns* user+assistant pairs.
-    """
+    """Sanitise messages for the backend."""
     system: Optional[Dict] = None
     turns: List[Dict] = []
 
@@ -235,7 +209,7 @@ def build_model_messages(
 
         entry: Dict[str, Any] = {"role": role, "content": content}
         if role == "assistant" and m.get("tool_calls"):
-            entry["tool_calls"] = m["tool_calls"]  # preserves id field
+            entry["tool_calls"] = m["tool_calls"]
         turns.append(entry)
 
     if len(turns) > max_history_turns * 2:
@@ -254,19 +228,6 @@ def _log_payload_sizes(
     tools_count: int,
     layer_sizes: Optional[Dict[str, int]] = None,
 ) -> None:
-    """Log character counts for each message role + system prompt layer breakdown.
-
-    System prompt breakdown (when layer_sizes provided):
-      L0+L1     identity + wake-up base (mempalace)
-      L0.5g     global summary
-      L0.5p     per-chat summary
-      L1.5_kg   KG sidecar
-      L1.5_rag  RAG sidecar
-
-    Output example:
-      [req_id] system layers: L0+L1=3100 L0.5g=420 L0.5p=0 L1.5_kg=0 L1.5_rag=3121  total=6641
-      [req_id] payload sizes: system=6641 user=76 assistant=0 tool=0  total_chars=6717  tools=29
-    """
     sizes: Dict[str, int] = {"system": 0, "user": 0, "assistant": 0, "tool": 0}
     for m in messages:
         role = m.get("role", "other")
@@ -337,9 +298,18 @@ def options_chat():
 def load_tools():
     tools    = []
     registry = {}
+    clients  = []
 
     for source, cmd in discover_mcp_servers().items():
         client = MCPClient(cmd)
+        try:
+            client.start()
+        except Exception as e:
+            log.error("[tools] %s: failed to start MCP server: %s", source, e)
+            continue
+
+        clients.append(client)
+
         try:
             server_tools = client.list_tools()
         except Exception as e:
@@ -376,27 +346,27 @@ def load_tools():
             })
             log.debug("[tools] registered: %s", name)
 
-    return tools, registry
+    return tools, registry, clients
+
+
+def _stop_all_mcp_clients() -> None:
+    for client in _MCP_CLIENTS:
+        try:
+            client.stop()
+        except Exception as e:
+            log.debug("[mcp] atexit stop error: %s", e)
 
 
 def init_tools():
-    global TOOLS, TOOL_REGISTRY
+    global TOOLS, TOOL_REGISTRY, _MCP_CLIENTS
     log.info("[tools] initializing MCP tools...")
-    TOOLS, TOOL_REGISTRY = load_tools()
+    TOOLS, TOOL_REGISTRY, _MCP_CLIENTS = load_tools()
+    atexit.register(_stop_all_mcp_clients)
     log.info("[tools] total: %d tools in registry", len(TOOLS))
 
 
 def call_tool(name: str, arguments: Dict[str, Any]) -> Any:
-    """Invoke a tool by name.
-
-    Returns the tool result dict on success.  On failure (unknown tool,
-    MCP error, exception) returns an error dict so the model can see what
-    went wrong and potentially correct its call:
-      {"error": "<reason>", "tool": "<name>", "args": {…}}
-
-    Callers should NOT raise on the returned error dict — they must append
-    it as a tool message so the model gets the feedback.
-    """
+    """Invoke a tool by name."""
     if name == "mempalacekgquery":
         entity = arguments.get("entity", "")
         if entity:
@@ -422,7 +392,6 @@ def call_tool(name: str, arguments: Dict[str, Any]) -> Any:
 
     log.debug("[tool] %s result: %s", name, str(result)[:300])
 
-    # Surface MCP-level errors explicitly so the model sees them.
     if isinstance(result, dict) and result.get("success") is False:
         err_msg = result.get("error") or "unknown MCP error"
         log.warning("[tool] %s returned MCP error: %s", name, err_msg)
@@ -500,19 +469,9 @@ def _update_global_summary(turns_text: str) -> None:
 
 
 def _compress_summary(session: sess.Session) -> None:
-    """Compress ALL accumulated raw_turns into session.summary.
-
-    Uses the full raw_turns list (not a tail slice) so no turns are silently
-    dropped between compression cycles.  After a successful compression the
-    list is cleared; on failure the list is also cleared to avoid unbounded
-    growth, but the turns are still indexed into RAG first.
-    """
     if not session.raw_turns:
         return
 
-    # Snapshot the full list — a new turn could be appended concurrently
-    # between here and clear(), but _compress_lock prevents a second compress
-    # thread from running, so in practice this is safe.
     turns = list(session.raw_turns)
     turns_text = "\n".join(
         f"User: {t['user']}\nAssistant: {t['assistant']}"
@@ -780,13 +739,6 @@ def tags():
 
 
 def _options_for_round(options: Dict[str, Any], round_num: int) -> Dict[str, Any]:
-    """Return options dict adjusted for the current tool round.
-
-    For round 0 (initial user turn) options are used as-is.
-    For round 1+ (tool follow-up) num_predict is boosted by
-    TOOL_ROUND_NUM_PREDICT_BOOST so the model has enough room to
-    synthesise a full answer after the (heavier) tool context.
-    """
     if round_num == 0:
         return options
     boosted = dict(options)
@@ -1130,7 +1082,6 @@ def generate():
     want_stream = original_payload.get("stream", True)
     options     = merge_options(original_payload.get("options"))
 
-    chat_id = None
     session = None
 
     messages: List[Dict[str, Any]] = []
