@@ -6,6 +6,7 @@ import os
 import shlex
 import signal
 import subprocess
+import threading
 from contextlib import AsyncExitStack
 from typing import Any
 
@@ -17,8 +18,6 @@ from config import MCP_ENV_PREFIX
 log = logging.getLogger("chatd.mcp_client")
 
 # Seconds to wait for MCP server to respond.
-# list_tools is called once at startup - generous budget.
-# call_tool is called inline during streaming - shorter budget.
 MCP_LIST_TOOLS_TIMEOUT: float = float(os.environ.get("CHATD_MCP_LIST_TOOLS_TIMEOUT", "30"))
 MCP_CALL_TOOL_TIMEOUT:  float = float(os.environ.get("CHATD_MCP_CALL_TOOL_TIMEOUT",  "60"))
 
@@ -47,11 +46,7 @@ def discover_mcp_servers() -> dict[str, list[str]]:
 
 
 def _kill_process(cmd: list[str]) -> None:
-    """Best-effort: find and SIGKILL child processes matching cmd.
-
-    stdio_client does not expose the subprocess handle, so we use pgrep.
-    Falls back silently on non-Linux systems where pgrep is unavailable.
-    """
+    """Best-effort: find and SIGKILL child processes matching cmd."""
     try:
         result = subprocess.run(
             ["pgrep", "-f", " ".join(cmd)],
@@ -72,39 +67,83 @@ def _kill_process(cmd: list[str]) -> None:
 
 
 class MCPClient:
+    """Long-lived MCP client that keeps the server process running.
+
+    Call start() once after construction, stop() on shutdown.
+    list_tools() and call_tool() reuse the persistent session.
+    """
+
     def __init__(self, cmd: list[str]):
         self.cmd = cmd
+        self._session: ClientSession | None = None
+        self._stack: AsyncExitStack | None = None
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._lock = threading.Lock()
 
-    async def _with_session(self, fn, timeout: float):
-        """Run fn(session) inside a fresh stdio MCP session.
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
 
-        Raises asyncio.TimeoutError if the whole operation
-        (spawn + initialize + fn) exceeds *timeout* seconds.
-        """
+    async def _start_async(self) -> None:
         command = self.cmd[0]
         args    = self.cmd[1:]
+        self._stack = AsyncExitStack()
+        read, write = await self._stack.enter_async_context(
+            stdio_client(StdioServerParameters(
+                command=command, args=args, env=os.environ.copy(),
+            ))
+        )
+        self._session = await self._stack.enter_async_context(
+            ClientSession(read, write)
+        )
+        await self._session.initialize()
 
-        async def _run():
-            async with AsyncExitStack() as stack:
-                read, write = await stack.enter_async_context(
-                    stdio_client(StdioServerParameters(command=command, args=args, env=os.environ.copy()))
-                )
-                session = await stack.enter_async_context(ClientSession(read, write))
-                await session.initialize()
-                return await fn(session)
+    def start(self) -> None:
+        """Spawn the MCP server process and initialise the session."""
+        self._loop = asyncio.new_event_loop()
+        try:
+            self._loop.run_until_complete(self._start_async())
+            log.info("[mcp] started: %s", self.cmd[0])
+        except Exception as e:
+            log.error("[mcp] failed to start %s: %s", self.cmd, e)
+            self._loop.close()
+            self._loop = None
+            raise
 
-        return await asyncio.wait_for(_run(), timeout=timeout)
+    def stop(self) -> None:
+        """Tear down the session and kill the server process."""
+        if self._stack and self._loop:
+            try:
+                self._loop.run_until_complete(self._stack.aclose())
+            except Exception as e:
+                log.debug("[mcp] stop aclose error: %s", e)
+        if self._loop:
+            self._loop.close()
+            self._loop = None
+        self._session = None
+        self._stack = None
+        log.info("[mcp] stopped: %s", self.cmd[0])
 
-    def start(self):  return None
-    def stop(self):   return None
+    # ------------------------------------------------------------------
+    # Internal: run a coroutine on the persistent loop (thread-safe)
+    # ------------------------------------------------------------------
+
+    def _run(self, coro, timeout: float):
+        if self._loop is None or self._session is None:
+            raise RuntimeError(f"MCPClient not started: {self.cmd}")
+        with self._lock:
+            return self._loop.run_until_complete(
+                asyncio.wait_for(coro, timeout=timeout)
+            )
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
 
     def list_tools(self) -> list:
-        async def run(session):
-            result = await session.list_tools()
-            return result.tools
-
         try:
-            return asyncio.run(self._with_session(run, MCP_LIST_TOOLS_TIMEOUT))
+            result = self._run(self._session.list_tools(), MCP_LIST_TOOLS_TIMEOUT)
+            return result.tools
         except asyncio.TimeoutError:
             log.error(
                 "[mcp] list_tools timed out after %.0fs: %s",
@@ -116,19 +155,17 @@ class MCPClient:
             )
 
     def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
-        async def run(session):
-            return await session.call_tool(name, arguments=arguments)
-
         try:
-            result = asyncio.run(self._with_session(run, MCP_CALL_TOOL_TIMEOUT))
+            result = self._run(
+                self._session.call_tool(name, arguments=arguments),
+                MCP_CALL_TOOL_TIMEOUT,
+            )
         except asyncio.TimeoutError:
             log.error(
                 "[mcp] call_tool '%s' timed out after %.0fs: %s",
                 name, MCP_CALL_TOOL_TIMEOUT, self.cmd,
             )
             _kill_process(self.cmd)
-            # RuntimeError is caught by call_tool() in chatd.py and
-            # returned as {"error": ...} dict so the model sees the timeout.
             raise RuntimeError(
                 f"MCP call_tool timeout ({MCP_CALL_TOOL_TIMEOUT:.0f}s): {name}"
             )
