@@ -90,6 +90,15 @@ def proxy_get(path: str) -> Response:
     )
 
 
+def proxy_post(path: str, json_body: Dict[str, Any]) -> Response:
+    r = requests.post(f"{OLLAMA_API}{path}", json=json_body, timeout=600, stream=True)
+    return Response(
+        r.iter_content(chunk_size=None),
+        status=r.status_code,
+        content_type=r.headers.get("Content-Type", "application/x-ndjson"),
+    )
+
+
 def merge_options(client_options: Optional[Dict]) -> Dict[str, Any]:
     opts = dict(DEFAULT_OPTIONS)
     if client_options:
@@ -632,6 +641,12 @@ def _build_or_tags() -> List[Dict[str, Any]]:
     return result
 
 
+@app.get("/")
+@app.get("/api")
+def root():
+    return Response("Ollama is running", status=200, mimetype="text/plain")
+
+
 @app.get("/version")
 @app.get("/api/version")
 def version():
@@ -645,6 +660,93 @@ def version():
 @app.get("/api/health")
 def health():
     return jsonify({"ok": True, "tools": len(TOOLS)})
+
+
+@app.post("/pull")
+@app.post("/api/pull")
+def pull():
+    try:
+        payload = request.get_json(force=True, silent=False) or {}
+    except Exception as e:
+        log.error("pull: bad JSON: %s", e)
+        return jsonify({"error": "invalid JSON"}), 400
+
+    model_name = payload.get("name") or payload.get("model") or ""
+    log.debug("[pull] fake success for model %s", model_name)
+
+    def _stream() -> Generator[bytes, None, None]:
+        chunk = {
+            "status":    "success",
+            "digest":    "",
+            "total":     1,
+            "completed": 1,
+            "model":     model_name,
+        }
+        yield (json.dumps(chunk, ensure_ascii=False) + "\n").encode("utf-8")
+
+    return Response(
+        _stream(),
+        content_type="application/x-ndjson",
+        headers={
+            "X-Accel-Buffering": "no",
+            "Cache-Control":     "no-cache",
+            "Transfer-Encoding": "chunked",
+        },
+    )
+
+
+@app.post("/show")
+@app.post("/api/show")
+def show_model():
+    try:
+        payload = request.get_json(force=True, silent=False) or {}
+    except Exception as e:
+        log.error("show: bad JSON: %s", e)
+        return jsonify({"error": "invalid JSON"}), 400
+
+    model_name = payload.get("name") or payload.get("model")
+    if not model_name:
+        return jsonify({"error": "missing model name"}), 400
+
+    if model_name.startswith(OPENROUTER_PREFIX):
+        info = fetch_model_info(model_name)
+        if info is None:
+            return jsonify({"error": f"model not found: {model_name}"}), 404
+
+        description = info.get("description") or ""
+        context_len = info.get("context_length") or 0
+        arch = (info.get("architecture") or {}).get("modality") or "text"
+
+        result = {
+            "model": model_name,
+            "modified_at": now_iso(),
+            "size": context_len,
+            "digest": "",
+            "details": {
+                "format": "api",
+                "family": "openrouter",
+                "families": ["openrouter"],
+                "parameter_size": description[:64],
+                "quantization_level": arch,
+            },
+            "capabilities": ["chat", "tools"],
+        }
+        return jsonify(result)
+
+    try:
+        r = requests.post(
+            f"{OLLAMA_API}/api/show",
+            json={"name": model_name},
+            timeout=600,
+        )
+        return Response(
+            r.content,
+            status=r.status_code,
+            content_type=r.headers.get("Content-Type", "application/json"),
+        )
+    except Exception as e:
+        log.error("[show] proxy failed: %s", e)
+        return jsonify({"error": str(e)}), 502
 
 
 @app.get("/tags")
@@ -1002,6 +1104,158 @@ def chat():
         stream_with_context(
             chat_stream_generator(model, messages, options, session, layer_sizes, req_id)
         ),
+        content_type="application/x-ndjson",
+        headers={
+            "X-Accel-Buffering": "no",
+            "Cache-Control":     "no-cache",
+            "Transfer-Encoding": "chunked",
+        },
+    )
+
+
+@app.post("/generate")
+@app.post("/api/generate")
+def generate():
+    req_id = uuid.uuid4().hex[:8]
+
+    try:
+        original_payload = request.get_json(force=True, silent=False)
+    except Exception as e:
+        log.error("[%s] generate: failed to parse request JSON: %s", req_id, e)
+        return jsonify({"error": "invalid JSON"}), 400
+
+    model       = original_payload.get("model") or "qwen3:8b"
+    prompt      = original_payload.get("prompt") or ""
+    system_text = original_payload.get("system") or ""
+    want_stream = original_payload.get("stream", True)
+    options     = merge_options(original_payload.get("options"))
+
+    chat_id = None
+    session = None
+
+    messages: List[Dict[str, Any]] = []
+    if system_text:
+        messages.append({"role": "system", "content": system_text})
+    messages.append({"role": "user", "content": prompt})
+
+    summary = ""
+    global_summary = memory.read_global_summary()
+
+    log.info(
+        "[%s] POST /api/generate model=%s stream=%s prompt_len=%d",
+        req_id, model, want_stream, len(prompt),
+    )
+
+    messages, layer_sizes = ensure_system_prompt(
+        messages,
+        per_chat_summary=summary,
+        global_summary=global_summary,
+    )
+
+    if not want_stream:
+        try:
+            MAX_TOOL_ROUNDS = 5
+            resp: Dict = {}
+            prev_tc_names: Optional[List[str]] = None
+            rep = 0
+            backend = backends.get_backend(model)
+
+            for i in range(MAX_TOOL_ROUNDS):
+                round_options = _options_for_round(options, i)
+                built_messages = build_model_messages(messages)
+                payload = make_ollama_payload(model, built_messages, round_options, stream=False)
+                _log_payload_sizes(req_id, built_messages, len(TOOLS),
+                                   layer_sizes if i == 0 else None)
+                log.debug("[%s] generate non-stream round %d, think=%s", req_id, i, THINKING)
+                resp       = backend.chat_sync(payload)
+                msg        = resp.get("message") or {}
+                tool_calls = msg.get("tool_calls") or []
+
+                if not tool_calls:
+                    break
+
+                tc_names = [(tc.get("function") or {}).get("name") for tc in tool_calls]
+                log.info("[%s] generate non-stream tool_calls: %s", req_id, tc_names)
+
+                if tc_names == prev_tc_names:
+                    rep += 1
+                    if rep >= 2:
+                        log.warning("[%s] generate non-stream tool loop, aborting", req_id)
+                        return jsonify({"error": "tool loop detected"}), 500
+                else:
+                    rep = 0
+                prev_tc_names = tc_names
+
+                messages.append({
+                    "role":       "assistant",
+                    "content":    msg.get("content") or "",
+                    "tool_calls": tool_calls,
+                })
+                for tc in tool_calls:
+                    fn        = tc.get("function") or {}
+                    tool_name = fn.get("name")
+                    tool_args = fn.get("arguments") or {}
+                    if isinstance(tool_args, str):
+                        try:
+                            tool_args = json.loads(tool_args)
+                        except json.JSONDecodeError:
+                            tool_args = {}
+                    tool_result = call_tool(tool_name, tool_args)
+                    if isinstance(tool_result, dict) and "error" in tool_result:
+                        log.warning(
+                            "[%s] generate non-stream tool %s error (passed to model): %s",
+                            req_id, tool_name, tool_result["error"],
+                        )
+                    messages.append({
+                        "role":    "tool",
+                        "content": json.dumps(tool_result, ensure_ascii=False),
+                    })
+
+            msg    = resp.get("message") or {}
+            answer = (msg.get("content") or "").strip() or ""
+
+            log.info("[%s] generate non-stream done, answer_len=%d", req_id, len(answer))
+
+            return jsonify({
+                "model": model,
+                "created_at": now_iso(),
+                "response": answer,
+                "done": True,
+            })
+
+        except ReadTimeout:
+            log.error("[%s] generate backend timeout", req_id)
+            return jsonify({"error": "backend timeout"}), 504
+        except Exception as e:
+            log.error("[%s] generate non-stream error: %s", req_id, traceback.format_exc())
+            return jsonify({"error": str(e)}), 502
+
+    def generate_stream():
+        inner = chat_stream_generator(model, messages, options, session, layer_sizes, req_id)
+        for raw in inner:
+            try:
+                obj = json.loads(raw.decode("utf-8"))
+            except Exception:
+                yield raw
+                continue
+
+            msg = obj.get("message") or {}
+            content = msg.get("content") or ""
+
+            out = {
+                "model": obj.get("model") or model,
+                "created_at": obj.get("created_at") or now_iso(),
+                "response": content,
+                "done": obj.get("done", False),
+            }
+            if obj.get("done"):
+                out["done_reason"] = obj.get("done_reason", "stop")
+
+            yield (json.dumps(out, ensure_ascii=False) + "\n").encode("utf-8")
+
+    log.info("[%s] starting generate stream", req_id)
+    return Response(
+        stream_with_context(generate_stream()),
         content_type="application/x-ndjson",
         headers={
             "X-Accel-Buffering": "no",
