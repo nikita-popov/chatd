@@ -58,6 +58,7 @@ TOOL_REGISTRY: Dict[str, MCPClient] = {}
 _MCP_CLIENTS: List[MCPClient] = []
 
 app = Flask(__name__)
+app.json.ensure_ascii = False
 
 _GLOBAL_SUMMARY_LOCK = threading.Lock()
 
@@ -66,6 +67,14 @@ TOOL_ROUND_NUM_PREDICT_BOOST = 1024
 
 # Maximum seconds to wait for run_tool_loop inside /api/event.
 EVENT_TOOL_LOOP_TIMEOUT = 120
+
+_EVENT_DIRECTIVE = (
+    "\n\n"
+    "This is an automated system event — there is no human in the conversation.\n"
+    "You MUST respond by calling the appropriate tools to handle this event.\n"
+    "Do NOT just describe what you would do — actually call the tools now.\n"
+    "After completing all actions, write a brief summary of what was done."
+)
 
 
 # ── helpers ────────────────────────────────────────────────────────────────────
@@ -1256,6 +1265,7 @@ def system_event():
     event_text = (
         f"[SYSTEM EVENT] type={event_type} source={event_source}\n"
         f"{json.dumps(event_payload, ensure_ascii=False, indent=2)}"
+        f"{_EVENT_DIRECTIVE}"
     )
     messages: List[Dict[str, Any]] = [{"role": "user", "content": event_text}]
 
