@@ -64,6 +64,9 @@ _GLOBAL_SUMMARY_LOCK = threading.Lock()
 # How much to boost num_predict for tool follow-up rounds.
 TOOL_ROUND_NUM_PREDICT_BOOST = 1024
 
+# Maximum seconds to wait for run_tool_loop inside /api/event.
+EVENT_TOOL_LOOP_TIMEOUT = 120
+
 
 # ── helpers ────────────────────────────────────────────────────────────────────
 
@@ -144,8 +147,11 @@ def _last_user_text(messages: List[Dict]) -> str:
     return ""
 
 
-def _check_event_token() -> Optional[Response]:
-    """Return 401 Response if CHATD_EVENT_TOKEN is set and Bearer doesn't match."""
+def _check_event_token() -> Optional[Tuple[Response, int]]:
+    """Return (Response, status) tuple if CHATD_EVENT_TOKEN is set and Bearer doesn't match.
+
+    Returns None when the request is allowed through.
+    """
     if not CHATD_EVENT_TOKEN:
         return None
     auth = request.headers.get("Authorization", "")
@@ -389,8 +395,9 @@ def add_cors(response: Response) -> Response:
     return response
 
 
-@app.route("/api/chat", methods=["OPTIONS"])
-@app.route("/chat",     methods=["OPTIONS"])
+@app.route("/api/chat",  methods=["OPTIONS"])
+@app.route("/chat",      methods=["OPTIONS"])
+@app.route("/api/event", methods=["OPTIONS"])
 def options_chat():
     return Response(status=204)
 
@@ -1229,12 +1236,17 @@ def system_event():
         log.error("[%s] event: bad JSON: %s", req_id, e)
         return jsonify({"error": "invalid JSON"}), 400
 
-    event_type    = ev.get("type", "event")
-    event_source  = ev.get("source", "unknown")
-    event_payload = ev.get("payload") or {k: v for k, v in ev.items()
-                                          if k not in ("type", "source", "model", "options")}
-    model         = ev.get("model") or CHATD_EVENT_MODEL or "qwen3:8b"
-    options       = merge_options(ev.get("options"))
+    event_type   = ev.get("type", "event")
+    event_source = ev.get("source", "unknown")
+    # Use explicit "payload" key when present; otherwise collect all non-reserved fields.
+    # Check key existence explicitly so that an empty dict payload is preserved.
+    if "payload" in ev:
+        event_payload = ev["payload"]
+    else:
+        event_payload = {k: v for k, v in ev.items()
+                         if k not in ("type", "source", "model", "options")}
+    model   = ev.get("model") or CHATD_EVENT_MODEL or "qwen3:8b"
+    options = merge_options(ev.get("options"))
 
     log.info(
         "[%s] system event: type=%s source=%s model=%s",
@@ -1254,20 +1266,39 @@ def system_event():
         global_summary=global_summary,
     )
 
-    try:
-        answer = run_tool_loop(model, messages, options, layer_sizes, req_id)
-        log.info("[%s] event done, answer_len=%d", req_id, len(answer))
-        return jsonify({
-            "ok":       True,
-            "req_id":   req_id,
-            "response": answer,
-        })
-    except ReadTimeout:
-        log.error("[%s] event: backend timeout", req_id)
-        return jsonify({"error": "backend timeout"}), 504
-    except Exception as e:
+    # Run tool loop in a daemon thread with a hard timeout so a hanging model
+    # cannot block a gunicorn worker indefinitely.
+    result_box: Dict[str, Any] = {}
+
+    def _run():
+        try:
+            result_box["answer"] = run_tool_loop(model, messages, options, layer_sizes, req_id)
+        except Exception as exc:
+            result_box["exc"] = exc
+
+    t = threading.Thread(target=_run, daemon=True, name=f"event-{req_id}")
+    t.start()
+    t.join(timeout=EVENT_TOOL_LOOP_TIMEOUT)
+
+    if t.is_alive():
+        log.error("[%s] event: tool loop timed out after %ds", req_id, EVENT_TOOL_LOOP_TIMEOUT)
+        return jsonify({"error": "tool loop timeout"}), 504
+
+    if "exc" in result_box:
+        exc = result_box["exc"]
+        if isinstance(exc, ReadTimeout):
+            log.error("[%s] event: backend timeout", req_id)
+            return jsonify({"error": "backend timeout"}), 504
         log.error("[%s] event error: %s", req_id, traceback.format_exc())
-        return jsonify({"error": str(e)}), 502
+        return jsonify({"error": str(exc)}), 502
+
+    answer = result_box.get("answer", "")
+    log.info("[%s] event done, answer_len=%d", req_id, len(answer))
+    return jsonify({
+        "ok":       True,
+        "req_id":   req_id,
+        "response": answer,
+    })
 
 
 init_tools()
