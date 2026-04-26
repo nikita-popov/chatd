@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import atexit
 import json
 import logging
 import os
@@ -53,12 +54,14 @@ VERSION = "1.0.0"
 TOOLS: List[Dict] = []
 TOOL_REGISTRY: Dict[str, MCPClient] = {}
 
+# All started MCP clients — used for clean shutdown via atexit.
+_MCP_CLIENTS: List[MCPClient] = []
+
 app = Flask(__name__)
 
 _GLOBAL_SUMMARY_LOCK = threading.Lock()
 
 # How much to boost num_predict for tool follow-up rounds.
-# After tool execution the context is heavier; the model needs more room to answer.
 TOOL_ROUND_NUM_PREDICT_BOOST = 1024
 
 
@@ -90,6 +93,15 @@ def proxy_get(path: str) -> Response:
         r.content,
         status=r.status_code,
         content_type=r.headers.get("Content-Type", "application/json"),
+    )
+
+
+def proxy_post(path: str, json_body: Dict[str, Any]) -> Response:
+    r = requests.post(f"{OLLAMA_API}{path}", json=json_body, timeout=600, stream=True)
+    return Response(
+        r.iter_content(chunk_size=None),
+        status=r.status_code,
+        content_type=r.headers.get("Content-Type", "application/x-ndjson"),
     )
 
 
@@ -161,19 +173,6 @@ def ensure_system_prompt(
       L1        mempalace Essential Story (included in wake_up base)
       L1.5_kg   KG recall sidecar
       L1.5_rag  RAG recall sidecar
-
-    Layer assembly order:
-      L0   mempalace identity.txt
-      L0.5 chatd composed layer:
-             – global compressed summary  (cross-chat activity)
-             – per-chat compressed summary (this session arc)
-      L1   mempalace Essential Story / wake-up context
-      L1.5 chatd request-scoped sidecars:
-             – KG recall from user message text
-             – external RAG context from rag.retrieve()
-
-    mempalace L2 (Room Recall) and L3 (Deep Search) are tool-driven
-    and are NOT auto-injected here.
     """
     base_prompt = memory.wake_up(
         per_chat_summary=per_chat_summary,
@@ -220,9 +219,8 @@ def build_model_messages(
 
     - Strip fields unknown to Ollama (chatId, id, createdAt, updatedAt …).
     - Remove <think>…</think> blocks from previous assistant turns.
-    - Preserve tool_calls and id fields on assistant messages (needed for
-      tool_call_id pairing in openrouter._to_openai).
-    - Keep system message as-is (already assembled by ensure_system_prompt).
+    - Preserve tool_calls on assistant messages.
+    - Keep system message as-is.
     - Limit history to *max_history_turns* user+assistant pairs.
     """
     system: Optional[Dict] = None
@@ -242,7 +240,7 @@ def build_model_messages(
 
         entry: Dict[str, Any] = {"role": role, "content": content}
         if role == "assistant" and m.get("tool_calls"):
-            entry["tool_calls"] = m["tool_calls"]  # preserves id field
+            entry["tool_calls"] = m["tool_calls"]
         turns.append(entry)
 
     if len(turns) > max_history_turns * 2:
@@ -261,19 +259,6 @@ def _log_payload_sizes(
     tools_count: int,
     layer_sizes: Optional[Dict[str, int]] = None,
 ) -> None:
-    """Log character counts for each message role + system prompt layer breakdown.
-
-    System prompt breakdown (when layer_sizes provided):
-      L0+L1     identity + wake-up base (mempalace)
-      L0.5g     global summary
-      L0.5p     per-chat summary
-      L1.5_kg   KG sidecar
-      L1.5_rag  RAG sidecar
-
-    Output example:
-      [req_id] system layers: L0+L1=3100 L0.5g=420 L0.5p=0 L1.5_kg=0 L1.5_rag=3121  total=6641
-      [req_id] payload sizes: system=6641 user=76 assistant=0 tool=0  total_chars=6717  tools=29
-    """
     sizes: Dict[str, int] = {"system": 0, "user": 0, "assistant": 0, "tool": 0}
     for m in messages:
         role = m.get("role", "other")
@@ -415,9 +400,18 @@ def options_chat():
 def load_tools():
     tools    = []
     registry = {}
+    clients  = []
 
     for source, cmd in discover_mcp_servers().items():
         client = MCPClient(cmd)
+        try:
+            client.start()
+        except Exception as e:
+            log.error("[tools] %s: failed to start MCP server: %s", source, e)
+            continue
+
+        clients.append(client)
+
         try:
             server_tools = client.list_tools()
         except Exception as e:
@@ -454,13 +448,22 @@ def load_tools():
             })
             log.debug("[tools] registered: %s", name)
 
-    return tools, registry
+    return tools, registry, clients
+
+
+def _stop_all_mcp_clients() -> None:
+    for client in _MCP_CLIENTS:
+        try:
+            client.stop()
+        except Exception as e:
+            log.debug("[mcp] atexit stop error: %s", e)
 
 
 def init_tools():
-    global TOOLS, TOOL_REGISTRY
+    global TOOLS, TOOL_REGISTRY, _MCP_CLIENTS
     log.info("[tools] initializing MCP tools...")
-    TOOLS, TOOL_REGISTRY = load_tools()
+    TOOLS, TOOL_REGISTRY, _MCP_CLIENTS = load_tools()
+    atexit.register(_stop_all_mcp_clients)
     log.info("[tools] total: %d tools in registry", len(TOOLS))
 
 
@@ -469,11 +472,7 @@ def call_tool(name: str, arguments: Dict[str, Any]) -> Any:
 
     Returns the tool result dict on success.  On failure (unknown tool,
     MCP error, exception) returns an error dict so the model can see what
-    went wrong and potentially correct its call:
-      {"error": "<reason>", "tool": "<name>", "args": {…}}
-
-    Callers should NOT raise on the returned error dict — they must append
-    it as a tool message so the model gets the feedback.
+    went wrong and potentially correct its call.
     """
     if name == "mempalacekgquery":
         entity = arguments.get("entity", "")
@@ -500,7 +499,6 @@ def call_tool(name: str, arguments: Dict[str, Any]) -> Any:
 
     log.debug("[tool] %s result: %s", name, str(result)[:300])
 
-    # Surface MCP-level errors explicitly so the model sees them.
     if isinstance(result, dict) and result.get("success") is False:
         err_msg = result.get("error") or "unknown MCP error"
         log.warning("[tool] %s returned MCP error: %s", name, err_msg)
@@ -578,13 +576,7 @@ def _update_global_summary(turns_text: str) -> None:
 
 
 def _compress_summary(session: sess.Session) -> None:
-    """Compress ALL accumulated raw_turns into session.summary.
-
-    Uses the full raw_turns list (not a tail slice) so no turns are silently
-    dropped between compression cycles.  After a successful compression the
-    list is cleared; on failure the list is also cleared to avoid unbounded
-    growth, but the turns are still indexed into RAG first.
-    """
+    """Compress ALL accumulated raw_turns into session.summary."""
     if not session.raw_turns:
         return
 
@@ -716,6 +708,14 @@ def _build_or_tags() -> List[Dict[str, Any]]:
     return result
 
 
+# ── routes ──────────────────────────────────────────────────────────────────────
+
+@app.get("/")
+@app.get("/api")
+def root():
+    return Response("Ollama is running", status=200, mimetype="text/plain")
+
+
 @app.get("/version")
 @app.get("/api/version")
 def version():
@@ -729,6 +729,93 @@ def version():
 @app.get("/api/health")
 def health():
     return jsonify({"ok": True, "tools": len(TOOLS)})
+
+
+@app.post("/pull")
+@app.post("/api/pull")
+def pull():
+    try:
+        payload = request.get_json(force=True, silent=False) or {}
+    except Exception as e:
+        log.error("pull: bad JSON: %s", e)
+        return jsonify({"error": "invalid JSON"}), 400
+
+    model_name = payload.get("name") or payload.get("model") or ""
+    log.debug("[pull] fake success for model %s", model_name)
+
+    def _stream() -> Generator[bytes, None, None]:
+        chunk = {
+            "status":    "success",
+            "digest":    "",
+            "total":     1,
+            "completed": 1,
+            "model":     model_name,
+        }
+        yield (json.dumps(chunk, ensure_ascii=False) + "\n").encode("utf-8")
+
+    return Response(
+        _stream(),
+        content_type="application/x-ndjson",
+        headers={
+            "X-Accel-Buffering": "no",
+            "Cache-Control":     "no-cache",
+            "Transfer-Encoding": "chunked",
+        },
+    )
+
+
+@app.post("/show")
+@app.post("/api/show")
+def show_model():
+    try:
+        payload = request.get_json(force=True, silent=False) or {}
+    except Exception as e:
+        log.error("show: bad JSON: %s", e)
+        return jsonify({"error": "invalid JSON"}), 400
+
+    model_name = payload.get("name") or payload.get("model")
+    if not model_name:
+        return jsonify({"error": "missing model name"}), 400
+
+    if model_name.startswith(OPENROUTER_PREFIX):
+        info = fetch_model_info(model_name)
+        if info is None:
+            return jsonify({"error": f"model not found: {model_name}"}), 404
+
+        description = info.get("description") or ""
+        context_len = info.get("context_length") or 0
+        arch = (info.get("architecture") or {}).get("modality") or "text"
+
+        result = {
+            "model": model_name,
+            "modified_at": now_iso(),
+            "size": context_len,
+            "digest": "",
+            "details": {
+                "format": "api",
+                "family": "openrouter",
+                "families": ["openrouter"],
+                "parameter_size": description[:64],
+                "quantization_level": arch,
+            },
+            "capabilities": ["chat", "tools"],
+        }
+        return jsonify(result)
+
+    try:
+        r = requests.post(
+            f"{OLLAMA_API}/api/show",
+            json={"name": model_name},
+            timeout=600,
+        )
+        return Response(
+            r.content,
+            status=r.status_code,
+            content_type=r.headers.get("Content-Type", "application/json"),
+        )
+    except Exception as e:
+        log.error("[show] proxy failed: %s", e)
+        return jsonify({"error": str(e)}), 502
 
 
 @app.get("/tags")
@@ -764,10 +851,8 @@ def tags():
 def _options_for_round(options: Dict[str, Any], round_num: int) -> Dict[str, Any]:
     """Return options dict adjusted for the current tool round.
 
-    For round 0 (initial user turn) options are used as-is.
-    For round 1+ (tool follow-up) num_predict is boosted by
-    TOOL_ROUND_NUM_PREDICT_BOOST so the model has enough room to
-    synthesise a full answer after the (heavier) tool context.
+    Round 0: options as-is.
+    Round 1+: num_predict boosted by TOOL_ROUND_NUM_PREDICT_BOOST.
     """
     if round_num == 0:
         return options
@@ -1039,13 +1124,101 @@ def chat():
     )
 
 
+@app.post("/generate")
+@app.post("/api/generate")
+def generate():
+    req_id = uuid.uuid4().hex[:8]
+
+    try:
+        original_payload = request.get_json(force=True, silent=False)
+    except Exception as e:
+        log.error("[%s] generate: failed to parse request JSON: %s", req_id, e)
+        return jsonify({"error": "invalid JSON"}), 400
+
+    model       = original_payload.get("model") or "qwen3:8b"
+    prompt      = original_payload.get("prompt") or ""
+    system_text = original_payload.get("system") or ""
+    want_stream = original_payload.get("stream", True)
+    options     = merge_options(original_payload.get("options"))
+
+    session = None
+
+    messages: List[Dict[str, Any]] = []
+    if system_text:
+        messages.append({"role": "system", "content": system_text})
+    messages.append({"role": "user", "content": prompt})
+
+    global_summary = memory.read_global_summary()
+
+    log.info(
+        "[%s] POST /api/generate model=%s stream=%s prompt_len=%d",
+        req_id, model, want_stream, len(prompt),
+    )
+
+    messages, layer_sizes = ensure_system_prompt(
+        messages,
+        per_chat_summary="",
+        global_summary=global_summary,
+    )
+
+    if not want_stream:
+        try:
+            answer = run_tool_loop(model, messages, options, layer_sizes, req_id)
+            log.info("[%s] generate non-stream done, answer_len=%d", req_id, len(answer))
+            return jsonify({
+                "model":      model,
+                "created_at": now_iso(),
+                "response":   answer,
+                "done":       True,
+            })
+        except ReadTimeout:
+            log.error("[%s] generate backend timeout", req_id)
+            return jsonify({"error": "backend timeout"}), 504
+        except Exception as e:
+            log.error("[%s] generate non-stream error: %s", req_id, traceback.format_exc())
+            return jsonify({"error": str(e)}), 502
+
+    def generate_stream():
+        inner = chat_stream_generator(model, messages, options, session, layer_sizes, req_id)
+        for raw in inner:
+            try:
+                obj = json.loads(raw.decode("utf-8"))
+            except Exception:
+                yield raw
+                continue
+
+            msg     = obj.get("message") or {}
+            content = msg.get("content") or ""
+
+            out = {
+                "model":      obj.get("model") or model,
+                "created_at": obj.get("created_at") or now_iso(),
+                "response":   content,
+                "done":       obj.get("done", False),
+            }
+            if obj.get("done"):
+                out["done_reason"] = obj.get("done_reason", "stop")
+
+            yield (json.dumps(out, ensure_ascii=False) + "\n").encode("utf-8")
+
+    log.info("[%s] starting generate stream", req_id)
+    return Response(
+        stream_with_context(generate_stream()),
+        content_type="application/x-ndjson",
+        headers={
+            "X-Accel-Buffering": "no",
+            "Cache-Control":     "no-cache",
+            "Transfer-Encoding": "chunked",
+        },
+    )
+
+
 # ── /api/event ──────────────────────────────────────────────────────────────────────
 
 @app.post("/api/event")
 def system_event():
     req_id = uuid.uuid4().hex[:8]
 
-    # ── auth ───────────────────────────────────────────────────────────────────────
     denied = _check_event_token()
     if denied:
         return denied
@@ -1068,7 +1241,6 @@ def system_event():
         req_id, event_type, event_source, model,
     )
 
-    # ── build messages ──────────────────────────────────────────────────────────────
     event_text = (
         f"[SYSTEM EVENT] type={event_type} source={event_source}\n"
         f"{json.dumps(event_payload, ensure_ascii=False, indent=2)}"
@@ -1082,7 +1254,6 @@ def system_event():
         global_summary=global_summary,
     )
 
-    # ── run ──────────────────────────────────────────────────────────────────────────
     try:
         answer = run_tool_loop(model, messages, options, layer_sizes, req_id)
         log.info("[%s] event done, answer_len=%d", req_id, len(answer))
