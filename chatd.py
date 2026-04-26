@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-import atexit
 import json
 import logging
 import os
@@ -23,12 +22,15 @@ from config import (
     TOOLS_FILTER,
     TOOLS_ALLOWED,
     DEFAULT_OPTIONS,
+    MAX_TOOL_ROUNDS,
     MEMPALACE_WRITE_TOOLS,
     TOOL_OVERRIDE,
     TOOL_DESCRIPTION_OVERRIDES,
     CHATD_SUMMARY_MODEL,
     CHATD_COMPRESS_EVERY,
     OPENROUTER_API_MODELS,
+    CHATD_EVENT_TOKEN,
+    CHATD_EVENT_MODEL,
 )
 from backends.ollama import OLLAMA_API
 from backends.openrouter import fetch_model_info, OPENROUTER_PREFIX
@@ -50,9 +52,6 @@ VERSION = "1.0.0"
 
 TOOLS: List[Dict] = []
 TOOL_REGISTRY: Dict[str, MCPClient] = {}
-
-# All started MCP clients — used for clean shutdown via atexit.
-_MCP_CLIENTS: List[MCPClient] = []
 
 app = Flask(__name__)
 
@@ -91,15 +90,6 @@ def proxy_get(path: str) -> Response:
         r.content,
         status=r.status_code,
         content_type=r.headers.get("Content-Type", "application/json"),
-    )
-
-
-def proxy_post(path: str, json_body: Dict[str, Any]) -> Response:
-    r = requests.post(f"{OLLAMA_API}{path}", json=json_body, timeout=600, stream=True)
-    return Response(
-        r.iter_content(chunk_size=None),
-        status=r.status_code,
-        content_type=r.headers.get("Content-Type", "application/x-ndjson"),
     )
 
 
@@ -142,6 +132,19 @@ def _last_user_text(messages: List[Dict]) -> str:
     return ""
 
 
+def _check_event_token() -> Optional[Response]:
+    """Return 401 Response if CHATD_EVENT_TOKEN is set and Bearer doesn't match."""
+    if not CHATD_EVENT_TOKEN:
+        return None
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Bearer "):
+        return jsonify({"error": "missing Authorization header"}), 401
+    token = auth.removeprefix("Bearer ").strip()
+    if token != CHATD_EVENT_TOKEN:
+        return jsonify({"error": "invalid token"}), 401
+    return None
+
+
 # ── system prompt assembly ─────────────────────────────────────────────────────
 
 def ensure_system_prompt(
@@ -149,7 +152,29 @@ def ensure_system_prompt(
     per_chat_summary: str = "",
     global_summary: str = "",
 ) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
-    """Assemble the always-loaded memory block and prepend it as system message."""
+    """Assemble the always-loaded memory block and prepend it as system message.
+
+    Returns (messages, layer_sizes) where layer_sizes maps layer name to char count:
+      L0        mempalace identity + wake-up base
+      L0.5g     global compressed summary
+      L0.5p     per-chat compressed summary
+      L1        mempalace Essential Story (included in wake_up base)
+      L1.5_kg   KG recall sidecar
+      L1.5_rag  RAG recall sidecar
+
+    Layer assembly order:
+      L0   mempalace identity.txt
+      L0.5 chatd composed layer:
+             – global compressed summary  (cross-chat activity)
+             – per-chat compressed summary (this session arc)
+      L1   mempalace Essential Story / wake-up context
+      L1.5 chatd request-scoped sidecars:
+             – KG recall from user message text
+             – external RAG context from rag.retrieve()
+
+    mempalace L2 (Room Recall) and L3 (Deep Search) are tool-driven
+    and are NOT auto-injected here.
+    """
     base_prompt = memory.wake_up(
         per_chat_summary=per_chat_summary,
         global_summary=global_summary,
@@ -191,7 +216,15 @@ def build_model_messages(
     raw_messages: List[Dict],
     max_history_turns: int = 20,
 ) -> List[Dict]:
-    """Sanitise messages for the backend."""
+    """Sanitise messages for the backend.
+
+    - Strip fields unknown to Ollama (chatId, id, createdAt, updatedAt …).
+    - Remove <think>…</think> blocks from previous assistant turns.
+    - Preserve tool_calls and id fields on assistant messages (needed for
+      tool_call_id pairing in openrouter._to_openai).
+    - Keep system message as-is (already assembled by ensure_system_prompt).
+    - Limit history to *max_history_turns* user+assistant pairs.
+    """
     system: Optional[Dict] = None
     turns: List[Dict] = []
 
@@ -209,7 +242,7 @@ def build_model_messages(
 
         entry: Dict[str, Any] = {"role": role, "content": content}
         if role == "assistant" and m.get("tool_calls"):
-            entry["tool_calls"] = m["tool_calls"]
+            entry["tool_calls"] = m["tool_calls"]  # preserves id field
         turns.append(entry)
 
     if len(turns) > max_history_turns * 2:
@@ -228,6 +261,19 @@ def _log_payload_sizes(
     tools_count: int,
     layer_sizes: Optional[Dict[str, int]] = None,
 ) -> None:
+    """Log character counts for each message role + system prompt layer breakdown.
+
+    System prompt breakdown (when layer_sizes provided):
+      L0+L1     identity + wake-up base (mempalace)
+      L0.5g     global summary
+      L0.5p     per-chat summary
+      L1.5_kg   KG sidecar
+      L1.5_rag  RAG sidecar
+
+    Output example:
+      [req_id] system layers: L0+L1=3100 L0.5g=420 L0.5p=0 L1.5_kg=0 L1.5_rag=3121  total=6641
+      [req_id] payload sizes: system=6641 user=76 assistant=0 tool=0  total_chars=6717  tools=29
+    """
     sizes: Dict[str, int] = {"system": 0, "user": 0, "assistant": 0, "tool": 0}
     for m in messages:
         role = m.get("role", "other")
@@ -277,6 +323,77 @@ def make_ollama_payload(
     return payload
 
 
+# ── tool loop helper ──────────────────────────────────────────────────────────────────
+
+def run_tool_loop(
+    model: str,
+    messages: List[Dict],
+    options: Dict[str, Any],
+    layer_sizes: Dict[str, int],
+    req_id: str,
+) -> str:
+    """Run the non-streaming tool loop and return the final assistant text.
+
+    Shared by /api/chat (non-stream), /api/generate (non-stream), and /api/event.
+    Mutates *messages* in-place (appends assistant + tool turns).
+    Returns the final assistant content string.
+    """
+    prev_tc_names: Optional[List[str]] = None
+    rep = 0
+    resp: Dict = {}
+    backend = backends.get_backend(model)
+
+    for i in range(MAX_TOOL_ROUNDS):
+        round_options = _options_for_round(options, i)
+        built = build_model_messages(messages)
+        payload = make_ollama_payload(model, built, round_options, stream=False)
+        _log_payload_sizes(req_id, built, len(TOOLS), layer_sizes if i == 0 else None)
+        log.debug("[%s] tool_loop round %d", req_id, i)
+
+        resp       = backend.chat_sync(payload)
+        msg        = resp.get("message") or {}
+        tool_calls = msg.get("tool_calls") or []
+
+        if not tool_calls:
+            break
+
+        tc_names = [(tc.get("function") or {}).get("name") for tc in tool_calls]
+        log.info("[%s] tool_calls: %s", req_id, tc_names)
+
+        if tc_names == prev_tc_names:
+            rep += 1
+            if rep >= 2:
+                log.warning("[%s] tool loop detected, aborting", req_id)
+                break
+        else:
+            rep = 0
+        prev_tc_names = tc_names
+
+        messages.append({
+            "role":       "assistant",
+            "content":    msg.get("content") or "",
+            "tool_calls": tool_calls,
+        })
+        for tc in tool_calls:
+            fn   = tc.get("function") or {}
+            name = fn.get("name") or "unknown"
+            args = fn.get("arguments") or {}
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except json.JSONDecodeError:
+                    args = {}
+            result = call_tool(name, args)
+            if isinstance(result, dict) and "error" in result:
+                log.warning("[%s] tool %s error: %s", req_id, name, result["error"])
+            messages.append({
+                "role":    "tool",
+                "content": json.dumps(result, ensure_ascii=False),
+            })
+
+    return ((resp.get("message") or {}).get("content") or "").strip()
+
+
 # ── CORS ───────────────────────────────────────────────────────────────────────
 
 @app.after_request
@@ -298,18 +415,9 @@ def options_chat():
 def load_tools():
     tools    = []
     registry = {}
-    clients  = []
 
     for source, cmd in discover_mcp_servers().items():
         client = MCPClient(cmd)
-        try:
-            client.start()
-        except Exception as e:
-            log.error("[tools] %s: failed to start MCP server: %s", source, e)
-            continue
-
-        clients.append(client)
-
         try:
             server_tools = client.list_tools()
         except Exception as e:
@@ -346,27 +454,27 @@ def load_tools():
             })
             log.debug("[tools] registered: %s", name)
 
-    return tools, registry, clients
-
-
-def _stop_all_mcp_clients() -> None:
-    for client in _MCP_CLIENTS:
-        try:
-            client.stop()
-        except Exception as e:
-            log.debug("[mcp] atexit stop error: %s", e)
+    return tools, registry
 
 
 def init_tools():
-    global TOOLS, TOOL_REGISTRY, _MCP_CLIENTS
+    global TOOLS, TOOL_REGISTRY
     log.info("[tools] initializing MCP tools...")
-    TOOLS, TOOL_REGISTRY, _MCP_CLIENTS = load_tools()
-    atexit.register(_stop_all_mcp_clients)
+    TOOLS, TOOL_REGISTRY = load_tools()
     log.info("[tools] total: %d tools in registry", len(TOOLS))
 
 
 def call_tool(name: str, arguments: Dict[str, Any]) -> Any:
-    """Invoke a tool by name."""
+    """Invoke a tool by name.
+
+    Returns the tool result dict on success.  On failure (unknown tool,
+    MCP error, exception) returns an error dict so the model can see what
+    went wrong and potentially correct its call:
+      {"error": "<reason>", "tool": "<name>", "args": {…}}
+
+    Callers should NOT raise on the returned error dict — they must append
+    it as a tool message so the model gets the feedback.
+    """
     if name == "mempalacekgquery":
         entity = arguments.get("entity", "")
         if entity:
@@ -392,6 +500,7 @@ def call_tool(name: str, arguments: Dict[str, Any]) -> Any:
 
     log.debug("[tool] %s result: %s", name, str(result)[:300])
 
+    # Surface MCP-level errors explicitly so the model sees them.
     if isinstance(result, dict) and result.get("success") is False:
         err_msg = result.get("error") or "unknown MCP error"
         log.warning("[tool] %s returned MCP error: %s", name, err_msg)
@@ -469,6 +578,13 @@ def _update_global_summary(turns_text: str) -> None:
 
 
 def _compress_summary(session: sess.Session) -> None:
+    """Compress ALL accumulated raw_turns into session.summary.
+
+    Uses the full raw_turns list (not a tail slice) so no turns are silently
+    dropped between compression cycles.  After a successful compression the
+    list is cleared; on failure the list is also cleared to avoid unbounded
+    growth, but the turns are still indexed into RAG first.
+    """
     if not session.raw_turns:
         return
 
@@ -600,12 +716,6 @@ def _build_or_tags() -> List[Dict[str, Any]]:
     return result
 
 
-@app.get("/")
-@app.get("/api")
-def root():
-    return Response("Ollama is running", status=200, mimetype="text/plain")
-
-
 @app.get("/version")
 @app.get("/api/version")
 def version():
@@ -619,93 +729,6 @@ def version():
 @app.get("/api/health")
 def health():
     return jsonify({"ok": True, "tools": len(TOOLS)})
-
-
-@app.post("/pull")
-@app.post("/api/pull")
-def pull():
-    try:
-        payload = request.get_json(force=True, silent=False) or {}
-    except Exception as e:
-        log.error("pull: bad JSON: %s", e)
-        return jsonify({"error": "invalid JSON"}), 400
-
-    model_name = payload.get("name") or payload.get("model") or ""
-    log.debug("[pull] fake success for model %s", model_name)
-
-    def _stream() -> Generator[bytes, None, None]:
-        chunk = {
-            "status":    "success",
-            "digest":    "",
-            "total":     1,
-            "completed": 1,
-            "model":     model_name,
-        }
-        yield (json.dumps(chunk, ensure_ascii=False) + "\n").encode("utf-8")
-
-    return Response(
-        _stream(),
-        content_type="application/x-ndjson",
-        headers={
-            "X-Accel-Buffering": "no",
-            "Cache-Control":     "no-cache",
-            "Transfer-Encoding": "chunked",
-        },
-    )
-
-
-@app.post("/show")
-@app.post("/api/show")
-def show_model():
-    try:
-        payload = request.get_json(force=True, silent=False) or {}
-    except Exception as e:
-        log.error("show: bad JSON: %s", e)
-        return jsonify({"error": "invalid JSON"}), 400
-
-    model_name = payload.get("name") or payload.get("model")
-    if not model_name:
-        return jsonify({"error": "missing model name"}), 400
-
-    if model_name.startswith(OPENROUTER_PREFIX):
-        info = fetch_model_info(model_name)
-        if info is None:
-            return jsonify({"error": f"model not found: {model_name}"}), 404
-
-        description = info.get("description") or ""
-        context_len = info.get("context_length") or 0
-        arch = (info.get("architecture") or {}).get("modality") or "text"
-
-        result = {
-            "model": model_name,
-            "modified_at": now_iso(),
-            "size": context_len,
-            "digest": "",
-            "details": {
-                "format": "api",
-                "family": "openrouter",
-                "families": ["openrouter"],
-                "parameter_size": description[:64],
-                "quantization_level": arch,
-            },
-            "capabilities": ["chat", "tools"],
-        }
-        return jsonify(result)
-
-    try:
-        r = requests.post(
-            f"{OLLAMA_API}/api/show",
-            json={"name": model_name},
-            timeout=600,
-        )
-        return Response(
-            r.content,
-            status=r.status_code,
-            content_type=r.headers.get("Content-Type", "application/json"),
-        )
-    except Exception as e:
-        log.error("[show] proxy failed: %s", e)
-        return jsonify({"error": str(e)}), 502
 
 
 @app.get("/tags")
@@ -739,6 +762,13 @@ def tags():
 
 
 def _options_for_round(options: Dict[str, Any], round_num: int) -> Dict[str, Any]:
+    """Return options dict adjusted for the current tool round.
+
+    For round 0 (initial user turn) options are used as-is.
+    For round 1+ (tool follow-up) num_predict is boosted by
+    TOOL_ROUND_NUM_PREDICT_BOOST so the model has enough room to
+    synthesise a full answer after the (heavier) tool context.
+    """
     if round_num == 0:
         return options
     boosted = dict(options)
@@ -756,7 +786,6 @@ def chat_stream_generator(
     layer_sizes: Dict[str, int],
     req_id: str = "-",
 ) -> Generator[bytes, None, None]:
-    MAX_TOOL_ROUNDS = 5
     prev_tool_names: Optional[List[str]] = None
     repeat_count = 0
 
@@ -974,62 +1003,7 @@ def chat():
 
     if not want_stream:
         try:
-            MAX_TOOL_ROUNDS = 5
-            resp: Dict = {}
-            prev_tc_names: Optional[List[str]] = None
-            rep = 0
-            backend = backends.get_backend(model)
-
-            for i in range(MAX_TOOL_ROUNDS):
-                round_options = _options_for_round(options, i)
-                built_messages = build_model_messages(messages)
-                payload = make_ollama_payload(model, built_messages, round_options, stream=False)
-                _log_payload_sizes(req_id, built_messages, len(TOOLS),
-                                   layer_sizes if i == 0 else None)
-                log.debug("[%s] non-stream round %d, think=%s", req_id, i, THINKING)
-                resp       = backend.chat_sync(payload)
-                msg        = resp.get("message") or {}
-                tool_calls = msg.get("tool_calls") or []
-
-                if not tool_calls:
-                    break
-
-                tc_names = [(tc.get("function") or {}).get("name") for tc in tool_calls]
-                log.info("[%s] non-stream tool_calls: %s", req_id, tc_names)
-
-                if tc_names == prev_tc_names:
-                    rep += 1
-                    if rep >= 2:
-                        log.warning("[%s] non-stream tool loop, aborting", req_id)
-                        return jsonify({"error": "tool loop detected"}), 500
-                else:
-                    rep = 0
-                prev_tc_names = tc_names
-
-                messages.append({
-                    "role":       "assistant",
-                    "content":    msg.get("content") or "",
-                    "tool_calls": tool_calls,
-                })
-                for tc in tool_calls:
-                    fn        = tc.get("function") or {}
-                    tool_name = fn.get("name")
-                    tool_args = fn.get("arguments") or {}
-                    if isinstance(tool_args, str):
-                        tool_args = json.loads(tool_args)
-                    tool_result = call_tool(tool_name, tool_args)
-                    if isinstance(tool_result, dict) and "error" in tool_result:
-                        log.warning(
-                            "[%s] non-stream tool %s error (passed to model): %s",
-                            req_id, tool_name, tool_result["error"],
-                        )
-                    messages.append({
-                        "role":    "tool",
-                        "content": json.dumps(tool_result, ensure_ascii=False),
-                    })
-
-            msg    = resp.get("message") or {}
-            answer = (msg.get("content") or "").strip() or "[пустой ответ]"
+            answer = run_tool_loop(model, messages, options, layer_sizes, req_id)
 
             if session and answer:
                 last_user = _last_user_text(messages)
@@ -1042,7 +1016,7 @@ def chat():
                     maybe_compress_async(session)
 
             log.info("[%s] non-stream done, answer_len=%d", req_id, len(answer))
-            return jsonify({"model": model, "answer": answer, "raw": resp})
+            return jsonify({"model": model, "answer": answer})
 
         except ReadTimeout:
             log.error("[%s] backend timeout", req_id)
@@ -1065,155 +1039,64 @@ def chat():
     )
 
 
-@app.post("/generate")
-@app.post("/api/generate")
-def generate():
+# ── /api/event ──────────────────────────────────────────────────────────────────────
+
+@app.post("/api/event")
+def system_event():
     req_id = uuid.uuid4().hex[:8]
 
+    # ── auth ───────────────────────────────────────────────────────────────────────
+    denied = _check_event_token()
+    if denied:
+        return denied
+
     try:
-        original_payload = request.get_json(force=True, silent=False)
+        ev = request.get_json(force=True, silent=False) or {}
     except Exception as e:
-        log.error("[%s] generate: failed to parse request JSON: %s", req_id, e)
+        log.error("[%s] event: bad JSON: %s", req_id, e)
         return jsonify({"error": "invalid JSON"}), 400
 
-    model       = original_payload.get("model") or "qwen3:8b"
-    prompt      = original_payload.get("prompt") or ""
-    system_text = original_payload.get("system") or ""
-    want_stream = original_payload.get("stream", True)
-    options     = merge_options(original_payload.get("options"))
-
-    session = None
-
-    messages: List[Dict[str, Any]] = []
-    if system_text:
-        messages.append({"role": "system", "content": system_text})
-    messages.append({"role": "user", "content": prompt})
-
-    summary = ""
-    global_summary = memory.read_global_summary()
+    event_type    = ev.get("type", "event")
+    event_source  = ev.get("source", "unknown")
+    event_payload = ev.get("payload") or {k: v for k, v in ev.items()
+                                          if k not in ("type", "source", "model", "options")}
+    model         = ev.get("model") or CHATD_EVENT_MODEL or "qwen3:8b"
+    options       = merge_options(ev.get("options"))
 
     log.info(
-        "[%s] POST /api/generate model=%s stream=%s prompt_len=%d",
-        req_id, model, want_stream, len(prompt),
+        "[%s] system event: type=%s source=%s model=%s",
+        req_id, event_type, event_source, model,
     )
 
+    # ── build messages ──────────────────────────────────────────────────────────────
+    event_text = (
+        f"[SYSTEM EVENT] type={event_type} source={event_source}\n"
+        f"{json.dumps(event_payload, ensure_ascii=False, indent=2)}"
+    )
+    messages: List[Dict[str, Any]] = [{"role": "user", "content": event_text}]
+
+    global_summary = memory.read_global_summary()
     messages, layer_sizes = ensure_system_prompt(
         messages,
-        per_chat_summary=summary,
+        per_chat_summary="",
         global_summary=global_summary,
     )
 
-    if not want_stream:
-        try:
-            MAX_TOOL_ROUNDS = 5
-            resp: Dict = {}
-            prev_tc_names: Optional[List[str]] = None
-            rep = 0
-            backend = backends.get_backend(model)
-
-            for i in range(MAX_TOOL_ROUNDS):
-                round_options = _options_for_round(options, i)
-                built_messages = build_model_messages(messages)
-                payload = make_ollama_payload(model, built_messages, round_options, stream=False)
-                _log_payload_sizes(req_id, built_messages, len(TOOLS),
-                                   layer_sizes if i == 0 else None)
-                log.debug("[%s] generate non-stream round %d, think=%s", req_id, i, THINKING)
-                resp       = backend.chat_sync(payload)
-                msg        = resp.get("message") or {}
-                tool_calls = msg.get("tool_calls") or []
-
-                if not tool_calls:
-                    break
-
-                tc_names = [(tc.get("function") or {}).get("name") for tc in tool_calls]
-                log.info("[%s] generate non-stream tool_calls: %s", req_id, tc_names)
-
-                if tc_names == prev_tc_names:
-                    rep += 1
-                    if rep >= 2:
-                        log.warning("[%s] generate non-stream tool loop, aborting", req_id)
-                        return jsonify({"error": "tool loop detected"}), 500
-                else:
-                    rep = 0
-                prev_tc_names = tc_names
-
-                messages.append({
-                    "role":       "assistant",
-                    "content":    msg.get("content") or "",
-                    "tool_calls": tool_calls,
-                })
-                for tc in tool_calls:
-                    fn        = tc.get("function") or {}
-                    tool_name = fn.get("name")
-                    tool_args = fn.get("arguments") or {}
-                    if isinstance(tool_args, str):
-                        try:
-                            tool_args = json.loads(tool_args)
-                        except json.JSONDecodeError:
-                            tool_args = {}
-                    tool_result = call_tool(tool_name, tool_args)
-                    if isinstance(tool_result, dict) and "error" in tool_result:
-                        log.warning(
-                            "[%s] generate non-stream tool %s error (passed to model): %s",
-                            req_id, tool_name, tool_result["error"],
-                        )
-                    messages.append({
-                        "role":    "tool",
-                        "content": json.dumps(tool_result, ensure_ascii=False),
-                    })
-
-            msg    = resp.get("message") or {}
-            answer = (msg.get("content") or "").strip() or ""
-
-            log.info("[%s] generate non-stream done, answer_len=%d", req_id, len(answer))
-
-            return jsonify({
-                "model": model,
-                "created_at": now_iso(),
-                "response": answer,
-                "done": True,
-            })
-
-        except ReadTimeout:
-            log.error("[%s] generate backend timeout", req_id)
-            return jsonify({"error": "backend timeout"}), 504
-        except Exception as e:
-            log.error("[%s] generate non-stream error: %s", req_id, traceback.format_exc())
-            return jsonify({"error": str(e)}), 502
-
-    def generate_stream():
-        inner = chat_stream_generator(model, messages, options, session, layer_sizes, req_id)
-        for raw in inner:
-            try:
-                obj = json.loads(raw.decode("utf-8"))
-            except Exception:
-                yield raw
-                continue
-
-            msg = obj.get("message") or {}
-            content = msg.get("content") or ""
-
-            out = {
-                "model": obj.get("model") or model,
-                "created_at": obj.get("created_at") or now_iso(),
-                "response": content,
-                "done": obj.get("done", False),
-            }
-            if obj.get("done"):
-                out["done_reason"] = obj.get("done_reason", "stop")
-
-            yield (json.dumps(out, ensure_ascii=False) + "\n").encode("utf-8")
-
-    log.info("[%s] starting generate stream", req_id)
-    return Response(
-        stream_with_context(generate_stream()),
-        content_type="application/x-ndjson",
-        headers={
-            "X-Accel-Buffering": "no",
-            "Cache-Control":     "no-cache",
-            "Transfer-Encoding": "chunked",
-        },
-    )
+    # ── run ──────────────────────────────────────────────────────────────────────────
+    try:
+        answer = run_tool_loop(model, messages, options, layer_sizes, req_id)
+        log.info("[%s] event done, answer_len=%d", req_id, len(answer))
+        return jsonify({
+            "ok":       True,
+            "req_id":   req_id,
+            "response": answer,
+        })
+    except ReadTimeout:
+        log.error("[%s] event: backend timeout", req_id)
+        return jsonify({"error": "backend timeout"}), 504
+    except Exception as e:
+        log.error("[%s] event error: %s", req_id, traceback.format_exc())
+        return jsonify({"error": str(e)}), 502
 
 
 init_tools()

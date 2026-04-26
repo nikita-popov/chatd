@@ -10,10 +10,10 @@ import os
 from pathlib import Path
 from typing import Any, Dict, List, Set
 
-# ── Thinking mode ────────────────────────────────────────────────────────────────────────
+# ── Thinking mode ────────────────────────────────────────────────────────────────────
 THINKING: bool = os.environ.get("CHATD_THINKING", "false").lower() == "true"
 
-# ── Tools ────────────────────────────────────────────────────────────────────────────────
+# ── Tools ────────────────────────────────────────────────────────────────────────
 TOOLS_FILTER: bool = os.environ.get("CHATD_TOOLS_FILTER", "false").lower() == "true"
 
 _default_allowed = (
@@ -24,7 +24,10 @@ TOOLS_ALLOWED: Set[str] = set(
     os.environ.get("CHATD_TOOLS_ALLOWED", _default_allowed).split(",")
 )
 
-# ── Sampling ─────────────────────────────────────────────────────────────────────────────────
+# ── Tool rounds ──────────────────────────────────────────────────────────────────
+MAX_TOOL_ROUNDS: int = int(os.environ.get("CHATD_MAX_TOOL_ROUNDS", "5"))
+
+# ── Sampling ───────────────────────────────────────────────────────────────────────
 DEFAULT_OPTIONS: Dict[str, Any] = {
     "num_predict":    int(os.environ.get("CHATD_NUM_PREDICT",    "768")),
     "num_ctx":        int(os.environ.get("CHATD_NUM_CTX",        "8192")),
@@ -34,7 +37,7 @@ DEFAULT_OPTIONS: Dict[str, Any] = {
     "repeat_penalty": float(os.environ.get("CHATD_REPEAT_PENALTY", "1.05")),
 }
 
-# ── MemPalace ─────────────────────────────────────────────────────────────────────────────────
+# ── MemPalace ────────────────────────────────────────────────────────────────────────
 MEMPALACE_PALACE_PATH: str = os.environ.get(
     "MEMPALACE_PALACE_PATH", "~/.local/share/mempalace"
 )
@@ -48,7 +51,7 @@ MEMPALACE_WRITE_TOOLS: Set[str] = {
     "mempalace_add_drawer",
 }
 
-# ── Session / summaries ─────────────────────────────────────────────────────────────────────────
+# ── Session / summaries ───────────────────────────────────────────────────────────────────
 CHATD_SESSION_DIR: str = os.environ.get(
     "CHATD_SESSION_DIR", "~/.local/share/chatd/sessions"
 )
@@ -61,7 +64,7 @@ CHATD_SUMMARY_MODEL: str = os.environ.get("CHATD_SUMMARY_MODEL", "qwen2.5:1.5b")
 
 CHATD_COMPRESS_EVERY: int = int(os.environ.get("CHATD_COMPRESS_EVERY", "5"))
 
-# ── External RAG store ────────────────────────────────────────────────────────────────────────────
+# ── External RAG store ───────────────────────────────────────────────────────────────────────────
 RAG_DB_PATH: str = os.environ.get(
     "CHATD_RAG_DB_PATH", "~/.local/share/chatd/rag.sqlite3"
 )
@@ -71,20 +74,25 @@ RAG_MAX_CHARS_PER_CHUNK: int = int(os.environ.get("CHATD_RAG_MAX_CHARS_PER_CHUNK
 RAG_MIN_SCORE: float = float(os.environ.get("CHATD_RAG_MIN_SCORE", "0.25"))
 
 # ── OpenRouter ───────────────────────────────────────────────────────────────────────────────────────
-# Whitelist of OpenRouter models to expose via /api/tags.
-# Format: comma-separated OR model IDs with the configured prefix.
-# Example: OPENROUTER_API_MODELS=or/google/gemini-2.0-flash,or/anthropic/claude-3.5-sonnet
-# If empty, no OpenRouter models are injected into /api/tags.
 OPENROUTER_API_MODELS: List[str] = [
     m.strip()
     for m in os.environ.get("OPENROUTER_API_MODELS", "").split(",")
     if m.strip()
 ]
 
-# ── MCP auto-discovery prefix ───────────────────────────────────────────────────────────────────────────────
+# ── Events ──────────────────────────────────────────────────────────────────────────
+# Optional shared secret for /api/event.
+# If set, caller must pass Authorization: Bearer <token>.
+# If empty — endpoint is open (only for trusted internal networks).
+CHATD_EVENT_TOKEN: str = os.environ.get("CHATD_EVENT_TOKEN", "")
+
+# Model used to process incoming events (can differ from chat model).
+CHATD_EVENT_MODEL: str = os.environ.get("CHATD_EVENT_MODEL", "")
+
+# ── MCP auto-discovery prefix ───────────────────────────────────────────────────────────────────────────────────────────────
 MCP_ENV_PREFIX: str = "CHATD_MCP_"
 
-# ── Tool description overrides ───────────────────────────────────────────────────────────────────────────────────────
+# ── Tool description overrides ──────────────────────────────────────────────────────────────────────────────────────────────────────
 TOOL_OVERRIDE: bool = os.environ.get("CHATD_TOOL_OVERRIDE", "false").lower() == "true"
 
 def _load_tool_descriptions() -> Dict[str, str]:
