@@ -65,6 +65,10 @@ _GLOBAL_SUMMARY_LOCK = threading.Lock()
 # How much to boost num_predict for tool follow-up rounds.
 TOOL_ROUND_NUM_PREDICT_BOOST = 1024
 
+# Extra tokens guaranteed for the final answer round (no tool_calls).
+# This is applied on top of whatever num_predict the last tool round had.
+EVENT_FINAL_ROUND_NUM_PREDICT = 2048
+
 # Maximum seconds to wait for run_tool_loop inside /api/event.
 EVENT_TOOL_LOOP_TIMEOUT = 120
 
@@ -73,7 +77,10 @@ _EVENT_DIRECTIVE = (
     "This is an automated system event — there is no human in the conversation.\n"
     "You MUST respond by calling the appropriate tools to handle this event.\n"
     "Do NOT just describe what you would do — actually call the tools now.\n"
-    "After completing all actions, write a brief summary of what was done."
+    "IMPORTANT: After completing all diagnostic/action tool calls you MUST call\n"
+    "the 'send_message' tool (or equivalent notification tool) to inform the user\n"
+    "about what happened and what was found. Do NOT skip this step.\n"
+    "After all tool calls are done, write a brief summary of what was done."
 )
 
 
@@ -85,7 +92,7 @@ def now_iso() -> str:
 
 def make_chunk(model: str, content: str, done: bool = False) -> bytes:
     obj: Dict[str, Any] = {
-        "model": model,
+        "model":    model,
         "created_at": now_iso(),
         "message": {"role": "assistant", "content": content},
         "done": done,
@@ -331,12 +338,15 @@ def run_tool_loop(
     options: Dict[str, Any],
     layer_sizes: Dict[str, int],
     req_id: str,
+    final_num_predict: Optional[int] = None,
 ) -> str:
     """Run the non-streaming tool loop and return the final assistant text.
 
     Shared by /api/chat (non-stream), /api/generate (non-stream), and /api/event.
     Mutates *messages* in-place (appends assistant + tool turns).
     Returns the final assistant content string.
+
+    final_num_predict: if set, overrides num_predict for the last (answer) round.
     """
     prev_tc_names: Optional[List[str]] = None
     rep = 0
@@ -355,6 +365,21 @@ def run_tool_loop(
         tool_calls = msg.get("tool_calls") or []
 
         if not tool_calls:
+            # Final answer round: re-run with boosted num_predict if answer is empty
+            # or if caller requested a guaranteed minimum for the answer.
+            content = (msg.get("content") or "").strip()
+            if not content and final_num_predict:
+                log.debug(
+                    "[%s] empty answer on round %d, retrying with num_predict=%d",
+                    req_id, i, final_num_predict,
+                )
+                boosted = dict(round_options)
+                boosted["num_predict"] = final_num_predict
+                payload2 = make_ollama_payload(model, built, boosted, stream=False)
+                resp2 = backend.chat_sync(payload2)
+                content2 = ((resp2.get("message") or {}).get("content") or "").strip()
+                if content2:
+                    return content2
             break
 
         tc_names = [(tc.get("function") or {}).get("name") for tc in tool_calls]
@@ -1282,7 +1307,10 @@ def system_event():
 
     def _run():
         try:
-            result_box["answer"] = run_tool_loop(model, messages, options, layer_sizes, req_id)
+            result_box["answer"] = run_tool_loop(
+                model, messages, options, layer_sizes, req_id,
+                final_num_predict=EVENT_FINAL_ROUND_NUM_PREDICT,
+            )
         except Exception as exc:
             result_box["exc"] = exc
 
