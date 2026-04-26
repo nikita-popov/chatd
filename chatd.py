@@ -69,18 +69,33 @@ TOOL_ROUND_NUM_PREDICT_BOOST = 1024
 # This is applied on top of whatever num_predict the last tool round had.
 EVENT_FINAL_ROUND_NUM_PREDICT = 2048
 
-# Maximum seconds to wait for run_tool_loop inside /api/event.
+# Maximum seconds to wait for the background event worker before logging a warning.
+# The HTTP response is already sent (202), this is just for log visibility.
 EVENT_TOOL_LOOP_TIMEOUT = 120
 
+# Directive injected into every system event prompt.
+# The model is instructed to:
+#   1. Immediately call send_message (or equivalent) to acknowledge receipt.
+#   2. If action is needed — do it, then call send_message again with the result.
+#   3. If nothing needs to be done — the first send_message is sufficient.
 _EVENT_DIRECTIVE = (
     "\n\n"
     "This is an automated system event — there is no human in the conversation.\n"
-    "You MUST respond by calling the appropriate tools to handle this event.\n"
-    "Do NOT just describe what you would do — actually call the tools now.\n"
-    "IMPORTANT: After completing all diagnostic/action tool calls you MUST call\n"
-    "the 'send_message' tool (or equivalent notification tool) to inform the user\n"
-    "about what happened and what was found. Do NOT skip this step.\n"
-    "After all tool calls are done, write a brief summary of what was done."
+    "\n"
+    "STEP 1 — Acknowledge immediately:\n"
+    "  Call send_message (or the appropriate notification tool) RIGHT NOW to inform\n"
+    "  the user that you received this event. If the event requires action, briefly\n"
+    "  say what you are about to do. If nothing needs to be done — say so and stop.\n"
+    "\n"
+    "STEP 2 — Act (only if action is needed):\n"
+    "  Call the required diagnostic or action tools to handle the event.\n"
+    "  Do NOT just describe what you would do — actually call the tools.\n"
+    "\n"
+    "STEP 3 — Report result:\n"
+    "  After all action tools are done, call send_message again to report\n"
+    "  what was done and what was found.\n"
+    "\n"
+    "Do NOT skip STEP 1. Do NOT write a plain-text summary without calling send_message."
 )
 
 
@@ -1272,8 +1287,6 @@ def system_event():
 
     event_type   = ev.get("type", "event")
     event_source = ev.get("source", "unknown")
-    # Use explicit "payload" key when present; otherwise collect all non-reserved fields.
-    # Check key existence explicitly so that an empty dict payload is preserved.
     if "payload" in ev:
         event_payload = ev["payload"]
     else:
@@ -1301,42 +1314,21 @@ def system_event():
         global_summary=global_summary,
     )
 
-    # Run tool loop in a daemon thread with a hard timeout so a hanging model
-    # cannot block a gunicorn worker indefinitely.
-    result_box: Dict[str, Any] = {}
-
     def _run():
         try:
-            result_box["answer"] = run_tool_loop(
+            answer = run_tool_loop(
                 model, messages, options, layer_sizes, req_id,
                 final_num_predict=EVENT_FINAL_ROUND_NUM_PREDICT,
             )
-        except Exception as exc:
-            result_box["exc"] = exc
+            log.info("[%s] event worker done, answer_len=%d", req_id, len(answer))
+        except Exception:
+            log.error("[%s] event worker error:\n%s", req_id, traceback.format_exc())
 
     t = threading.Thread(target=_run, daemon=True, name=f"event-{req_id}")
     t.start()
-    t.join(timeout=EVENT_TOOL_LOOP_TIMEOUT)
 
-    if t.is_alive():
-        log.error("[%s] event: tool loop timed out after %ds", req_id, EVENT_TOOL_LOOP_TIMEOUT)
-        return jsonify({"error": "tool loop timeout"}), 504
-
-    if "exc" in result_box:
-        exc = result_box["exc"]
-        if isinstance(exc, ReadTimeout):
-            log.error("[%s] event: backend timeout", req_id)
-            return jsonify({"error": "backend timeout"}), 504
-        log.error("[%s] event error: %s", req_id, traceback.format_exc())
-        return jsonify({"error": str(exc)}), 502
-
-    answer = result_box.get("answer", "")
-    log.info("[%s] event done, answer_len=%d", req_id, len(answer))
-    return jsonify({
-        "ok":       True,
-        "req_id":   req_id,
-        "response": answer,
-    })
+    # Return immediately — the model will notify the user via send_message tool.
+    return jsonify({"ok": True, "req_id": req_id}), 202
 
 
 init_tools()
