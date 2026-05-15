@@ -65,6 +65,7 @@ CHATD_SUMMARY_MODEL: str = os.environ.get("CHATD_SUMMARY_MODEL", "qwen2.5:1.5b")
 CHATD_COMPRESS_EVERY: int = int(os.environ.get("CHATD_COMPRESS_EVERY", "5"))
 
 # ── External RAG store ───────────────────────────────────────────────────────────────────────────
+RAG_ENABLED: bool = os.environ.get("CHATD_RAG_ENABLED", "true").lower() == "true"
 RAG_DB_PATH: str = os.environ.get(
     "CHATD_RAG_DB_PATH", "~/.local/share/chatd/rag.sqlite3"
 )

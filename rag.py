@@ -8,6 +8,9 @@ the current user message.
 
 L1.5 is always injected into the system prompt alongside KG recall.
 It does not replace or modify any mempalace layer.
+
+Set CHATD_RAG_ENABLED=false to disable the layer entirely without
+touching any other RAG settings.
 """
 import json
 import logging
@@ -21,6 +24,7 @@ import backends
 from config import (
     RAG_DB_PATH,
     RAG_EMBED_MODEL,
+    RAG_ENABLED,
     RAG_MAX_CHARS_PER_CHUNK,
     RAG_MIN_SCORE,
     RAG_TOP_K,
@@ -43,6 +47,9 @@ def _connect() -> sqlite3.Connection:
 
 def init() -> None:
     """Initialise the L1.5 external RAG store (chatd-owned, separate from mempalace)."""
+    if not RAG_ENABLED:
+        log.info("RAG: disabled via CHATD_RAG_ENABLED")
+        return
     conn = _connect()
     try:
         conn.execute("""
@@ -98,6 +105,8 @@ def _cosine_similarity(a: List[float], b: List[float]) -> float:
 
 def index_turn(source: str, user: str, assistant: str) -> None:
     """Index one conversation turn into the L1.5 RAG store."""
+    if not RAG_ENABLED:
+        return
     chunk = _chunk_turn(user, assistant)
     if not chunk:
         return
@@ -131,6 +140,8 @@ def index_turn(source: str, user: str, assistant: str) -> None:
 
 def retrieve(query: str, top_k: int = RAG_TOP_K) -> Optional[str]:
     """Return L1.5 RAG context: top-k semantically similar past turns for *query*."""
+    if not RAG_ENABLED:
+        return None
     query = (query or "").strip()
     if not query:
         return None
