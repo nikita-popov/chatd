@@ -5,9 +5,11 @@ Layered memory model:
   L0   mempalace : model identity.txt — always loaded
   L0.5 chatd     : composed layer — per-chat compressed summary +
                    global compressed summary — always loaded
+                   (disable with CHATD_LAYER_05_ENABLED=false)
   L1   mempalace : Essential Story (wake-up context) — always loaded
   L1.5 chatd     : request-scoped sidecar — KG recall + external RAG
                    injected per request — always loaded
+                   (disable with CHATD_LAYER_15_ENABLED=false)
   L2   mempalace : Room Recall (filtered retrieval) — when topic comes up
   L3   mempalace : Deep Search (full semantic query) — when explicitly asked
 
@@ -30,6 +32,19 @@ from config import (
 )
 
 log = logging.getLogger("chatd.memory")
+
+# ── Layer feature flags ───────────────────────────────────────────────────────
+
+def _bool_env(name: str, default: bool = True) -> bool:
+    """Read a boolean environment variable.  Accepts true/false (case-insensitive)."""
+    val = os.environ.get(name, "").strip().lower()
+    if not val:
+        return default
+    return val not in ("false", "0", "no", "off")
+
+
+LAYER_05_ENABLED: bool = _bool_env("CHATD_LAYER_05_ENABLED", default=True)
+LAYER_15_ENABLED: bool = _bool_env("CHATD_LAYER_15_ENABLED", default=True)
 
 # ── L1: in-process KG ───────────────────────────────────────────────────────
 
@@ -90,6 +105,9 @@ def kg_recall(entity: str) -> Optional[str]:
 def kg_recall_from_text(text: str, max_results: int = 5) -> Optional[str]:
     """Extract entity candidates from *text* and query KG for each.
 
+    Returns None immediately when L1.5 is disabled via
+    CHATD_LAYER_15_ENABLED=false.
+
     Scans the user message for words that might be KG subjects/entities,
     queries each one via kg_recall(), and returns a deduplicated fact block.
     Returns None when nothing is found — caller decides whether to fall back
@@ -98,6 +116,9 @@ def kg_recall_from_text(text: str, max_results: int = 5) -> Optional[str]:
     Heuristic: words longer than 3 chars that are not in _STOPWORDS.
     At most 8 entity candidates are checked to bound latency.
     """
+    if not LAYER_15_ENABLED:
+        return None
+
     words = {
         w.lower().strip(".,!?:;\"'()")
         for w in text.split()
@@ -256,8 +277,7 @@ def wake_up(per_chat_summary: str = "", global_summary: str = "") -> str:
     """Assemble the always-loaded system-prompt block.
 
     L0.5 is a composed layer: both per_chat_summary and global_summary
-    are part of it. They are emitted separately so the model can
-    distinguish chat-scoped context from broader activity context.
+    are part of it.  Skipped entirely when CHATD_LAYER_05_ENABLED=false.
 
     Parameters
     ----------
@@ -268,10 +288,13 @@ def wake_up(per_chat_summary: str = "", global_summary: str = "") -> str:
     """
     base = _wakeup_cached()   # L0 + L1, mempalace, cached
     parts = [base]
-    if global_summary:
-        parts.append(f"## Recent activity (global)\n{global_summary}")
-    if per_chat_summary:
-        parts.append(f"## Conversation summary\n{per_chat_summary}")
+    if LAYER_05_ENABLED:
+        if global_summary:
+            parts.append(f"## Recent activity (global)\n{global_summary}")
+        if per_chat_summary:
+            parts.append(f"## Conversation summary\n{per_chat_summary}")
+    else:
+        log.debug("FastMemory: L0.5 disabled (CHATD_LAYER_05_ENABLED=false)")
     return "\n\n".join(p for p in parts if p)
 
 
@@ -330,6 +353,10 @@ def init() -> None:
     """
     from mempalace import __version__ as mp_version
     log.info("mempalace: version %s", mp_version)
+    log.info(
+        "FastMemory: layer flags — L0.5=%s L1.5=%s",
+        LAYER_05_ENABLED, LAYER_15_ENABLED,
+    )
 
     palace_path = os.path.expanduser(MEMPALACE_PALACE_PATH)
     kg_path     = os.path.expanduser(MEMPALACE_KG_PATH)
