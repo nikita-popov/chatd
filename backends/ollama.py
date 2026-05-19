@@ -15,6 +15,9 @@ OLLAMA_API: str = os.environ.get("OLLAMA_API", "http://127.0.0.1:11434")
 
 log = logging.getLogger("chatd.backends.ollama")
 
+# Persistent session — reuses TCP connections to the local Ollama daemon.
+_session: requests.Session = requests.Session()
+
 
 class OllamaBackend:
     """Ollama local runtime. Default backend for all unprefixed models."""
@@ -22,7 +25,7 @@ class OllamaBackend:
     def chat_stream(
         self, payload: Dict[str, Any]
     ) -> Generator[bytes, None, None]:
-        r = requests.post(
+        r = _session.post(
             f"{OLLAMA_API}/api/chat",
             json=payload, timeout=3600, stream=True,
         )
@@ -33,7 +36,7 @@ class OllamaBackend:
                     yield line + b"\n"
 
     def chat_sync(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        r = requests.post(
+        r = _session.post(
             f"{OLLAMA_API}/api/chat",
             json=payload, timeout=3600,
         )
@@ -41,7 +44,7 @@ class OllamaBackend:
         return r.json()
 
     def embed(self, text: str, model: str) -> List[float]:
-        r = requests.post(
+        r = _session.post(
             f"{OLLAMA_API}/api/embed",
             json={"model": model, "input": text},
             timeout=120,

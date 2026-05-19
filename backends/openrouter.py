@@ -40,6 +40,9 @@ _PREFIX: str = OPENROUTER_PREFIX
 _model_cache: Dict[str, Dict[str, Any]] = {}
 _model_cache_loaded: bool = False
 
+# Persistent session — reuses TCP+TLS connections across tool loop rounds.
+_session: requests.Session = requests.Session()
+
 
 def _strip(model: str) -> str:
     return model[len(_PREFIX):] if model.startswith(_PREFIX) else model
@@ -58,7 +61,7 @@ def _load_model_cache() -> None:
     if _model_cache_loaded:
         return
     try:
-        r = requests.get(
+        r = _session.get(
             f"{OPENROUTER_API_BASE}/models",
             headers=_headers(),
             timeout=15,
@@ -252,7 +255,7 @@ def _or_response_meta(r: requests.Response) -> str:
         parts.append(f"provider={provider}")
     if gen_id:
         parts.append(f"generation={gen_id}")
-    return " ".join(parts)
+    return " '.join(parts)
 
 
 def _log_http_error(exc: HTTPError) -> str:
@@ -367,7 +370,7 @@ class OpenRouterBackend:
     ) -> Generator[bytes, None, None]:
         model = payload["model"]
         try:
-            r = requests.post(
+            r = _session.post(
                 f"{OPENROUTER_API_BASE}/chat/completions",
                 headers=_headers(),
                 json=_to_openai(payload, stream=True),
@@ -383,7 +386,7 @@ class OpenRouterBackend:
 
     def chat_sync(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         try:
-            r = requests.post(
+            r = _session.post(
                 f"{OPENROUTER_API_BASE}/chat/completions",
                 headers=_headers(),
                 json=_to_openai(payload, stream=False),
