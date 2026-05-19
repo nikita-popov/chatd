@@ -188,21 +188,20 @@ def _check_event_token() -> Optional[Tuple[Response, int]]:
 
 def ensure_system_prompt(
     messages: List[Dict[str, Any]],
-    global_summary: str = "",
 ) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
     """Assemble the always-loaded memory block and prepend it as system message.
 
     Returns (messages, layer_sizes) where layer_sizes maps layer name to char count:
-      L0        mempalace identity + wake-up base
-      L0.5g     global compressed summary
-      L1        mempalace Essential Story (included in wake_up base)
+      L0+L1     mempalace identity + wake-up base (Essential Story included)
       L1.5_kg   KG recall sidecar
       L1.5_rag  RAG recall sidecar
+
+    Note: L0.5g (global summary) is intentionally omitted — MemPalace wake-up
+    already covers the same information.
     """
-    base_prompt = memory.wake_up(global_summary=global_summary)
+    base_prompt = memory.wake_up()
     layer_sizes: Dict[str, int] = {
         "L0+L1":   len(base_prompt),
-        "L0.5g":   len(global_summary),
         "L1.5_kg": 0,
         "L1.5_rag": 0,
     }
@@ -290,10 +289,9 @@ def _log_payload_sizes(
 
     if layer_sizes:
         log.debug(
-            "[%s] system layers: L0+L1=%d L0.5g=%d L1.5_kg=%d L1.5_rag=%d  total=%d",
+            "[%s] system layers: L0+L1=%d L1.5_kg=%d L1.5_rag=%d  total=%d",
             req_id,
             layer_sizes.get("L0+L1", 0),
-            layer_sizes.get("L0.5g", 0),
             layer_sizes.get("L1.5_kg", 0),
             layer_sizes.get("L1.5_rag", 0),
             sizes.get("system", 0),
@@ -932,15 +930,9 @@ def chat():
     chat_id = extract_chat_id(request)
     session = sess.get_session(chat_id) if chat_id else None
 
-    global_summary = memory.read_global_summary()
+    log.info("[%s] chat_id=%s", req_id, chat_id)
 
-    log.info("[%s] chat_id=%s global_summary_len=%d",
-             req_id, chat_id, len(global_summary))
-
-    messages, layer_sizes = ensure_system_prompt(
-        messages,
-        global_summary=global_summary,
-    )
+    messages, layer_sizes = ensure_system_prompt(messages)
 
     log.info("[%s] POST /api/chat model=%s stream=%s messages=%d options=%s",
              req_id, model, want_stream, len(messages), options)
@@ -1011,17 +1003,12 @@ def generate():
         messages.append({"role": "system", "content": system_text})
     messages.append({"role": "user", "content": prompt})
 
-    global_summary = memory.read_global_summary()
-
     log.info(
         "[%s] POST /api/generate model=%s stream=%s prompt_len=%d",
         req_id, model, want_stream, len(prompt),
     )
 
-    messages, layer_sizes = ensure_system_prompt(
-        messages,
-        global_summary=global_summary,
-    )
+    messages, layer_sizes = ensure_system_prompt(messages)
 
     if not want_stream:
         try:
@@ -1113,11 +1100,7 @@ def system_event():
     )
     messages: List[Dict[str, Any]] = [{"role": "user", "content": event_text}]
 
-    global_summary = memory.read_global_summary()
-    messages, layer_sizes = ensure_system_prompt(
-        messages,
-        global_summary=global_summary,
-    )
+    messages, layer_sizes = ensure_system_prompt(messages)
 
     def _run():
         try:

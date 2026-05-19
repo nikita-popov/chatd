@@ -68,7 +68,8 @@ def init() -> None:
             "CREATE INDEX IF NOT EXISTS idx_rag_added_at ON rag_chunks(added_at)"
         )
         conn.commit()
-        log.info("RAG: store ready at %s", _db_path())
+        total = conn.execute("SELECT COUNT(*) FROM rag_chunks").fetchone()[0]
+        log.info("RAG: store ready at %s (total chunks: %d)", _db_path(), total)
     finally:
         conn.close()
 
@@ -103,6 +104,18 @@ def _cosine_similarity(a: List[float], b: List[float]) -> float:
     return dot / (norm_a * norm_b)
 
 
+def _count_total() -> int:
+    """Return total number of chunks in the RAG store."""
+    try:
+        conn = _connect()
+        try:
+            return conn.execute("SELECT COUNT(*) FROM rag_chunks").fetchone()[0]
+        finally:
+            conn.close()
+    except Exception:
+        return -1
+
+
 def index_turn(source: str, user: str, assistant: str) -> None:
     """Index one conversation turn into the L1.5 RAG store."""
     if not RAG_ENABLED:
@@ -110,6 +123,7 @@ def index_turn(source: str, user: str, assistant: str) -> None:
     chunk = _chunk_turn(user, assistant)
     if not chunk:
         return
+    chunk_len = len(chunk)
     try:
         embedding = _embed(chunk)
     except Exception as e:
@@ -131,7 +145,11 @@ def index_turn(source: str, user: str, assistant: str) -> None:
             ),
         )
         conn.commit()
-        log.debug("RAG: indexed chunk for %s", source)
+        total = conn.execute("SELECT COUNT(*) FROM rag_chunks").fetchone()[0]
+        log.debug(
+            "RAG: indexed chunk source=%s chunk_len=%d db_total=%d",
+            source, chunk_len, total,
+        )
     except Exception as e:
         log.warning("RAG: failed to index chunk for %s: %s", source, e)
     finally:
@@ -175,13 +193,25 @@ def retrieve(query: str, top_k: int = RAG_TOP_K) -> Optional[str]:
             scored.append((score, row["source"], row["chunk"], row["added_at"]))
 
     if not scored:
+        log.debug("RAG: no chunks above min_score=%.3f (scanned %d)", RAG_MIN_SCORE, len(rows))
         return None
 
     scored.sort(key=lambda x: x[0], reverse=True)
+    top = scored[:top_k]
+    sources = [s for _, s, _, _ in top]
+    total_chars = sum(len(c) for _, _, c, _ in top)
+    log.debug(
+        "RAG: retrieved %d/%d chunks, total_chars=%d, sources=%s, scores=%s",
+        len(top),
+        len(scored),
+        total_chars,
+        sources,
+        [f"{sc:.3f}" for sc, _, _, _ in top],
+    )
+
     blocks = []
-    for score, source, chunk, added_at in scored[:top_k]:
+    for score, source, chunk, added_at in top:
         blocks.append(
             f"[source={source} score={score:.3f} at={added_at}]\n{chunk}"
         )
-    log.debug("RAG: retrieved %d chunks", len(blocks))
     return "\n\n---\n\n".join(blocks)
