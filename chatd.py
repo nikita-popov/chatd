@@ -188,8 +188,14 @@ def _check_event_token() -> Optional[Tuple[Response, int]]:
 
 def ensure_system_prompt(
     messages: List[Dict[str, Any]],
+    session: Optional[sess.Session] = None,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
     """Assemble the always-loaded memory block and prepend it as system message.
+
+    L0+L1 (wake-up base) is cached per session — rebuilt only on the first
+    request of each session, or after a mempalace write operation invalidates
+    the cache.  L1.5 (KG recall + RAG sidecar) is always computed per-request
+    because it depends on the current user message.
 
     Returns (messages, layer_sizes) where layer_sizes maps layer name to char count:
       L0+L1     mempalace identity + wake-up base (Essential Story included)
@@ -199,13 +205,25 @@ def ensure_system_prompt(
     Note: L0.5g (global summary) is intentionally omitted — MemPalace wake-up
     already covers the same information.
     """
-    base_prompt = memory.wake_up()
+    # L0+L1: use session cache when available
+    if session is not None:
+        base_prompt = session.get_cached_base_prompt()
+        if base_prompt is None:
+            base_prompt = memory.wake_up()
+            session.set_cached_base_prompt(base_prompt)
+        else:
+            log.debug("[syspr] session %s: reusing cached base prompt (%d chars)",
+                      session.session_id, len(base_prompt))
+    else:
+        base_prompt = memory.wake_up()
+
     layer_sizes: Dict[str, int] = {
         "L0+L1":   len(base_prompt),
         "L1.5_kg": 0,
         "L1.5_rag": 0,
     }
 
+    # L1.5: always per-request — KG and RAG depend on the current question
     last_user = _last_user_text(messages)
     if last_user:
         extra = memory.kg_recall_from_text(last_user)
@@ -535,6 +553,8 @@ def call_tool(name: str, arguments: Dict[str, Any]) -> Any:
 
     if name in MEMPALACE_WRITE_TOOLS:
         memory.invalidate()
+        sess.invalidate_all_prompt_caches()
+
     return result
 
 
@@ -932,7 +952,7 @@ def chat():
 
     log.info("[%s] chat_id=%s", req_id, chat_id)
 
-    messages, layer_sizes = ensure_system_prompt(messages)
+    messages, layer_sizes = ensure_system_prompt(messages, session=session)
 
     log.info("[%s] POST /api/chat model=%s stream=%s messages=%d options=%s",
              req_id, model, want_stream, len(messages), options)
@@ -1008,7 +1028,7 @@ def generate():
         req_id, model, want_stream, len(prompt),
     )
 
-    messages, layer_sizes = ensure_system_prompt(messages)
+    messages, layer_sizes = ensure_system_prompt(messages, session=session)
 
     if not want_stream:
         try:
@@ -1100,7 +1120,8 @@ def system_event():
     )
     messages: List[Dict[str, Any]] = [{"role": "user", "content": event_text}]
 
-    messages, layer_sizes = ensure_system_prompt(messages)
+    # /api/event has no session context — session=None, wake-up not cached
+    messages, layer_sizes = ensure_system_prompt(messages, session=None)
 
     def _run():
         try:

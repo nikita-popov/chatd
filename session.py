@@ -14,7 +14,7 @@ at 20 user+assistant pairs before forwarding to the backend.
 import json
 import logging
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Optional
@@ -29,6 +29,26 @@ _SESSIONS: Dict[str, "Session"] = {}
 @dataclass
 class Session:
     session_id: str
+
+    # ── system prompt cache (L0+L1 only; L1.5 is always per-request) ─────────
+    # Avoids rebuilding the static wake-up block on every HTTP request.
+    # Invalidated when a mempalace write-tool is called.
+    _base_prompt_cache: Optional[str] = field(default=None, repr=False)
+
+    def get_cached_base_prompt(self) -> Optional[str]:
+        """Return cached L0+L1 wake-up string, or None if not yet built."""
+        return self._base_prompt_cache
+
+    def set_cached_base_prompt(self, prompt: str) -> None:
+        """Store the assembled L0+L1 wake-up string for this session."""
+        self._base_prompt_cache = prompt
+        log.debug("[session:%s] base prompt cached (%d chars)", self.session_id, len(prompt))
+
+    def invalidate_prompt_cache(self) -> None:
+        """Drop the cached base prompt (call after mempalace write ops)."""
+        if self._base_prompt_cache is not None:
+            self._base_prompt_cache = None
+            log.debug("[session:%s] base prompt cache invalidated", self.session_id)
 
     # ── persistence ──────────────────────────────────────────────────────────
 
@@ -91,6 +111,17 @@ def get_session(session_id: str) -> Session:
     if session_id not in _SESSIONS:
         _SESSIONS[session_id] = Session.load(session_id)
     return _SESSIONS[session_id]
+
+
+def invalidate_all_prompt_caches() -> None:
+    """Drop base prompt cache on every active session.
+
+    Called after mempalace write operations so the next request
+    rebuilds the wake-up block from fresh data.
+    """
+    for s in _SESSIONS.values():
+        s.invalidate_prompt_cache()
+    log.debug("[session] invalidated base prompt cache on %d sessions", len(_SESSIONS))
 
 
 def record_turn(session: Session, user_msg: str, assistant_msg: str) -> None:
