@@ -27,9 +27,6 @@ from config import (
     MEMPALACE_WRITE_TOOLS,
     TOOL_OVERRIDE,
     TOOL_DESCRIPTION_OVERRIDES,
-    CHATD_SUMMARY_MODEL,
-    CHATD_COMPRESS_EVERY,
-    OPENROUTER_API_MODELS,
     CHATD_EVENT_TOKEN,
     CHATD_EVENT_MODEL,
 )
@@ -60,24 +57,15 @@ _MCP_CLIENTS: List[MCPClient] = []
 app = Flask(__name__)
 app.json.ensure_ascii = False
 
-_GLOBAL_SUMMARY_LOCK = threading.Lock()
-
 # How much to boost num_predict for tool follow-up rounds.
 TOOL_ROUND_NUM_PREDICT_BOOST = 1024
 
 # Extra tokens guaranteed for the final answer round (no tool_calls).
-# This is applied on top of whatever num_predict the last tool round had.
 EVENT_FINAL_ROUND_NUM_PREDICT = 2048
 
 # Maximum seconds to wait for the background event worker before logging a warning.
-# The HTTP response is already sent (202), this is just for log visibility.
 EVENT_TOOL_LOOP_TIMEOUT = 120
 
-# Directive injected into every system event prompt.
-# The model is instructed to:
-#   1. Immediately call send_message (or equivalent) to acknowledge receipt.
-#   2. If action is needed — do it, then call send_message again with the result.
-#   3. If nothing needs to be done — the first send_message is sufficient.
 _EVENT_DIRECTIVE = (
     "\n\n"
     "This is an automated system event — there is no human in the conversation.\n"
@@ -152,8 +140,6 @@ def extract_chat_id(flask_request) -> Optional[str]:
     Hollama sends requests from /sessions/<id> — the browser automatically
     includes this URL as the Referer header, so we parse it from there.
     Falls back to scanning messages for a legacy chatId field.
-
-    Example Referer: http://host/sessions/e8unjq  →  "e8unjq"
     """
     referer = flask_request.headers.get("Referer", "")
     if referer:
@@ -161,7 +147,6 @@ def extract_chat_id(flask_request) -> Optional[str]:
         if m:
             return m.group(1)
 
-    # Legacy fallback: chatId field in messages (pre-hollama WebUI)
     messages = flask_request.get_json(silent=True) or {}
     for msg in (messages.get("messages") or []):
         chat_id = msg.get("chatId")
@@ -179,10 +164,7 @@ def _last_user_text(messages: List[Dict]) -> str:
 
 
 def _check_event_token() -> Optional[Tuple[Response, int]]:
-    """Return (Response, status) tuple if CHATD_EVENT_TOKEN is set and Bearer doesn't match.
-
-    Returns None when the request is allowed through.
-    """
+    """Return (Response, status) tuple if CHATD_EVENT_TOKEN is set and Bearer doesn't match."""
     if not CHATD_EVENT_TOKEN:
         return None
     auth = request.headers.get("Authorization", "")
@@ -198,7 +180,6 @@ def _check_event_token() -> Optional[Tuple[Response, int]]:
 
 def ensure_system_prompt(
     messages: List[Dict[str, Any]],
-    per_chat_summary: str = "",
     global_summary: str = "",
 ) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
     """Assemble the always-loaded memory block and prepend it as system message.
@@ -206,19 +187,14 @@ def ensure_system_prompt(
     Returns (messages, layer_sizes) where layer_sizes maps layer name to char count:
       L0        mempalace identity + wake-up base
       L0.5g     global compressed summary
-      L0.5p     per-chat compressed summary
       L1        mempalace Essential Story (included in wake_up base)
       L1.5_kg   KG recall sidecar
       L1.5_rag  RAG recall sidecar
     """
-    base_prompt = memory.wake_up(
-        per_chat_summary=per_chat_summary,
-        global_summary=global_summary,
-    )
+    base_prompt = memory.wake_up(global_summary=global_summary)
     layer_sizes: Dict[str, int] = {
         "L0+L1":   len(base_prompt),
         "L0.5g":   len(global_summary),
-        "L0.5p":   len(per_chat_summary),
         "L1.5_kg": 0,
         "L1.5_rag": 0,
     }
@@ -305,11 +281,10 @@ def _log_payload_sizes(
 
     if layer_sizes:
         log.debug(
-            "[%s] system layers: L0+L1=%d L0.5g=%d L0.5p=%d L1.5_kg=%d L1.5_rag=%d  total=%d",
+            "[%s] system layers: L0+L1=%d L0.5g=%d L1.5_kg=%d L1.5_rag=%d  total=%d",
             req_id,
             layer_sizes.get("L0+L1", 0),
             layer_sizes.get("L0.5g", 0),
-            layer_sizes.get("L0.5p", 0),
             layer_sizes.get("L1.5_kg", 0),
             layer_sizes.get("L1.5_rag", 0),
             sizes.get("system", 0),
@@ -355,14 +330,7 @@ def run_tool_loop(
     req_id: str,
     final_num_predict: Optional[int] = None,
 ) -> str:
-    """Run the non-streaming tool loop and return the final assistant text.
-
-    Shared by /api/chat (non-stream), /api/generate (non-stream), and /api/event.
-    Mutates *messages* in-place (appends assistant + tool turns).
-    Returns the final assistant content string.
-
-    final_num_predict: if set, overrides num_predict for the last (answer) round.
-    """
+    """Run the non-streaming tool loop and return the final assistant text."""
     prev_tc_names: Optional[List[str]] = None
     rep = 0
     resp: Dict = {}
@@ -380,8 +348,6 @@ def run_tool_loop(
         tool_calls = msg.get("tool_calls") or []
 
         if not tool_calls:
-            # Final answer round: re-run with boosted num_predict if answer is empty
-            # or if caller requested a guaranteed minimum for the answer.
             content = (msg.get("content") or "").strip()
             if not content and final_num_predict:
                 log.debug(
@@ -524,12 +490,7 @@ def init_tools():
 
 
 def call_tool(name: str, arguments: Dict[str, Any]) -> Any:
-    """Invoke a tool by name.
-
-    Returns the tool result dict on success.  On failure (unknown tool,
-    MCP error, exception) returns an error dict so the model can see what
-    went wrong and potentially correct its call.
-    """
+    """Invoke a tool by name."""
     if name == "mempalacekgquery":
         entity = arguments.get("entity", "")
         if entity:
@@ -568,161 +529,6 @@ def call_tool(name: str, arguments: Dict[str, Any]) -> Any:
     if name in MEMPALACE_WRITE_TOOLS:
         memory.invalidate()
     return result
-
-
-# ── compressed summary + external RAG indexing ────────────────────────────────
-
-_SUMMARIZE_SYSTEM = (
-    "You are a memory compressor for a personal AI assistant.\n"
-    "Task: given an existing summary and new conversation turns, "
-    "produce an UPDATED summary that merges both.\n"
-    "Rules:\n"
-    "- Do NOT repeat facts already in the existing summary verbatim.\n"
-    "- Add only NEW facts, decisions, preferences, open questions from the new turns.\n"
-    "- If a new turn contradicts the summary, update the fact (do not keep both).\n"
-    "- Drop: greetings, tool call details, apologies, filler phrases.\n"
-    "- Output: plain text, max 1250 words, no markdown, no bullet points.\n"
-    "- Language: match the language of the conversation (Russian if Russian)."
-)
-
-_GLOBAL_SUMMARIZE_SYSTEM = (
-    "You are a global activity compressor for a personal AI assistant.\n"
-    "Task: merge the previous global summary with new conversation turns and "
-    "keep only stable medium-term context about recent work, ongoing themes, "
-    "and repeated user interests.\n"
-    "Rules:\n"
-    "- Keep it compact and factual.\n"
-    "- Prefer persistent patterns over one-off details.\n"
-    "- Remove stale or superseded facts.\n"
-    "- Output: plain text, max 900 words, no markdown, no bullet points.\n"
-    "- Language: match the language of the conversation (Russian if Russian)."
-)
-
-
-def _summarize_text(system_prompt: str, previous_summary: str, turns_text: str) -> str:
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": (
-            f"Previous summary:\n{previous_summary or '(empty)'}\n\n"
-            f"New exchanges:\n{turns_text}"
-        )},
-    ]
-    payload = {
-        "model":    CHATD_SUMMARY_MODEL,
-        "messages": messages,
-        "stream":   False,
-        "think":    False,
-        "options":  {"num_predict": 1500, "temperature": 0.2},
-    }
-    backend = backends.get_backend(CHATD_SUMMARY_MODEL)
-    resp = backend.chat_sync(payload)
-    return ((resp.get("message") or {}).get("content") or "").strip()
-
-
-def _update_global_summary(turns_text: str) -> None:
-    with _GLOBAL_SUMMARY_LOCK:
-        previous = memory.read_global_summary()
-        try:
-            new_summary = _summarize_text(_GLOBAL_SUMMARIZE_SYSTEM, previous, turns_text)
-            if new_summary and len(new_summary) >= 20:
-                memory.write_global_summary(new_summary)
-                log.info("[global-summary] updated (%d chars)", len(new_summary))
-        except Exception as e:
-            log.warning("[global-summary] update failed: %s", e)
-
-
-def _compress_summary(session: sess.Session) -> None:
-    """Compress ALL accumulated raw_turns into session.summary."""
-    if not session.raw_turns:
-        return
-
-    turns = list(session.raw_turns)
-    turns_text = "\n".join(
-        f"User: {t['user']}\nAssistant: {t['assistant']}"
-        for t in turns
-    )
-    log.debug(
-        "[session:%s] compressing %d turns (%d chars) with model %s",
-        session.session_id, len(turns), len(turns_text), CHATD_SUMMARY_MODEL,
-    )
-    try:
-        new_summary = _summarize_text(_SUMMARIZE_SYSTEM, session.summary, turns_text)
-        if new_summary and len(new_summary) >= 20:
-            session.summary = new_summary
-            for turn in turns:
-                rag.index_turn(
-                    source=f"session:{session.session_id}",
-                    user=turn["user"],
-                    assistant=turn["assistant"],
-                )
-            _update_global_summary(turns_text)
-            session.raw_turns.clear()
-            session.save()
-            log.info(
-                "[session:%s] summary updated (%d turns → %d chars)",
-                session.session_id, len(turns), len(new_summary),
-            )
-        else:
-            log.warning(
-                "[session:%s] summariser returned empty content, clearing raw_turns anyway",
-                session.session_id,
-            )
-            session.raw_turns.clear()
-            session.save()
-    except Exception as e:
-        log.warning("[session:%s] compress failed: %s", session.session_id, e)
-
-
-def maybe_compress_async(session: sess.Session) -> None:
-    if len(session.raw_turns) < CHATD_COMPRESS_EVERY:
-        return
-    if not session._compress_lock.acquire(blocking=False):
-        log.debug("[session:%s] compress already running, skipping", session.session_id)
-        return
-
-    def _run():
-        try:
-            _compress_summary(session)
-        finally:
-            session._compress_lock.release()
-
-    t = threading.Thread(
-        target=_run,
-        daemon=True,
-        name=f"compress-{session.session_id}",
-    )
-    t.start()
-    log.debug("[session:%s] compression thread started", session.session_id)
-
-
-def _backfill_session(session: sess.Session, messages: List[Dict]) -> None:
-    if session.raw_turns or session.summary:
-        return
-    pairs: List[Dict] = []
-    last_user: Optional[str] = None
-    for m in messages:
-        role = m.get("role")
-        if role == "user":
-            last_user = (m.get("content") or "")
-        elif role == "assistant" and last_user is not None:
-            pairs.append({
-                "user":      last_user,
-                "assistant": (m.get("content") or ""),
-            })
-            last_user = None
-    if not pairs:
-        return
-    session.raw_turns = pairs[-10:]
-    log.info(
-        "[session:%s] backfilled %d turns from incoming history",
-        session.session_id, len(session.raw_turns),
-    )
-    maybe_compress_async(session)
-
-
-def _log_yield(req_id: str, label: str, data: bytes) -> bytes:
-    log.debug("[%s] yield %-12s %d bytes", req_id, label, len(data))
-    return data
 
 
 # ── augmented /api/tags ────────────────────────────────────────────────────────
@@ -905,11 +711,6 @@ def tags():
 
 
 def _options_for_round(options: Dict[str, Any], round_num: int) -> Dict[str, Any]:
-    """Return options dict adjusted for the current tool round.
-
-    Round 0: options as-is.
-    Round 1+: num_predict boosted by TOOL_ROUND_NUM_PREDICT_BOOST.
-    """
     if round_num == 0:
         return options
     boosted = dict(options)
@@ -1088,7 +889,11 @@ def chat_stream_generator(
                 len(last_user_msg), len(final_assistant_content),
             )
             sess.record_turn(session, last_user_msg, final_assistant_content)
-            maybe_compress_async(session)
+            rag.index_turn(
+                source=f"session:{session.session_id}",
+                user=last_user_msg,
+                assistant=final_assistant_content,
+            )
         else:
             log.debug(
                 "[%s] [finally] skipping save: session=%s user_empty=%s answer_empty=%s",
@@ -1118,24 +923,13 @@ def chat():
     chat_id = extract_chat_id(request)
     session = sess.get_session(chat_id) if chat_id else None
 
-    if session:
-        _backfill_session(session, messages)
-
-    history_depth = sum(1 for m in messages if m.get("role") in ("user", "assistant"))
-    if history_depth <= 1:
-        summary = ""
-        log.debug("[%s] fresh chat (depth=%d), suppressing summary", req_id, history_depth)
-    else:
-        summary = session.summary if session else ""
-
     global_summary = memory.read_global_summary()
 
-    log.info("[%s] chat_id=%s summary_len=%d global_summary_len=%d",
-             req_id, chat_id, len(summary), len(global_summary))
+    log.info("[%s] chat_id=%s global_summary_len=%d",
+             req_id, chat_id, len(global_summary))
 
     messages, layer_sizes = ensure_system_prompt(
         messages,
-        per_chat_summary=summary,
         global_summary=global_summary,
     )
 
@@ -1154,7 +948,11 @@ def chat():
                         req_id, session.session_id, len(last_user), len(answer),
                     )
                     sess.record_turn(session, last_user, answer)
-                    maybe_compress_async(session)
+                    rag.index_turn(
+                        source=f"session:{session.session_id}",
+                        user=last_user,
+                        assistant=answer,
+                    )
 
             log.info("[%s] non-stream done, answer_len=%d", req_id, len(answer))
             return jsonify({"model": model, "answer": answer})
@@ -1213,7 +1011,6 @@ def generate():
 
     messages, layer_sizes = ensure_system_prompt(
         messages,
-        per_chat_summary="",
         global_summary=global_summary,
     )
 
@@ -1310,7 +1107,6 @@ def system_event():
     global_summary = memory.read_global_summary()
     messages, layer_sizes = ensure_system_prompt(
         messages,
-        per_chat_summary="",
         global_summary=global_summary,
     )
 
@@ -1327,7 +1123,6 @@ def system_event():
     t = threading.Thread(target=_run, daemon=True, name=f"event-{req_id}")
     t.start()
 
-    # Return immediately — the model will notify the user via send_message tool.
     return jsonify({"ok": True, "req_id": req_id}), 202
 
 

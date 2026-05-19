@@ -3,8 +3,7 @@
 
 Layered memory model:
   L0   mempalace : model identity.txt — always loaded
-  L0.5 chatd     : composed layer — per-chat compressed summary +
-                   global compressed summary — always loaded
+  L0.5 chatd     : global compressed summary — always loaded
                    (disable with CHATD_LAYER_05_ENABLED=false)
   L1   mempalace : Essential Story (wake-up context) — always loaded
   L1.5 chatd     : request-scoped sidecar — KG recall + external RAG
@@ -15,6 +14,10 @@ Layered memory model:
 
 mempalace layers (L0, L1, L2, L3) are never modified here.
 chatd layers (L0.5, L1.5) are purely additive overlays.
+
+Note: per-chat rolling summary (formerly part of L0.5) has been removed.
+Context management is handled by the GUI sending full messages[] and by
+build_model_messages() capping history at 20 user+assistant pairs.
 """
 import functools
 import logging
@@ -77,13 +80,7 @@ def _get_kg() -> Optional[KnowledgeGraph]:
 # ── Public API ────────────────────────────────────────────────────────────────
 
 def kg_recall(entity: str) -> Optional[str]:
-    """Return all current KG facts for *entity* as a compact text block.
-
-    Hot path — uses KnowledgeGraph.query_entity() with today's date so
-    temporal filtering is handled by mempalace itself.  Returns None when
-    no facts are found (caller decides whether to fall back to
-    mempalace_kg_query MCP tool).
-    """
+    """Return all current KG facts for *entity* as a compact text block."""
     kg = _get_kg()
     if kg is None:
         return None
@@ -107,14 +104,6 @@ def kg_recall_from_text(text: str, max_results: int = 5) -> Optional[str]:
 
     Returns None immediately when L1.5 is disabled via
     CHATD_LAYER_15_ENABLED=false.
-
-    Scans the user message for words that might be KG subjects/entities,
-    queries each one via kg_recall(), and returns a deduplicated fact block.
-    Returns None when nothing is found — caller decides whether to fall back
-    to mempalace_kg_query MCP tool.
-
-    Heuristic: words longer than 3 chars that are not in _STOPWORDS.
-    At most 8 entity candidates are checked to bound latency.
     """
     if not LAYER_15_ENABLED:
         return None
@@ -179,11 +168,7 @@ def write_global_summary(summary: str) -> None:
 
 
 def invalidate() -> None:
-    """Close the KnowledgeGraph connection and clear the wake-up cache.
-
-    Call whenever mempalace writes new data (kg_add, add_drawer) so the next
-    wake_up() call re-opens a fresh connection and sees the updated state.
-    """
+    """Close the KnowledgeGraph connection and clear the wake-up cache."""
     global _kg
     if _kg is not None:
         try:
@@ -229,10 +214,7 @@ def _read_kg_block(limit: int = 60) -> str:
 
 
 def _run_wakeup_subprocess() -> str:
-    """Fallback: execute 'python -m mempalace wake-up' via subprocess.
-
-    Used only when the KG SQLite is absent or unreadable (e.g. first run).
-    """
+    """Fallback: execute 'python -m mempalace wake-up' via subprocess."""
     import subprocess
 
     venv_python = os.environ.get("CHATD_MCP_MEMPALACE", "").split()[0] or "python3"
@@ -255,11 +237,7 @@ def _run_wakeup_subprocess() -> str:
 
 @functools.lru_cache(maxsize=1)
 def _wakeup_cached() -> str:
-    """Assemble always-loaded mempalace block (cached, single slot).
-
-    Prefer KnowledgeGraph reads over subprocess to avoid spawn overhead.
-    Falls back to subprocess only when KG file is missing.
-    """
+    """Assemble always-loaded mempalace block (cached, single slot)."""
     identity = _read_identity()
     kg_block = _read_kg_block()
 
@@ -273,16 +251,15 @@ def _wakeup_cached() -> str:
     return text
 
 
-def wake_up(per_chat_summary: str = "", global_summary: str = "") -> str:
+def wake_up(global_summary: str = "") -> str:
     """Assemble the always-loaded system-prompt block.
 
-    L0.5 is a composed layer: both per_chat_summary and global_summary
-    are part of it.  Skipped entirely when CHATD_LAYER_05_ENABLED=false.
+    L0.5 contains only the global activity summary now — per-chat rolling
+    summary has been removed.  Skipped entirely when
+    CHATD_LAYER_05_ENABLED=false.
 
     Parameters
     ----------
-    per_chat_summary:
-        Per-chat rolling compressed summary (L0.5 chat part).
     global_summary:
         Cross-chat activity summary (L0.5 global part).
     """
@@ -291,8 +268,6 @@ def wake_up(per_chat_summary: str = "", global_summary: str = "") -> str:
     if LAYER_05_ENABLED:
         if global_summary:
             parts.append(f"## Recent activity (global)\n{global_summary}")
-        if per_chat_summary:
-            parts.append(f"## Conversation summary\n{per_chat_summary}")
     else:
         log.debug("FastMemory: L0.5 disabled (CHATD_LAYER_05_ENABLED=false)")
     return "\n\n".join(p for p in parts if p)
@@ -301,11 +276,6 @@ def wake_up(per_chat_summary: str = "", global_summary: str = "") -> str:
 # ── Bootstrap ─────────────────────────────────────────────────────────────────
 
 def _check_palace(palace_path: str) -> bool:
-    """Verify that the palace directory exists and contains at least one wing.
-
-    A freshly initialised palace has at minimum a README or a wing subdirectory.
-    Returns True when the palace looks healthy, False otherwise.
-    """
     p = Path(palace_path)
     if not p.exists():
         log.warning("mempalace: palace directory missing: %s", palace_path)
@@ -322,10 +292,6 @@ def _check_palace(palace_path: str) -> bool:
 
 
 def _check_kg(kg_path: str) -> bool:
-    """Verify that the KG SQLite file exists and KnowledgeGraph can open it.
-
-    Returns True when the KG is healthy, False otherwise.
-    """
     p = Path(kg_path)
     if not p.exists():
         log.warning("mempalace: KG database missing: %s", kg_path)
@@ -345,12 +311,7 @@ def _check_kg(kg_path: str) -> bool:
 
 
 def init() -> None:
-    """Run startup health checks and open the KnowledgeGraph connection.
-
-    Logs the status of every required path.  Emits WARNING (not an exception)
-    when something is missing so the service can still start in degraded mode
-    (e.g. answers without memory context until the user initialises mempalace).
-    """
+    """Run startup health checks and open the KnowledgeGraph connection."""
     from mempalace import __version__ as mp_version
     log.info("mempalace: version %s", mp_version)
     log.info(
@@ -366,7 +327,7 @@ def init() -> None:
 
     if palace_ok and kg_ok:
         log.info("mempalace: all checks passed, opening KnowledgeGraph")
-        _get_kg()  # warm up the connection at startup
+        _get_kg()
     else:
         issues = []
         if not palace_ok:

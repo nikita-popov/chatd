@@ -51,7 +51,7 @@ MEMPALACE_WRITE_TOOLS: Set[str] = {
     "mempalace_add_drawer",
 }
 
-# ── Session / summaries ───────────────────────────────────────────────────────────────────
+# ── Session ───────────────────────────────────────────────────────────────────────────────
 CHATD_SESSION_DIR: str = os.environ.get(
     "CHATD_SESSION_DIR", "~/.local/share/chatd/sessions"
 )
@@ -59,10 +59,6 @@ CHATD_SESSION_DIR: str = os.environ.get(
 CHATD_GLOBAL_SUMMARY_PATH: str = os.environ.get(
     "CHATD_GLOBAL_SUMMARY_PATH", "~/.local/share/chatd/global_summary.txt"
 )
-
-CHATD_SUMMARY_MODEL: str = os.environ.get("CHATD_SUMMARY_MODEL", "qwen2.5:1.5b")
-
-CHATD_COMPRESS_EVERY: int = int(os.environ.get("CHATD_COMPRESS_EVERY", "5"))
 
 # ── External RAG store ───────────────────────────────────────────────────────────────────────────
 RAG_ENABLED: bool = os.environ.get("CHATD_RAG_ENABLED", "true").lower() == "true"

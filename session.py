@@ -1,28 +1,20 @@
 #!/usr/bin/env python3
-"""session.py — per-chat session state with L1.5 rolling summary.
+"""session.py — per-chat session state.
 
-Each session is identified by the chatId that ollama-gui sends in every
-message.  State is persisted to a JSON file in CHATD_SESSION_DIR so it
-survives chatd restarts.
+Each session is identified by the chatId that hollama sends in every
+request.  State is persisted as an append-only JSONL chatlog so the
+conversation can be ingested by ``mempalace mine --mode convos`` without
+any extra conversion step.
 
-Schema (JSON on disk)::
-
-    {
-        "session_id": "42",
-        "summary":    "User prefers Emacs.  Working on chatd memory layers.",
-        "raw_turns":  [{"user": "...", "assistant": "..."}],
-        "updated_at": "2026-04-16T15:00:00Z"
-    }
-
-Alongside each .json file a .jsonl sibling is written in Claude Code JSONL
-format so the session can be ingested by ``mempalace mine --mode convos``
-without any extra conversion step.
+The rolling-summary / compression layer has been removed: context
+management is handled entirely by the GUI (it sends the full messages[]
+array on every request) and by build_model_messages() which caps history
+at 20 user+assistant pairs before forwarding to the backend.
 """
 import json
 import logging
 import os
-import threading
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Optional
@@ -37,83 +29,38 @@ _SESSIONS: Dict[str, "Session"] = {}
 @dataclass
 class Session:
     session_id: str
-    summary: str = ""
-    # unsummarized turns accumulated since last compression
-    raw_turns: list = field(default_factory=list, repr=False)
-    # Prevents two concurrent compress threads from running for the same
-    # session (e.g. two requests arriving before the first compress finishes).
-    # acquire(blocking=False) is used so the second caller just skips.
-    _compress_lock: threading.Lock = field(
-        default_factory=threading.Lock, repr=False, compare=False
-    )
 
     # ── persistence ──────────────────────────────────────────────────────────
 
-    def _path(self) -> Path:
+    def _dir(self) -> Path:
         d = Path(os.path.expanduser(CHATD_SESSION_DIR))
         d.mkdir(parents=True, exist_ok=True)
-        return d / f"{self.session_id}.json"
+        return d
+
+    def _json_path(self) -> Path:
+        return self._dir() / f"{self.session_id}.json"
+
+    def _jsonl_path(self) -> Path:
+        return self._dir() / f"{self.session_id}.jsonl"
 
     def save(self) -> None:
-        """Persist summary and raw_turns to disk, then refresh the JSONL chatlog."""
+        """Touch the JSON marker so the session directory entry exists."""
         data = {
             "session_id": self.session_id,
-            "summary":    self.summary,
-            "raw_turns":  self.raw_turns,
             "updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         }
-        path = self._path()
+        path = self._json_path()
         try:
             path.write_text(
                 json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
             )
-            log.debug(
-                "[session:%s] saved to %s (summary=%d chars, raw_turns=%d)",
-                self.session_id, path, len(self.summary), len(self.raw_turns),
-            )
+            log.debug("[session:%s] saved marker to %s", self.session_id, path)
         except Exception as e:
             log.warning("[session:%s] save failed (path=%s): %s", self.session_id, path, e)
-            return
-
-        #self._save_chatlog()
-
-    def _save_chatlog(self) -> None:
-        """Write raw_turns as Claude Code JSONL for ``mempalace mine --mode convos``.
-
-        Format: one JSON object per line, alternating human/assistant turns.
-        normalize.py in mempalace detects this schema via the ``type`` field
-        and applies strip_noise + tool_use capture automatically.
-        """
-        if not self.raw_turns:
-            return
-        log_path = self._path().with_suffix(".jsonl")
-        lines = []
-        for turn in self.raw_turns:
-            lines.append(json.dumps(
-                {"type": "human",
-                 "message": {"role": "human", "content": turn["user"]}},
-                ensure_ascii=False,
-            ))
-            lines.append(json.dumps(
-                {"type": "assistant",
-                 "message": {"role": "assistant", "content": turn["assistant"]}},
-                ensure_ascii=False,
-            ))
-        try:
-            log_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-            log.debug(
-                "[session:%s] chatlog jsonl written to %s (%d turns)",
-                self.session_id, log_path, len(self.raw_turns),
-            )
-        except Exception as e:
-            log.warning(
-                "[session:%s] chatlog write failed (path=%s): %s",
-                self.session_id, log_path, e,
-            )
 
     def append_chatlog(self, user: str, assistant: str) -> None:
-        """Append one turn to the persistent chatlog — never truncates."""
-        log_path = self._path().with_suffix(".jsonl")
+        """Append one turn to the persistent JSONL chatlog — never truncates."""
+        log_path = self._jsonl_path()
         lines = [
             json.dumps({"type": "human",
                         "message": {"role": "human", "content": user}},
@@ -130,24 +77,12 @@ class Session:
 
     @classmethod
     def load(cls, session_id: str) -> "Session":
-        """Load session from disk, or return a blank one."""
+        """Load session from disk marker, or return a blank one."""
         path = Path(os.path.expanduser(CHATD_SESSION_DIR)) / f"{session_id}.json"
         if path.exists():
-            try:
-                data = json.loads(path.read_text(encoding="utf-8"))
-                s = cls(
-                    session_id=session_id,
-                    summary=data.get("summary", ""),
-                    raw_turns=data.get("raw_turns", []),
-                )
-                log.info(
-                    "[session:%s] loaded from %s (summary=%d chars, raw_turns=%d)",
-                    session_id, path, len(s.summary), len(s.raw_turns),
-                )
-                return s
-            except Exception as e:
-                log.warning("[session:%s] load failed (path=%s): %s", session_id, path, e)
-        log.debug("[session:%s] no file at %s, starting fresh", session_id, path)
+            log.info("[session:%s] loaded from %s", session_id, path)
+        else:
+            log.debug("[session:%s] no file at %s, starting fresh", session_id, path)
         return cls(session_id=session_id)
 
 
@@ -159,13 +94,10 @@ def get_session(session_id: str) -> Session:
 
 
 def record_turn(session: Session, user_msg: str, assistant_msg: str) -> None:
-    """Append a Q/A pair to raw_turns and immediately persist to disk."""
-    session.raw_turns.append({"user": user_msg, "assistant": assistant_msg})
-    log.debug(
-        "[session:%s] recorded turn (raw_turns=%d, total_chars=%d)",
-        session.session_id,
-        len(session.raw_turns),
-        sum(len(t["user"]) + len(t["assistant"]) for t in session.raw_turns),
-    )
+    """Append a Q/A pair to the JSONL chatlog and touch the JSON marker."""
     session.append_chatlog(user_msg, assistant_msg)
     session.save()
+    log.debug(
+        "[session:%s] turn recorded (user=%d chars, assistant=%d chars)",
+        session.session_id, len(user_msg), len(assistant_msg),
+    )
