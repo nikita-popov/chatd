@@ -27,6 +27,11 @@ TOOLS_ALLOWED: Set[str] = set(
 # ── Tool rounds ──────────────────────────────────────────────────────────────────
 MAX_TOOL_ROUNDS: int = int(os.environ.get("CHATD_MAX_TOOL_ROUNDS", "5"))
 
+# ── History window ───────────────────────────────────────────────────────────────
+# Number of user+assistant pairs to keep when trimming history before sending
+# to the backend.  Increase when using a model with a large context window.
+MAX_HISTORY_TURNS: int = int(os.environ.get("CHATD_MAX_HISTORY_TURNS", "20"))
+
 # ── Sampling ───────────────────────────────────────────────────────────────────────
 DEFAULT_OPTIONS: Dict[str, Any] = {
     "num_predict":    int(os.environ.get("CHATD_NUM_PREDICT",    "768")),
@@ -86,7 +91,7 @@ CHATD_EVENT_TOKEN: str = os.environ.get("CHATD_EVENT_TOKEN", "")
 # Model used to process incoming events (can differ from chat model).
 CHATD_EVENT_MODEL: str = os.environ.get("CHATD_EVENT_MODEL", "")
 
-# ── MCP auto-discovery prefix ───────────────────────────────────────────────────────────────────────────────────────────────
+# ── MCP auto-discovery prefix ───────────────────────────────────────────────────────────────────────
 MCP_ENV_PREFIX: str = "CHATD_MCP_"
 
 # ── Tool description overrides ──────────────────────────────────────────────────────────────────────────────────────────────────────

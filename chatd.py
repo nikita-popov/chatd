@@ -24,11 +24,13 @@ from config import (
     TOOLS_ALLOWED,
     DEFAULT_OPTIONS,
     MAX_TOOL_ROUNDS,
+    MAX_HISTORY_TURNS,
     MEMPALACE_WRITE_TOOLS,
     TOOL_OVERRIDE,
     TOOL_DESCRIPTION_OVERRIDES,
     CHATD_EVENT_TOKEN,
     CHATD_EVENT_MODEL,
+    OPENROUTER_API_MODELS,
 )
 from backends.ollama import OLLAMA_API
 from backends.openrouter import fetch_model_info, OPENROUTER_PREFIX
@@ -107,6 +109,12 @@ def make_chunk(model: str, content: str, done: bool = False) -> bytes:
 
 def make_keepalive(model: str) -> bytes:
     return make_chunk(model, "")
+
+
+def _log_yield(req_id: str, label: str, data: bytes) -> bytes:
+    """Log a yielded chunk and return it unchanged."""
+    log.debug("[%s] yield %-12s %d bytes", req_id, label, len(data))
+    return data
 
 
 def proxy_get(path: str) -> Response:
@@ -226,7 +234,7 @@ def ensure_system_prompt(
 
 def build_model_messages(
     raw_messages: List[Dict],
-    max_history_turns: int = 20,
+    max_history_turns: int = MAX_HISTORY_TURNS,
 ) -> List[Dict]:
     """Sanitise messages for the backend.
 
@@ -234,7 +242,8 @@ def build_model_messages(
     - Remove <think>…</think> blocks from previous assistant turns.
     - Preserve tool_calls on assistant messages.
     - Keep system message as-is.
-    - Limit history to *max_history_turns* user+assistant pairs.
+    - Limit history to *max_history_turns* user+assistant pairs
+      (controlled by CHATD_MAX_HISTORY_TURNS env var, default 20).
     """
     system: Optional[Dict] = None
     turns: List[Dict] = []
