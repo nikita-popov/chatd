@@ -255,7 +255,7 @@ def _or_response_meta(r: requests.Response) -> str:
         parts.append(f"provider={provider}")
     if gen_id:
         parts.append(f"generation={gen_id}")
-    return " '.join(parts)
+    return " ".join(parts)
 
 
 def _log_http_error(exc: HTTPError) -> str:
