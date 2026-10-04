@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import atexit
+import hashlib
 import json
 import logging
 import os
@@ -92,6 +93,19 @@ _EVENT_DIRECTIVE = (
 
 
 # ── helpers ────────────────────────────────────────────────────────────────────
+
+def _tc_signature(tc_list: List[Dict]) -> str:
+    """Stable hash of tool_calls, including arguments."""
+    parts = []
+    for tc in tc_list:
+        fn = tc.get("function") or {}
+        name = fn.get("name") or ""
+        args = fn.get("arguments")
+        if isinstance(args, dict):
+            args = json.dumps(args, sort_keys=True, ensure_ascii=False)
+        parts.append(f"{name}:{args}")
+    return hashlib.sha256("|".join(parts).encode()).hexdigest()[:16]
+
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f") + "000Z"
@@ -823,7 +837,7 @@ def chat_stream_generator(
     layer_sizes: Dict[str, int],
     req_id: str = "-",
 ) -> Generator[bytes, None, None]:
-    prev_tool_names: Optional[List[str]] = None
+    prev_tool_calls: Optional[List[str]] = None
     repeat_count = 0
 
     last_user_msg = _last_user_text(messages)
@@ -931,19 +945,32 @@ def chat_stream_generator(
                 log.info("[%s] stream complete, no more tool rounds", req_id)
                 break
 
-            current_tool_names = [
-                (tc.get("function") or {}).get("name") for tc in last_tool_calls
-            ]
-            if current_tool_names == prev_tool_names:
+            current_sig = _tc_signature(last_tool_calls)
+            prev_sig = _tc_signature(prev_tool_calls) if prev_tool_calls else None
+
+            if current_sig == prev_sig:
                 repeat_count += 1
-                if repeat_count >= 2:
+                if repeat_count >= 3:
                     log.warning("[%s] tool loop detected (%s x%d), aborting",
-                                req_id, current_tool_names, repeat_count)
-                    yield make_chunk(model, "\n[ошибка: цикл инструментов, остановлено]\n", done=True)
-                    return
+                                req_id, current_sig, repeat_count)
+                    break
             else:
                 repeat_count = 0
-            prev_tool_names = current_tool_names
+            prev_tool_calls = last_tool_calls
+
+            #current_tool_names = [
+            #    (tc.get("function") or {}).get("name") for tc in last_tool_calls
+            #]
+            #if current_tool_names == prev_tool_calls:
+            #    repeat_count += 1
+            #    if repeat_count >= 3:
+            #        log.warning("[%s] tool loop detected (%s x%d), aborting",
+            #                    req_id, current_tool_names, repeat_count)
+            #        yield make_chunk(model, "\n[ошибка: цикл инструментов, остановлено]\n", done=True)
+            #        return
+            #else:
+            #    repeat_count = 0
+            #prev_tool_names = current_tool_names
 
             assistant_entry: Dict[str, Any] = {
                 "role":       "assistant",
@@ -985,6 +1012,46 @@ def chat_stream_generator(
 
             yield _log_yield(req_id, "keepalive/tr", make_keepalive(model))
             last_tool_calls = None
+            # End for
+
+        # Force without tools
+        if not final_assistant_content:
+            log.info("[%s] no final content after loop — forcing final answer without tools",
+                     req_id)
+            final_built = build_model_messages(messages)
+            final_payload = make_ollama_payload(model, final_built, options, stream=True)
+            final_payload.pop("tools", None)
+
+            try:
+                final_stream = backend.chat_stream(final_payload)
+                remapper_final = ThinkingRemapper(model)
+                for line in final_stream:
+                    if not line:
+                        continue
+                    try:
+                        chunk = json.loads(
+                            line.decode("utf-8") if isinstance(line, bytes) else line
+                        )
+                    except json.JSONDecodeError:
+                        continue
+
+                    done = chunk.get("done", False)
+                    if done:
+                        closing = remapper_final.close()
+                        if closing:
+                            yield _log_yield(req_id, "final/close", closing)
+                        final_assistant_content = remapper_final.content_acc
+                        yield _log_yield(req_id, "final/done", remapper_final.feed(line))
+                        break
+
+                    out = remapper_final.feed(line)
+                    yield _log_yield(req_id, "final/chunk", out)
+
+            except Exception as e:
+                log.error("[%s] final answer failed: %s", req_id, e)
+                fallback = f"\n[не удалось получить финальный ответ: {e}]\n"
+                final_assistant_content = fallback
+                yield make_chunk(model, fallback, done=True)
 
         log.debug("[%s] generator exiting normally", req_id)
 
