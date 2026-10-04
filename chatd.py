@@ -407,6 +407,16 @@ def run_tool_loop(
             "content":    msg.get("content") or "",
             "tool_calls": tool_calls,
         })
+        assistant_msg: Dict[str, Any] = {
+            "role":       "assistant",
+            "content":    msg.get("content") or "",
+            "tool_calls": tool_calls,
+        }
+        if msg.get("reasoning_content"):
+            assistant_msg["reasoning_content"] = msg["reasoning_content"]
+            
+        messages.append(assistant_msg)
+        
         for tc in tool_calls:
             fn   = tc.get("function") or {}
             name = fn.get("name") or "unknown"
@@ -840,6 +850,7 @@ def chat_stream_generator(
             )
 
             last_tool_calls: Optional[List[Dict]] = None
+            last_reasoning: str = ""
             chunk_count = 0
             remapper = ThinkingRemapper(model)
 
@@ -864,6 +875,8 @@ def chat_stream_generator(
                     msg  = chunk.get("message") or {}
                     done = chunk.get("done", False)
                     tc   = msg.get("tool_calls")
+                    if msg.get("reasoning_content"):
+                        last_reasoning += msg["reasoning_content"]
 
                     if tc:
                         log.info("[%s] tool_calls: %s", req_id,
@@ -929,6 +942,12 @@ def chat_stream_generator(
                 "content":    remapper.content_acc,
                 "tool_calls": last_tool_calls,
             })
+
+            if last_reasoning:
+                assistant_entry["reasoning_content"] = last_reasoning
+
+            messages.append(assistant_entry)
+            last_reasoning = ""
 
             for tc in last_tool_calls:
                 fn        = tc.get("function") or {}
