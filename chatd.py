@@ -766,7 +766,7 @@ def tags():
             content_type=r.headers.get("Content-Type", "application/json"),
         )
 
-     if not r.ok:
+    if not r.ok:
         return jsonify(data), r.status_code
 
     ollama_entries = data.setdefault("models", [])
