@@ -48,3 +48,8 @@ VICTORIA_URL=http://localhost:8428
 #CHATD_REPEAT_PENALTY=1.05
 #CHATD_NUM_CTX=8192
 #CHATD_NUM_PREDICT=768
+
+#DEEPSEEK_API_KEY=sk-...
+
+#CHATD_DEEPSEEK_API=https://api.deepseek.com
+#CHATD_DEEPSEEK_MODELS=deepseek-chat,deepseek-reasoner

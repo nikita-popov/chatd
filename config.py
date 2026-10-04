@@ -115,3 +115,17 @@ def _load_tool_descriptions() -> Dict[str, str]:
 
 
 TOOL_DESCRIPTION_OVERRIDES: Dict[str, str] = _load_tool_descriptions()
+
+DEEPSEEK_API = os.environ.get(
+    "CHATD_DEEPSEEK_API",
+    "https://api.deepseek.com",
+)
+
+DEEPSEEK_MODELS = [
+    m.strip()
+    for m in os.environ.get(
+        "CHATD_DEEPSEEK_MODELS",
+        "deepseek-flash",
+    ).split(",")
+    if m.strip()
+]
