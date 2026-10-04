@@ -943,6 +943,11 @@ def chat_stream_generator(
                 "tool_calls": last_tool_calls,
             })
 
+            assistant_entry: Dict[str, Any] = {
+                "role":       "assistant",
+                "content":    remapper.content_acc,
+                "tool_calls": last_tool_calls,
+            }
             if last_reasoning:
                 assistant_entry["reasoning_content"] = last_reasoning
 
