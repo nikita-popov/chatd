@@ -367,6 +367,11 @@ def run_tool_loop(
         round_options = _options_for_round(options, i)
         built = build_model_messages(messages)
         payload = make_ollama_payload(model, built, round_options, stream=False)
+
+        if i == MAX_TOOL_ROUNDS - 1:
+            payload.pop("tools", None)
+            log.info("[%s] tool_loop round %d: tools stripped — forcing final answer", req_id, i)
+        
         _log_payload_sizes(req_id, built, len(TOOLS), layer_sizes if i == 0 else None)
         log.debug("[%s] tool_loop round %d", req_id, i)
 
@@ -837,6 +842,14 @@ def chat_stream_generator(
             round_options = _options_for_round(options, round_num)
             built_messages = build_model_messages(messages)
             payload = make_ollama_payload(model, built_messages, round_options, stream=True)
+
+            # On the last allowed round, strip tools so the model MUST produce text
+            is_last_round = (round_num == MAX_TOOL_ROUNDS - 1)
+            if is_last_round:
+                payload.pop("tools", None)
+                log.info("[%s] round %d: tools stripped - forcing final answer",
+                         req_id, round_num)
+            
             _log_payload_sizes(req_id, built_messages, len(TOOLS),
                                layer_sizes if round_num == 0 else None)
             log.debug(
