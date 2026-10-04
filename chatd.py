@@ -402,11 +402,6 @@ def run_tool_loop(
             rep = 0
         prev_tc_names = tc_names
 
-        messages.append({
-            "role":       "assistant",
-            "content":    msg.get("content") or "",
-            "tool_calls": tool_calls,
-        })
         assistant_msg: Dict[str, Any] = {
             "role":       "assistant",
             "content":    msg.get("content") or "",
@@ -936,12 +931,6 @@ def chat_stream_generator(
             else:
                 repeat_count = 0
             prev_tool_names = current_tool_names
-
-            messages.append({
-                "role":       "assistant",
-                "content":    remapper.content_acc,
-                "tool_calls": last_tool_calls,
-            })
 
             assistant_entry: Dict[str, Any] = {
                 "role":       "assistant",
