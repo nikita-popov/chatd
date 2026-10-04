@@ -32,7 +32,7 @@ from config import (
     CHATD_EVENT_MODEL,
     OPENROUTER_API_MODELS,
     DEEPSEEK_API,
-    DEEPSEEK_MODELS,
+    DEEPSEEK_API_MODELS,
 )
 from backends.ollama import OLLAMA_API
 from backends.openrouter import fetch_model_info, OPENROUTER_PREFIX

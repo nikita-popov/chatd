@@ -121,7 +121,7 @@ DEEPSEEK_API = os.environ.get(
     "https://api.deepseek.com",
 )
 
-DEEPSEEK_MODELS = [
+DEEPSEEK_API_MODELS = [
     m.strip()
     for m in os.environ.get(
         "CHATD_DEEPSEEK_MODELS",
