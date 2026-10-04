@@ -31,6 +31,8 @@ from config import (
     CHATD_EVENT_TOKEN,
     CHATD_EVENT_MODEL,
     OPENROUTER_API_MODELS,
+    DEEPSEEK_API,
+    DEEPSEEK_MODELS,
 )
 from backends.ollama import OLLAMA_API
 from backends.openrouter import fetch_model_info, OPENROUTER_PREFIX
@@ -597,6 +599,27 @@ def _build_or_tags() -> List[Dict[str, Any]]:
     return result
 
 
+def _build_deepseek_tags() -> List[Dict[str, Any]]:
+    return [
+        {
+            "name": f"deepseek/{model}",
+            "model": f"deepseek/{model}",
+            "modified_at": now_iso(),
+            "size": 0,
+            "digest": "deepseek-api",
+            "details": {
+                "parent_model": "",
+                "format": "api",
+                "family": "deepseek",
+                "families": ["deepseek"],
+                "parameter_size": "API",
+                "quantization_level": "remote",
+            },
+        }
+        for model in DEEPSEEK_API_MODELS
+    ]
+
+
 # ── routes ──────────────────────────────────────────────────────────────────────
 
 @app.get("/")
@@ -691,6 +714,28 @@ def show_model():
         }
         return jsonify(result)
 
+    if model.startswith("deepseek/"):
+        model_name = model.removeprefix("deepseek/")
+
+        return jsonify({
+            "license": "DeepSeek API",
+            "modelfile": "",
+            "parameters": "",
+            "template": "",
+            "details": {
+                "parent_model": "",
+                "format": "api",
+                "family": "deepseek",
+                "families": ["deepseek"],
+                "parameter_size": "API",
+                "quantization_level": "remote",
+            },
+            "model_info": {
+                "general.architecture": "deepseek",
+                "general.basename": model_name,
+            },
+        })
+
     try:
         r = requests.post(
             f"{OLLAMA_API}/api/show",
@@ -711,12 +756,6 @@ def show_model():
 @app.get("/api/tags")
 def tags():
     r = requests.get(f"{OLLAMA_API}/api/tags", timeout=600)
-    if not OPENROUTER_API_MODELS:
-        return Response(
-            r.content,
-            status=r.status_code,
-            content_type=r.headers.get("Content-Type", "application/json"),
-        )
 
     try:
         data = r.json()
@@ -727,13 +766,32 @@ def tags():
             content_type=r.headers.get("Content-Type", "application/json"),
         )
 
+     if not r.ok:
+        return jsonify(data), r.status_code
+
+    ollama_entries = data.setdefault("models", [])
     or_entries = _build_or_tags()
+    deepseek_entries = _build_deepseek_tags()
+
+    #or_entries = _build_or_tags()
+    #data.setdefault("models", [])
+    #data["models"].extend(or_entries)
+
+    #entries = ollama_entries
+    #entries.extend(or_entries)
+    #entries.extend(deepseek_entries)
+
     data.setdefault("models", [])
+    data["models"].extend(ollama_entries)
     data["models"].extend(or_entries)
-    log.info("[tags] ollama=%d or=%d total=%d",
-             len(data["models"]) - len(or_entries),
-             len(or_entries),
-             len(data["models"]))
+    data["models"].extend(deepseek_entries)
+    
+    log.info(
+        "[tags] ollama=%d or=%d deepseek=%d total=%d",
+        len(ollama_entries),
+        len(or_entries),
+        len(deepseek_entries),
+        len(data["models"]))
     return jsonify(data)
 
 
