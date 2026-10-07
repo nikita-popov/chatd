@@ -149,6 +149,11 @@ BG_SESSION_ID: str = os.environ.get("CHATD_BG_SESSION_ID", "background")
 # (e.g. "qwen3:8b" → Ollama, "deepseek/deepseek-flash" → DeepSeek).
 BG_MODEL: str = os.environ.get("CHATD_BG_MODEL", "qwen3:8b")
 
+# Max output tokens per background tick. Background answers are short by
+# design; keep this well below the chat default to avoid 30-minute ticks
+# on CPU-only hosts.
+BG_NUM_PREDICT: int = int(os.environ.get("CHATD_BG_NUM_PREDICT", "256"))
+
 # Max tool rounds per tick (reserved for Planner/Executor — next PR).
 BG_MAX_TOOL_ROUNDS: int = int(os.environ.get("CHATD_BG_MAX_TOOL_ROUNDS", "5"))
 

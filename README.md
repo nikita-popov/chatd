@@ -228,6 +228,7 @@ All `CHATD_RAG_*` variables are documented in `.env.example`.
 | `CHATD_BG_STATE_DIR` | `~/.local/share/chatd/bg` | Background worker state |
 | `CHATD_BG_SESSION_ID` | `background` | Isolated session id |
 | `CHATD_BG_MODEL` | `qwen3:8b` | Model for background worker |
+| `CHATD_BG_NUM_PREDICT` | `256` | Max output tokens per background tick |
 | `CHATD_BG_MAX_TOOL_ROUNDS` | `5` | Max tool rounds per tick (reserved) |
 | `CHATD_BG_TOOLS_ALLOWED` | *(read-only list)* | Tools visible to background |
 

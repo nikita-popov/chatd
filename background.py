@@ -33,6 +33,7 @@ from typing import Any, Dict, Optional
 
 from config import (
     BG_MODEL,
+    BG_NUM_PREDICT,
     BG_SESSION_ID,
     BG_STATE_DIR,
 )
@@ -143,6 +144,10 @@ def _one_shot(payload: Dict[str, Any]) -> str:
         "options":  dict(DEFAULT_OPTIONS),
         # No "tools" key — background tick never invokes MCP in PR B+.
     }
+
+    if not THINKING:
+        body["think"] = False
+
     backend = backends.get_backend(BG_MODEL)
     resp = backend.chat_sync(body)
     msg = resp.get("message") or {}
