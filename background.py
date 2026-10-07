@@ -134,7 +134,7 @@ def _one_shot(payload: Dict[str, Any]) -> str:
     primitive and layer tool loops on top.
     """
     import backends
-    from config import DEFAULT_OPTIONS
+    from config import DEFAULT_OPTIONS, THINKING
 
     messages = _build_bg_messages(payload)
     body = {
