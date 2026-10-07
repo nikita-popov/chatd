@@ -4,9 +4,10 @@ Selects a backend instance based on the model name prefix.
 Add entries to _REGISTRY to register new backends.
 
 Model routing rules (checked in order):
-  "or/"   prefix  -> OpenRouter
-  "onnx/" prefix  -> ONNX
-  (default)       -> Ollama
+  "or/"       prefix  -> OpenRouter
+  "onnx/"     prefix  -> ONNX
+  "deepseek/" prefix  -> DeepSeek
+  (default)           -> Ollama
 """
 from __future__ import annotations
 

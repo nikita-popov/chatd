@@ -1,14 +1,14 @@
 import json
 import logging
 import os
+import requests
 import uuid
 from typing import Any, Dict, Generator, List
 
-import requests
+from config import DEEPSEEK_API
 
 log = logging.getLogger("chatd.backends.deepseek")
 
-DEEPSEEK_API = os.environ.get("CHATD_DEEPSEEK_API", "https://api.deepseek.com")
 DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
 
 _PREFIX = "deepseek/"

@@ -3,8 +3,6 @@
 
 Layered memory model:
   L0   mempalace : model identity.txt — always loaded
-  L0.5 chatd     : global compressed summary — always loaded
-                   (disable with CHATD_LAYER_05_ENABLED=false)
   L1   mempalace : Essential Story (wake-up context) — always loaded
   L1.5 chatd     : request-scoped sidecar — KG recall + external RAG
                    injected per request — always loaded
@@ -13,7 +11,7 @@ Layered memory model:
   L3   mempalace : Deep Search (full semantic query) — when explicitly asked
 
 mempalace layers (L0, L1, L2, L3) are never modified here.
-chatd layers (L0.5, L1.5) are purely additive overlays.
+chatd layer (L1.5) is a purely additive overlays.
 
 Note: per-chat rolling summary (formerly part of L0.5) has been removed.
 Context management is handled by the GUI sending full messages[] and by
@@ -29,7 +27,6 @@ from typing import Optional
 from mempalace.knowledge_graph import KnowledgeGraph
 
 from config import (
-    CHATD_GLOBAL_SUMMARY_PATH,
     MEMPALACE_KG_PATH,
     MEMPALACE_PALACE_PATH,
 )
@@ -46,7 +43,6 @@ def _bool_env(name: str, default: bool = True) -> bool:
     return val not in ("false", "0", "no", "off")
 
 
-LAYER_05_ENABLED: bool = _bool_env("CHATD_LAYER_05_ENABLED", default=True)
 LAYER_15_ENABLED: bool = _bool_env("CHATD_LAYER_15_ENABLED", default=True)
 
 # ── L1: in-process KG ───────────────────────────────────────────────────────
@@ -145,28 +141,6 @@ def kg_recall_from_text(text: str, max_results: int = 5) -> Optional[str]:
     return result
 
 
-def read_global_summary() -> str:
-    """Read L0.5 global activity summary from disk."""
-    path = Path(os.path.expanduser(CHATD_GLOBAL_SUMMARY_PATH))
-    try:
-        return path.read_text(encoding="utf-8").strip()
-    except FileNotFoundError:
-        return ""
-    except Exception as e:
-        log.warning("global summary read failed: %s", e)
-        return ""
-
-
-def write_global_summary(summary: str) -> None:
-    """Persist L0.5 global activity summary to disk."""
-    path = Path(os.path.expanduser(CHATD_GLOBAL_SUMMARY_PATH))
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(summary.strip(), encoding="utf-8")
-    except Exception as e:
-        log.warning("global summary write failed: %s", e)
-
-
 def invalidate() -> None:
     """Close the KnowledgeGraph connection and clear the wake-up cache."""
     global _kg
@@ -251,26 +225,9 @@ def _wakeup_cached() -> str:
     return text
 
 
-def wake_up(global_summary: str = "") -> str:
-    """Assemble the always-loaded system-prompt block.
-
-    L0.5 contains only the global activity summary now — per-chat rolling
-    summary has been removed.  Skipped entirely when
-    CHATD_LAYER_05_ENABLED=false.
-
-    Parameters
-    ----------
-    global_summary:
-        Cross-chat activity summary (L0.5 global part).
-    """
-    base = _wakeup_cached()   # L0 + L1, mempalace, cached
-    parts = [base]
-    if LAYER_05_ENABLED:
-        if global_summary:
-            parts.append(f"## Recent activity (global)\n{global_summary}")
-    else:
-        log.debug("FastMemory: L0.5 disabled (CHATD_LAYER_05_ENABLED=false)")
-    return "\n\n".join(p for p in parts if p)
+def wake_up() -> str:
+    """Assemble the always-loaded system-prompt block (L0 + L1 from mempalace)."""
+    return _wakeup_cached()
 
 
 # ── Bootstrap ─────────────────────────────────────────────────────────────────
@@ -314,10 +271,7 @@ def init() -> None:
     """Run startup health checks and open the KnowledgeGraph connection."""
     from mempalace import __version__ as mp_version
     log.info("mempalace: version %s", mp_version)
-    log.info(
-        "FastMemory: layer flags — L0.5=%s L1.5=%s",
-        LAYER_05_ENABLED, LAYER_15_ENABLED,
-    )
+    log.info("FastMemory: layer flags - L1.5=%s", LAYER_15_ENABLED)
 
     palace_path = os.path.expanduser(MEMPALACE_PALACE_PATH)
     kg_path     = os.path.expanduser(MEMPALACE_KG_PATH)

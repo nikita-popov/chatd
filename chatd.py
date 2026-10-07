@@ -294,8 +294,11 @@ def build_model_messages(
             continue
 
         entry: Dict[str, Any] = {"role": role, "content": content}
-        if role == "assistant" and m.get("tool_calls"):
-            entry["tool_calls"] = m["tool_calls"]
+        if role == "assistant":
+            if m.get("tool_calls"):
+                entry["tool_calls"] = m["tool_calls"]
+            if m.get("reasoning_content"):
+                entry["reasoning_content"] = m["reasoning_content"]
         turns.append(entry)
 
     if len(turns) > max_history_turns * 2:
@@ -372,7 +375,7 @@ def run_tool_loop(
     final_num_predict: Optional[int] = None,
 ) -> str:
     """Run the non-streaming tool loop and return the final assistant text."""
-    prev_tc_names: Optional[List[str]] = None
+    prev_tc_sig: Optional[str] = None
     rep = 0
     resp: Dict = {}
     backend = backends.get_backend(model)
@@ -385,7 +388,7 @@ def run_tool_loop(
         if i == MAX_TOOL_ROUNDS - 1:
             payload.pop("tools", None)
             log.info("[%s] tool_loop round %d: tools stripped — forcing final answer", req_id, i)
-        
+
         _log_payload_sizes(req_id, built, len(TOOLS), layer_sizes if i == 0 else None)
         log.debug("[%s] tool_loop round %d", req_id, i)
 
@@ -412,14 +415,14 @@ def run_tool_loop(
         tc_names = [(tc.get("function") or {}).get("name") for tc in tool_calls]
         log.info("[%s] tool_calls: %s", req_id, tc_names)
 
-        if tc_names == prev_tc_names:
+        current_sig = _tc_signature(tool_calls)
+        if current_sig == prev_tc_sig:
             rep += 1
-            if rep >= 2:
-                log.warning("[%s] tool loop detected, aborting", req_id)
+            if rep >= 3:
                 break
         else:
             rep = 0
-        prev_tc_names = tc_names
+        prev_tc_sig = current_sig
 
         assistant_msg: Dict[str, Any] = {
             "role":       "assistant",
@@ -428,9 +431,9 @@ def run_tool_loop(
         }
         if msg.get("reasoning_content"):
             assistant_msg["reasoning_content"] = msg["reasoning_content"]
-            
+
         messages.append(assistant_msg)
-        
+
         for tc in tool_calls:
             fn   = tc.get("function") or {}
             name = fn.get("name") or "unknown"
@@ -542,13 +545,13 @@ def init_tools():
 
 def call_tool(name: str, arguments: Dict[str, Any]) -> Any:
     """Invoke a tool by name."""
-    if name == "mempalacekgquery":
+    if name == "mempalace_kg_query":
         entity = arguments.get("entity", "")
         if entity:
             fast = memory.kg_recall(entity)
             if fast:
                 log.info(
-                    "[tool] mempalacekgquery intercepted by FastMemory (entity=%s)",
+                    "[tool] mempalace_kg_query intercepted by FastMemory (entity=%s)",
                     entity,
                 )
                 return {"facts": fast, "source": "fast_memory"}
@@ -738,8 +741,8 @@ def show_model():
         }
         return jsonify(result)
 
-    if model.startswith("deepseek/"):
-        model_name = model.removeprefix("deepseek/")
+    if model_name.startswith("deepseek/"):
+        model_name = model_name.removeprefix("deepseek/")
 
         return jsonify({
             "license": "DeepSeek API",
@@ -797,19 +800,11 @@ def tags():
     or_entries = _build_or_tags()
     deepseek_entries = _build_deepseek_tags()
 
-    #or_entries = _build_or_tags()
-    #data.setdefault("models", [])
-    #data["models"].extend(or_entries)
-
-    #entries = ollama_entries
-    #entries.extend(or_entries)
-    #entries.extend(deepseek_entries)
-
     data.setdefault("models", [])
     data["models"].extend(ollama_entries)
     data["models"].extend(or_entries)
     data["models"].extend(deepseek_entries)
-    
+
     log.info(
         "[tags] ollama=%d or=%d deepseek=%d total=%d",
         len(ollama_entries),
@@ -863,7 +858,7 @@ def chat_stream_generator(
                 payload.pop("tools", None)
                 log.info("[%s] round %d: tools stripped - forcing final answer",
                          req_id, round_num)
-            
+
             _log_payload_sizes(req_id, built_messages, len(TOOLS),
                                layer_sizes if round_num == 0 else None)
             log.debug(
@@ -958,20 +953,6 @@ def chat_stream_generator(
                 repeat_count = 0
             prev_tool_calls = last_tool_calls
 
-            #current_tool_names = [
-            #    (tc.get("function") or {}).get("name") for tc in last_tool_calls
-            #]
-            #if current_tool_names == prev_tool_calls:
-            #    repeat_count += 1
-            #    if repeat_count >= 3:
-            #        log.warning("[%s] tool loop detected (%s x%d), aborting",
-            #                    req_id, current_tool_names, repeat_count)
-            #        yield make_chunk(model, "\n[ошибка: цикл инструментов, остановлено]\n", done=True)
-            #        return
-            #else:
-            #    repeat_count = 0
-            #prev_tool_names = current_tool_names
-
             assistant_entry: Dict[str, Any] = {
                 "role":       "assistant",
                 "content":    remapper.content_acc,
@@ -1049,7 +1030,7 @@ def chat_stream_generator(
 
             except Exception as e:
                 log.error("[%s] final answer failed: %s", req_id, e)
-                fallback = f"\n[не удалось получить финальный ответ: {e}]\n"
+                fallback = f"\n[final answer failed: {e}]\n"
                 final_assistant_content = fallback
                 yield make_chunk(model, fallback, done=True)
 

@@ -93,7 +93,7 @@ class OnnxBackend:
             "and subclass OnnxBackend."
         )
 
-    def embed(self, text: str) -> List[float]:
+    def embed(self, text: str, model: str) -> List[float]:
         """Mean-pooled sentence embedding via ONNX encoder model."""
         import numpy as np
 

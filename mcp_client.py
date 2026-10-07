@@ -78,11 +78,15 @@ class MCPClient:
         self._session: ClientSession | None = None
         self._stack: AsyncExitStack | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
-        self._lock = threading.Lock()
+        self._thread: threading.Thread | None = None
 
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
+
+    def _loop_forever(self) -> None:
+        asyncio.set_event_loop(self._loop)
+        self._loop.run_forever()
 
     async def _start_async(self) -> None:
         command = self.cmd[0]
@@ -98,31 +102,46 @@ class MCPClient:
         )
         await self._session.initialize()
 
+
     def start(self) -> None:
-        """Spawn the MCP server process and initialise the session."""
         self._loop = asyncio.new_event_loop()
+        self._thread = threading.Thread(
+            target=self._loop_forever, daemon=True, name=f"mcp-loop-{self.cmd[0]}"
+        )
+        self._thread.start()
+        fut = asyncio.run_coroutine_threadsafe(self._start_async(), self._loop)
         try:
-            self._loop.run_until_complete(self._start_async())
+            fut.result(timeout=30)
             log.info("[mcp] started: %s", self.cmd[0])
         except Exception as e:
             log.error("[mcp] failed to start %s: %s", self.cmd, e)
-            self._loop.close()
-            self._loop = None
+            self._shutdown_loop()
             raise
 
-    def stop(self) -> None:
-        """Tear down the session and kill the server process."""
-        if self._stack and self._loop:
-            try:
-                self._loop.run_until_complete(self._stack.aclose())
-            except Exception as e:
-                log.debug("[mcp] stop aclose error: %s", e)
-        if self._loop:
-            self._loop.close()
-            self._loop = None
+
+    def _shutdown_loop(self) -> None:
+        if self._loop is None:
+            return
+        self._loop.call_soon_threadsafe(self._loop.stop)
+        if self._thread is not None:
+            self._thread.join(timeout=5)
+        self._loop.close()
+        self._loop = None
+        self._thread = None
         self._session = None
         self._stack = None
+
+
+    def stop(self) -> None:
+        if self._stack and self._loop:
+            try:
+                fut = asyncio.run_coroutine_threadsafe(self._stack.aclose(), self._loop)
+                fut.result(timeout=10)
+            except Exception as e:
+                log.debug("[mcp] stop aclose error: %s", e)
+        self._shutdown_loop()
         log.info("[mcp] stopped: %s", self.cmd[0])
+
 
     # ------------------------------------------------------------------
     # Internal: run a coroutine on the persistent loop (thread-safe)
@@ -131,10 +150,8 @@ class MCPClient:
     def _run(self, coro, timeout: float):
         if self._loop is None or self._session is None:
             raise RuntimeError(f"MCPClient not started: {self.cmd}")
-        with self._lock:
-            return self._loop.run_until_complete(
-                asyncio.wait_for(coro, timeout=timeout)
-            )
+        fut = asyncio.run_coroutine_threadsafe(coro, self._loop)
+        return fut.result(timeout=timeout)
 
     # ------------------------------------------------------------------
     # Public API
