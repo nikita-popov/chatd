@@ -545,6 +545,29 @@ When you are done, produce ONLY a JSON object, no prose:
 """
 
 
+_EXPLORATORY_SEED_PREFERENCE = [
+    "alerts_list",
+    "mempalace_kg_timeline",
+    "mempalace_status",
+    "monitor_query",
+]
+
+
+def _exploratory_seed_tool(tools: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Pick one read-only tool to call before invoking the LLM.
+
+    Small models on slow hardware often skip tool calls entirely when the
+    list is long and the prompt is dense. Pre-seeding a single call gives
+    the model a concrete result to interpret instead of an instruction it
+    can ignore.
+    """
+    by_name = {(t.get("function") or {}).get("name"): t for t in tools}
+    for name in _EXPLORATORY_SEED_PREFERENCE:
+        if name in by_name:
+            return by_name[name]
+    return tools[0] if tools else None
+
+
 def _executor_tool_loop(
     messages: List[Dict[str, Any]],
     model: str,
