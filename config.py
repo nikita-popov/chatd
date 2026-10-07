@@ -167,3 +167,52 @@ BG_TOOLS_ALLOWED: Set[str] = set(
         "alerts_list,alerts_summary,monitor_query,notes_search",
     ).split(",")
 )
+
+# ── Background thinking — phases (PR C) ──────────────────────────────────────
+# Per-phase model routing. If a phase var is empty, BG_MODEL is used as
+# fallback — this preserves backwards compatibility with PR B+.
+BG_MODEL_PLANNER: str = os.environ.get("CHATD_BG_MODEL_PLANNER", "")
+BG_MODEL_EXECUTOR: str = os.environ.get("CHATD_BG_MODEL_EXECUTOR", "")
+BG_MODEL_REFLECTOR: str = os.environ.get("CHATD_BG_MODEL_REFLECTOR", "")
+# Reserved for PR D (escalation on repeated failure). Declared now, unused.
+BG_MODEL_THINK: str = os.environ.get("CHATD_BG_MODEL_THINK", "")
+
+# Per-phase timeouts (seconds). Executor gets more room for its tool loop.
+BG_PHASE_TIMEOUT: int = int(os.environ.get("CHATD_BG_PHASE_TIMEOUT", "600"))
+BG_PHASE_TIMEOUT_EXECUTOR: int = int(
+    os.environ.get("CHATD_BG_PHASE_TIMEOUT_EXECUTOR", "900")
+)
+# Whole-tick timeout — everything above should fit inside this.
+BG_TICK_TIMEOUT: int = int(os.environ.get("CHATD_BG_TICK_TIMEOUT", "2700"))
+
+# Goal ledger limits.
+BG_MAX_ATTEMPTS_PER_GOAL: int = int(
+    os.environ.get("CHATD_BG_MAX_ATTEMPTS_PER_GOAL", "3")
+)
+# Maximum number of goals in status pending or active. blocked/done/cancelled
+# do not count. Once reached, Planner cannot create new goals and Executor
+# drops any new_goals from its output.
+BG_MAX_OPEN_GOALS: int = int(os.environ.get("CHATD_BG_MAX_OPEN_GOALS", "5"))
+
+# Exploratory goals (created by Executor when Planner returns skip).
+#  - local executor model only
+#  - read-only tools only
+#  - one active at a time
+#  - TTL: auto-cancelled if not closed within N hours
+#  - hard cap per day
+BG_EXPLORATORY_PER_DAY: int = int(
+    os.environ.get("CHATD_BG_EXPLORATORY_PER_DAY", "3")
+)
+BG_EXPLORATORY_TTL_HOURS: int = int(
+    os.environ.get("CHATD_BG_EXPLORATORY_TTL_HOURS", "24")
+)
+
+# Daily budget. 0 = no limit. Token counting relies on Ollama's
+# prompt_eval_count + eval_count; OpenAI-compatible backends currently do
+# not surface token usage through chatd, so their ticks count as 0.
+BG_DAILY_TOKEN_BUDGET: int = int(
+    os.environ.get("CHATD_BG_DAILY_TOKEN_BUDGET", "0")
+)
+BG_DAILY_TIME_BUDGET_SEC: int = int(
+    os.environ.get("CHATD_BG_DAILY_TIME_BUDGET_SEC", "0")
+)

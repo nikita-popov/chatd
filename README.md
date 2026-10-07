@@ -120,32 +120,70 @@ The assistant identity and tool usage rules live in `identity.txt`.
 Edit it to change the persona, language, or memory behaviour.
 The file is loaded by MemPalace `wake-up` as L0 context on every request.
 
-## Background thinking (preview)
+## Background thinking
 
-`chatd` can act as a background worker ("subconscious") that runs on a
-timer, observes state, and — eventually — proposes new goals. It never
-writes to canonical memory.
+`chatd` can run a background worker ("subconscious") on a timer. It reads
+context and — when enabled — maintains its own goal ledger. It never writes
+to canonical memory.
 
-The background worker keeps its own state in `$CHATD_BG_STATE_DIR`
-(default `~/.local/share/chatd/bg`):
+### State layout
 
-- `journal.jsonl` — append-only log of ticks
-- `tick.lock`     — concurrency lock (overlapping ticks are skipped)
+Everything lives in `$CHATD_BG_STATE_DIR` (default `~/.local/share/chatd/bg`):
 
-**Status:** single-turn preview. `/api/tick` calls `BG_MODEL` once with
-the wake-up block as system prompt and returns the model's text. No tools,
-no memory writes, no goals yet. Planner / Executor / Reflector phases will
-be added in a follow-up.
+- `goals.json`     — goal ledger (atomic rewrite via tmp+rename)
+- `budget.json`    — daily token and time counters
+- `journal.jsonl`  — append-only tick log
+- `tick.lock`      — flock; overlapping ticks are skipped
 
-**Enable:**
+### Phases
+
+Each tick runs up to three phases. Models are routed independently:
+
+| Phase     | Model env                 | Tools | Purpose |
+|-----------|---------------------------|-------|---------|
+| Planner   | `CHATD_BG_MODEL_PLANNER`  | no    | pick existing goal, propose new, or skip |
+| Executor  | `CHATD_BG_MODEL_EXECUTOR` | yes   | run the goal (tool loop) |
+| Reflector | `CHATD_BG_MODEL_REFLECTOR`| no    | on blocked goal: retry / cancel / keep |
+
+Empty per-phase env falls back to `CHATD_BG_MODEL`.
+
+### Goal ledger
+
+Goals have `status` ∈ {pending, active, done, blocked, cancelled} and
+`kind` ∈ {normal, exploratory}. `blocked` and closed goals do not count
+toward the open-goal cap (`CHATD_BG_MAX_OPEN_GOALS`). When the cap is
+reached, Planner cannot create new goals and Executor drops extra
+`new_goals` from its output.
+
+### Exploratory ticks
+
+When Planner returns `skip`, Executor performs a read-only exploratory tick:
+
+- local executor model only
+- tools limited to the read-only subset (`*_search`, `*_query`, `*_status`,
+  `*_list`, `*_summary`, `*_timeline`, `*_wake_up`)
+- one active exploratory goal at a time
+- auto-cancelled after `CHATD_BG_EXPLORATORY_TTL_HOURS`
+- hard cap `CHATD_BG_EXPLORATORY_PER_DAY` per day
+
+### Timeouts and budget
+
+- Per-phase timeout: `CHATD_BG_PHASE_TIMEOUT` (planner, reflector),
+  `CHATD_BG_PHASE_TIMEOUT_EXECUTOR` (executor).
+- Whole-tick timeout: `CHATD_BG_TICK_TIMEOUT`.
+- Daily budget: `CHATD_BG_DAILY_TOKEN_BUDGET`, `CHATD_BG_DAILY_TIME_BUDGET_SEC`
+  (0 = no limit). Token count relies on Ollama's `prompt_eval_count +
+  eval_count`; OpenAI-compatible backends currently report 0.
+
+### Enable and trigger
 
 ```sh
 CHATD_BG_ENABLED=true
 CHATD_BG_TOKEN=<random-secret>
-CHATD_BG_MODEL=qwen3:8b
+CHATD_BG_MODEL=qwen3.5:9b
+CHATD_BG_MODEL_PLANNER=qwen3.5:4b
+CHATD_BG_MODEL_REFLECTOR=qwen3.5:4b
 ```
-
-**Trigger:**
 
 ```sh
 curl -X POST http://127.0.0.1:5001/api/tick \
@@ -155,7 +193,7 @@ curl -X POST http://127.0.0.1:5001/api/tick \
 ```
 
 When `CHATD_BG_ENABLED=false` (default), the endpoint returns `404`.
-When `CHATD_BG_TOKEN` is set but the bearer doesn't match, `401`.
+When `CHATD_BG_TOKEN` is set and the bearer doesn't match, `401`.
 
 ## Backends
 

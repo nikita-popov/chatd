@@ -1,24 +1,36 @@
 #!/usr/bin/env python3
 """background.py — background thinking (subconscious) for chatd.
 
-Single-turn preview (PR B+). This module is deliberately additive and
-isolated:
+Phases (one per tick):
+  Planner    model without tools; selects skip | pick | new goal
+  Executor   model with tools; runs the selected goal (tool loop)
+  Reflector  model without tools; only on blocked goals: retry | cancel | keep
 
-  - It does NOT write to mempalace (only reads via memory.wake_up()).
-  - It does NOT touch session storage or the RAG store.
-  - Its only side effects are inside $CHATD_BG_STATE_DIR:
-        journal.jsonl — append-only log of ticks
-        tick.lock     — flock-based concurrency lock
+State lives entirely in $CHATD_BG_STATE_DIR:
+  goals.json     — ledger (atomic rewrite)
+  budget.json    — daily token/time counters
+  journal.jsonl  — append-only tick log
+  tick.lock      — flock, prevents overlapping ticks
 
-No tools are invoked in this preview. Planner / Executor / Reflector
-phases (with tool loops, goals.json ledger and token budget) will be
-added in a follow-up PR.
+Hard rules:
+  - No writes to mempalace. Only memory.wake_up() (read-only) is used.
+  - No session / RAG side effects.
+  - Exploratory goals: local executor model, read-only tools only, one
+    active at a time, TTL, daily cap.
+  - Ledger rewritten atomically (tmp + os.replace).
+  - Two-level timeouts: per phase, and per tick.
 
-Why the lock:
-  systemd timers with Persistent=true can trigger a new tick while the
-  previous one is still running. Rather than queue or overlap, we skip
-  and log — background work is idempotent by design, and overlapping
-  ticks are never useful.
+Token budget note:
+  Ollama returns prompt_eval_count + eval_count; we use their sum. DeepSeek
+  and OpenRouter currently go through chatd's Ollama-shaped shim and do not
+  expose usage, so their ticks count as 0 tokens. This is a known limitation
+  to be fixed when a real usage channel is plumbed (PR D).
+
+Threading note:
+  Phase timeouts use daemon threads. If a phase times out, the worker thread
+  keeps running until it finishes or dies with the process. This is a
+  deliberate trade-off: we prefer a clean "timeout" result over complex
+  cancellation that Python cannot do reliably anyway.
 """
 from __future__ import annotations
 
@@ -26,19 +38,46 @@ import fcntl
 import json
 import logging
 import os
+import re
+import threading
 import time
-from datetime import datetime, timezone
+import uuid
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from config import (
     BG_MODEL,
+    BG_MODEL_EXECUTOR,
+    BG_MODEL_PLANNER,
+    BG_MODEL_REFLECTOR,
+    BG_MODEL_THINK,  # noqa: F401 — declared for PR D
+    BG_MAX_ATTEMPTS_PER_GOAL,
+    BG_MAX_OPEN_GOALS,
+    BG_MAX_TOOL_ROUNDS,
+    BG_EXPLORATORY_PER_DAY,
+    BG_EXPLORATORY_TTL_HOURS,
+    BG_PHASE_TIMEOUT,
+    BG_PHASE_TIMEOUT_EXECUTOR,
+    BG_TICK_TIMEOUT,
+    BG_DAILY_TOKEN_BUDGET,
+    BG_DAILY_TIME_BUDGET_SEC,
     BG_NUM_PREDICT,
     BG_SESSION_ID,
     BG_STATE_DIR,
+    BG_TOOLS_ALLOWED,
 )
 
 log = logging.getLogger("chatd.bg")
+
+GOALS_VERSION = 1
+BUDGET_VERSION = 1
+
+# Read-only subset used for exploratory goals — intersection of any tool
+# list with these suffixes. Keeps the "read-only" promise even if the
+# operator accidentally adds write tools to BG_TOOLS_ALLOWED.
+_READONLY_SUFFIXES = ("_search", "_query", "_status", "_list", "_summary",
+                      "_timeline", "_wake_up")
 
 
 # ── paths ─────────────────────────────────────────────────────────────────────
@@ -47,6 +86,14 @@ def _state_dir() -> Path:
     p = Path(os.path.expanduser(BG_STATE_DIR))
     p.mkdir(parents=True, exist_ok=True)
     return p
+
+
+def _goals_path() -> Path:
+    return _state_dir() / "goals.json"
+
+
+def _budget_path() -> Path:
+    return _state_dir() / "budget.json"
 
 
 def _journal_path() -> Path:
@@ -61,17 +108,49 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f") + "000Z"
 
 
+def _today_utc() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+def _new_id() -> str:
+    return "g-" + uuid.uuid4().hex[:6]
+
+
+# ── atomic JSON I/O ───────────────────────────────────────────────────────────
+
+def _atomic_write_json(path: Path, data: Dict[str, Any]) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+def _read_json(path: Path, default: Dict[str, Any]) -> Dict[str, Any]:
+    if not path.exists():
+        return default
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        log.warning("[bg] failed to read %s: %s — using default", path, e)
+        return default
+
+
+# ── journal ───────────────────────────────────────────────────────────────────
+
 def _append_journal(entry: Dict[str, Any]) -> None:
-    path = _journal_path()
-    with path.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    try:
+        with _journal_path().open("a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except Exception as e:
+        log.warning("[bg] journal append failed: %s", e)
 
 
 # ── lock ──────────────────────────────────────────────────────────────────────
 
 class TickLock:
-    """Non-blocking file lock — prevents overlapping ticks."""
-
     def __init__(self, path: Path):
         self.path = path
         self._fd: Optional[int] = None
@@ -95,125 +174,828 @@ class TickLock:
                 self._fd = None
 
 
-# ── LLM call (single turn, no tools) ──────────────────────────────────────────
+# ── budget ────────────────────────────────────────────────────────────────────
 
-_DEFAULT_TICK_PROMPT = (
-    "Background tick. Look at the current context and, in one short "
-    "paragraph, note anything worth flagging. If nothing — reply "
-    "with exactly: nothing."
-)
-
-
-def _build_bg_messages(payload: Dict[str, Any]) -> list:
-    """Minimal message list for a single-turn background tick.
-
-    System prompt = memory.wake_up() (L0+L1 from mempalace, read-only).
-    User prompt   = payload["prompt"] or a default tick prompt.
-    """
-    import memory  # local import — avoid touching chatd.py's import order
-
-    system = memory.wake_up()
-
-    prompt = None
-    if isinstance(payload, dict):
-        prompt = payload.get("prompt")
-    if not prompt:
-        prompt = _DEFAULT_TICK_PROMPT
-
-    return [
-        {"role": "system", "content": system},
-        {"role": "user",   "content": prompt},
-    ]
+def _empty_budget() -> Dict[str, Any]:
+    return {
+        "version": BUDGET_VERSION,
+        "date": _today_utc(),
+        "tokens_used": 0,
+        "time_used_sec": 0,
+    }
 
 
-def _one_shot(payload: Dict[str, Any]) -> str:
-    """Single-turn LLM call. No tools, no session, no memory writes.
+def _read_budget() -> Dict[str, Any]:
+    b = _read_json(_budget_path(), _empty_budget())
+    if b.get("date") != _today_utc():
+        b = _empty_budget()
+        _atomic_write_json(_budget_path(), b)
+    return b
 
-    This is deliberately the *only* place in background.py that talks to a
-    backend. Planner/Executor/Reflector (next PR) will reuse it as the base
-    primitive and layer tool loops on top.
-    """
+
+def _budget_allows_new_tick() -> Optional[str]:
+    """Return a reason string if a new tick is not allowed, else None."""
+    if BG_DAILY_TOKEN_BUDGET <= 0 and BG_DAILY_TIME_BUDGET_SEC <= 0:
+        return None
+    b = _read_budget()
+    if BG_DAILY_TOKEN_BUDGET > 0 and b["tokens_used"] >= BG_DAILY_TOKEN_BUDGET:
+        return "daily_token_budget_exceeded"
+    if BG_DAILY_TIME_BUDGET_SEC > 0 and b["time_used_sec"] >= BG_DAILY_TIME_BUDGET_SEC:
+        return "daily_time_budget_exceeded"
+    return None
+
+
+def _budget_add(tokens: int, elapsed_sec: float) -> None:
+    if BG_DAILY_TOKEN_BUDGET <= 0 and BG_DAILY_TIME_BUDGET_SEC <= 0:
+        return
+    b = _read_budget()
+    b["tokens_used"] += int(tokens)
+    b["time_used_sec"] += int(elapsed_sec)
+    _atomic_write_json(_budget_path(), b)
+
+
+# ── phase timeout helper ──────────────────────────────────────────────────────
+
+def _run_with_timeout(fn, timeout_sec: int, *args, **kwargs):
+    """Run fn in a daemon thread, honour timeout_sec. Returns fn's result."""
+    box: Dict[str, Any] = {"result": None, "error": None}
+
+    def runner() -> None:
+        try:
+            box["result"] = fn(*args, **kwargs)
+        except Exception as e:  # noqa: BLE001
+            box["error"] = e
+
+    t = threading.Thread(target=runner, daemon=True, name="bg-phase")
+    t.start()
+    t.join(timeout=timeout_sec)
+    if t.is_alive():
+        raise TimeoutError(f"phase timed out after {timeout_sec}s")
+    if box["error"] is not None:
+        raise box["error"]
+    return box["result"]
+
+
+# ── goals ledger ──────────────────────────────────────────────────────────────
+
+def _empty_goals() -> Dict[str, Any]:
+    return {"version": GOALS_VERSION, "updated_at": _now_iso(), "goals": []}
+
+
+def _read_goals() -> Dict[str, Any]:
+    g = _read_json(_goals_path(), _empty_goals())
+    if not isinstance(g.get("goals"), list):
+        g["goals"] = []
+    return g
+
+
+def _write_goals(g: Dict[str, Any]) -> None:
+    g["updated_at"] = _now_iso()
+    _atomic_write_json(_goals_path(), g)
+
+
+def _open_goals(goals: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return [g for g in goals if g.get("status") in ("pending", "active")]
+
+
+def _active_exploratory(goals: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return [g for g in goals
+            if g.get("kind") == "exploratory"
+            and g.get("status") in ("pending", "active")]
+
+
+def _exploratory_created_today(goals: List[Dict[str, Any]]) -> int:
+    prefix = _today_utc()[:10]
+    return sum(
+        1 for g in goals
+        if g.get("kind") == "exploratory"
+        and (g.get("created_at") or "").startswith(prefix)
+    )
+
+
+def _new_goal(title: str, kind: str) -> Dict[str, Any]:
+    now = _now_iso()
+    return {
+        "id": _new_id(),
+        "kind": kind,
+        "title": title.strip()[:300] or "(untitled)",
+        "status": "pending",
+        "attempts": 0,
+        "created_at": now,
+        "updated_at": now,
+        "last_result": None,
+        "history": [{"ts": now, "event": "created", "by": "system"}],
+    }
+
+
+def _find_goal(goals: List[Dict[str, Any]], goal_id: str) -> Optional[Dict[str, Any]]:
+    for g in goals:
+        if g.get("id") == goal_id:
+            return g
+    return None
+
+
+def _cancel_stale_exploratory(goals: List[Dict[str, Any]]) -> int:
+    """Auto-cancel exploratory goals older than BG_EXPLORATORY_TTL_HOURS."""
+    if BG_EXPLORATORY_TTL_HOURS <= 0:
+        return 0
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=BG_EXPLORATORY_TTL_HOURS)
+    changed = 0
+    for g in goals:
+        if g.get("kind") != "exploratory":
+            continue
+        if g.get("status") not in ("pending", "active"):
+            continue
+        try:
+            created = datetime.strptime(
+                g["created_at"][:19], "%Y-%m-%dT%H:%M:%S"
+            ).replace(tzinfo=timezone.utc)
+        except Exception:
+            continue
+        if created < cutoff:
+            g["status"] = "cancelled"
+            g["updated_at"] = _now_iso()
+            g.setdefault("history", []).append({
+                "ts": g["updated_at"],
+                "event": "cancelled",
+                "by": "system",
+                "note": "exploratory TTL expired",
+            })
+            changed += 1
+    return changed
+
+
+# ── LLM primitive ─────────────────────────────────────────────────────────────
+
+def _llm_call(
+    messages: List[Dict[str, Any]],
+    model: str,
+    tools: Optional[List[Dict[str, Any]]] = None,
+    num_predict: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Single backend call. Returns {content, tool_calls, tokens, raw}."""
     import backends
     from config import DEFAULT_OPTIONS, THINKING
 
-    messages = _build_bg_messages(payload)
-    body = {
-        "model":    BG_MODEL,
+    options = dict(DEFAULT_OPTIONS)
+    if num_predict is not None:
+        options["num_predict"] = num_predict
+    body: Dict[str, Any] = {
+        "model": model,
         "messages": messages,
-        "stream":   False,
-        "options":  dict(DEFAULT_OPTIONS),
-        # No "tools" key — background tick never invokes MCP in PR B+.
+        "stream": False,
+        "options": options,
     }
-
+    if tools:
+        body["tools"] = tools
     if not THINKING:
         body["think"] = False
 
-    backend = backends.get_backend(BG_MODEL)
+    backend = backends.get_backend(model)
     resp = backend.chat_sync(body)
     msg = resp.get("message") or {}
-    return (msg.get("content") or "").strip()
+    tokens = int(resp.get("prompt_eval_count") or 0) + int(resp.get("eval_count") or 0)
+    return {
+        "content": msg.get("content") or "",
+        "tool_calls": msg.get("tool_calls") or [],
+        "tokens": tokens,
+        "raw": resp,
+    }
 
 
-# ── public API ────────────────────────────────────────────────────────────────
+def _system_block() -> str:
+    import memory
+    return memory.wake_up()
+
+
+def _extract_json(text: str) -> Optional[Dict[str, Any]]:
+    """Extract the first JSON object from text; tolerate ```json fences."""
+    if not text:
+        return None
+    m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+    if m:
+        candidate = m.group(1)
+    else:
+        start = text.find("{")
+        if start < 0:
+            return None
+        depth = 0
+        end = -1
+        for i, ch in enumerate(text[start:], start):
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    end = i
+                    break
+        if end < 0:
+            return None
+        candidate = text[start:end + 1]
+    try:
+        return json.loads(candidate)
+    except Exception:
+        return None
+
+
+# ── tools filtering for executor ──────────────────────────────────────────────
+
+def _allowed_tools_for(kind: str) -> List[Dict[str, Any]]:
+    """Return the tools list visible to the Executor for this goal kind."""
+    import chatd  # local import to avoid circular import at module load
+
+    all_tools = getattr(chatd, "TOOLS", []) or []
+    allowed_names = {t for t in BG_TOOLS_ALLOWED if t}
+
+    selected: List[Dict[str, Any]] = []
+    for t in all_tools:
+        fn = (t.get("function") or {})
+        name = fn.get("name")
+        if not name or name not in allowed_names:
+            continue
+        if kind == "exploratory" and not name.endswith(_READONLY_SUFFIXES):
+            continue
+        selected.append(t)
+    return selected
+
+
+def _execute_tool_call(tc: Dict[str, Any]) -> Any:
+    import chatd
+    fn = tc.get("function") or {}
+    name = fn.get("name") or "unknown"
+    args = fn.get("arguments") or {}
+    if isinstance(args, str):
+        try:
+            args = json.loads(args)
+        except json.JSONDecodeError:
+            args = {}
+    try:
+        return chatd.call_tool(name, args)
+    except Exception as e:  # noqa: BLE001
+        return {"error": str(e), "tool": name}
+
+
+# ── Planner ───────────────────────────────────────────────────────────────────
+
+_PLANNER_INSTRUCTIONS = """\
+You are the planner of a background worker. Pick exactly one action.
+
+Return ONLY a JSON object, no prose, using one of these shapes:
+
+  {"decision": "pick", "goal_id": "<id>", "reason": "..."}
+  {"decision": "new",  "title": "...", "reason": "..."}
+  {"decision": "skip", "reason": "..."}
+
+Rules:
+- "pick" — choose an existing pending goal that is most relevant now.
+- "new"  — propose a new goal (only if open goals < cap, see below).
+- "skip" — nothing worth doing this tick.
+
+The open-goal cap is a hard limit. If open >= cap, "new" is not allowed.
+"""
+
+
+def _planner() -> Dict[str, Any]:
+    model = BG_MODEL_PLANNER or BG_MODEL
+    goals = _read_goals()
+    open_list = _open_goals(goals["goals"])
+    cap = BG_MAX_OPEN_GOALS
+
+    listing_lines = []
+    for g in open_list:
+        listing_lines.append(
+            f"- id={g['id']} kind={g['kind']} attempts={g['attempts']} "
+            f"title={g['title']!r}"
+        )
+    listing = "\n".join(listing_lines) if listing_lines else "(none)"
+
+    user_text = (
+        f"Open goals: {len(open_list)} / {cap}\n"
+        f"{listing}\n\n"
+        f"Return your JSON decision."
+    )
+
+    messages = [
+        {"role": "system", "content": _system_block()},
+        {"role": "system", "content": _PLANNER_INSTRUCTIONS},
+        {"role": "user", "content": user_text},
+    ]
+
+    resp = _llm_call(messages, model, tools=None, num_predict=BG_NUM_PREDICT)
+    decision = _extract_json(resp["content"]) or {}
+
+    d = decision.get("decision")
+    if d == "new" and len(open_list) >= cap:
+        log.info("[bg planner] 'new' rejected: open cap %d reached", cap)
+        decision = {"decision": "skip", "reason": "open-goal cap reached"}
+        d = "skip"
+    if d == "pick" and not _find_goal(goals["goals"], decision.get("goal_id", "")):
+        log.info("[bg planner] 'pick' with unknown goal_id — downgrading to skip")
+        decision = {"decision": "skip", "reason": "unknown goal_id"}
+        d = "skip"
+    if d not in ("pick", "new", "skip"):
+        decision = {"decision": "skip", "reason": "invalid decision"}
+        d = "skip"
+
+    return {
+        "decision": decision,
+        "model": model,
+        "tokens": resp["tokens"],
+    }
+
+
+# ── Executor ──────────────────────────────────────────────────────────────────
+
+_EXECUTOR_JSON_INSTRUCTIONS = """\
+When you are done, produce ONLY a JSON object, no prose:
+
+  {"outcome": "done" | "partial" | "failed",
+   "observation": "one short paragraph",
+   "goal_updates": {"status": "done" | "partial" | "blocked",
+                    "last_result": "..."},
+   "new_goals": [{"title": "..."}]}
+
+Rules:
+- "done"    — goal fully completed.
+- "partial" — some progress, goal should stay open.
+- "failed"  — could not make progress; attempts will be incremented.
+- new_goals: only if you discovered something worth following up. May be [].
+"""
+
+_EXPLORATORY_INSTRUCTIONS = """\
+No open goals were selected. Your task: pick ONE useful read-only question
+about the current context, investigate it with the available tools, and
+report back.
+
+When you are done, produce ONLY a JSON object, no prose:
+
+  {"outcome": "done",
+   "observation": "one short paragraph answering your question",
+   "goal_updates": {"status": "done", "last_result": "..."},
+   "new_goals": []}
+"""
+
+
+def _executor_tool_loop(
+    messages: List[Dict[str, Any]],
+    model: str,
+    tools: List[Dict[str, Any]],
+    max_rounds: int,
+) -> int:
+    """Run tool rounds in-place on `messages`. Returns total tokens used."""
+    tokens_total = 0
+    for round_num in range(max_rounds):
+        resp = _llm_call(messages, model, tools=tools, num_predict=BG_NUM_PREDICT)
+        tokens_total += resp["tokens"]
+        tool_calls = resp["tool_calls"]
+        if not tool_calls:
+            messages.append({
+                "role": "assistant",
+                "content": resp["content"],
+            })
+            break
+
+        assistant_msg: Dict[str, Any] = {
+            "role": "assistant",
+            "content": resp["content"],
+            "tool_calls": tool_calls,
+        }
+        if resp["raw"].get("message", {}).get("reasoning_content"):
+            assistant_msg["reasoning_content"] = \
+                resp["raw"]["message"]["reasoning_content"]
+        messages.append(assistant_msg)
+
+        for tc in tool_calls:
+            result = _execute_tool_call(tc)
+            messages.append({
+                "role": "tool",
+                "content": json.dumps(result, ensure_ascii=False),
+            })
+        log.info("[bg executor] round %d: %d tool call(s)",
+                 round_num, len(tool_calls))
+    return tokens_total
+
+
+def _executor(goal: Dict[str, Any]) -> Dict[str, Any]:
+    model = BG_MODEL_EXECUTOR or BG_MODEL
+    kind = goal.get("kind", "normal")
+    tools = _allowed_tools_for(kind)
+
+    if kind == "normal":
+        user_text = (
+            f"Goal: {goal['title']}\n"
+            f"Attempt: {goal['attempts'] + 1} of {BG_MAX_ATTEMPTS_PER_GOAL}\n"
+            f"Previous result: {goal.get('last_result') or '(none)'}\n\n"
+            f"Work the goal using the available tools, then produce the JSON "
+            f"summary as instructed."
+        )
+        instructions = _EXECUTOR_JSON_INSTRUCTIONS
+    else:
+        user_text = (
+            f"Context: no open goals.\n"
+            f"Investigate read-only. Return the JSON summary."
+        )
+        instructions = _EXPLORATORY_INSTRUCTIONS
+
+    messages: List[Dict[str, Any]] = [
+        {"role": "system", "content": _system_block()},
+        {"role": "system", "content": instructions},
+        {"role": "user", "content": user_text},
+    ]
+
+    tokens_total = 0
+    try:
+        tokens_total += _executor_tool_loop(
+            messages, model, tools, BG_MAX_TOOL_ROUNDS
+        )
+    except Exception as e:
+        log.warning("[bg executor] tool loop failed: %s", e)
+
+    # Final summary call — no tools, forces a clean JSON answer.
+    messages.append({
+        "role": "user",
+        "content": "Now produce ONLY the JSON summary object.",
+    })
+    try:
+        resp = _llm_call(messages, model, tools=None, num_predict=BG_NUM_PREDICT)
+        tokens_total += resp["tokens"]
+        parsed = _extract_json(resp["content"]) or {}
+    except Exception as e:
+        log.warning("[bg executor] summary call failed: %s", e)
+        parsed = {}
+
+    outcome = parsed.get("outcome") if parsed.get("outcome") in (
+        "done", "partial", "failed"
+    ) else "failed"
+
+    observation = str(parsed.get("observation") or "").strip()
+    upd = parsed.get("goal_updates") or {}
+    new_status = upd.get("status") if upd.get("status") in (
+        "done", "partial", "blocked"
+    ) else ("done" if outcome == "done" else
+            "pending" if outcome == "partial" else "blocked")
+
+    new_goals_raw = parsed.get("new_goals") or []
+    new_goals: List[str] = []
+    if isinstance(new_goals_raw, list):
+        for item in new_goals_raw[:3]:
+            if isinstance(item, dict):
+                title = str(item.get("title") or "").strip()
+                if title:
+                    new_goals.append(title[:300])
+
+    return {
+        "model": model,
+        "tokens": tokens_total,
+        "outcome": outcome,
+        "observation": observation,
+        "new_status": new_status,
+        "new_goals": new_goals,
+    }
+
+
+# ── Reflector ─────────────────────────────────────────────────────────────────
+
+_REFLECTOR_INSTRUCTIONS = """\
+A goal has been repeatedly blocked. Decide what to do with it.
+
+Return ONLY a JSON object, no prose:
+
+  {"decision": "retry" | "cancel" | "keep_blocked", "reason": "..."}
+
+- "retry"        — reset attempts and leave it pending for another try.
+- "cancel"       — give up permanently.
+- "keep_blocked" — leave it blocked; try again next tick.
+"""
+
+
+def _reflector(goal: Dict[str, Any]) -> Dict[str, Any]:
+    model = BG_MODEL_REFLECTOR or BG_MODEL
+    history_lines = []
+    for h in (goal.get("history") or [])[-10:]:
+        history_lines.append(
+            f"- {h.get('ts','?')} {h.get('event','?')} "
+            f"{h.get('by','')} {h.get('note','')}".rstrip()
+        )
+    history = "\n".join(history_lines) or "(empty)"
+
+    user_text = (
+        f"Goal id: {goal['id']}\n"
+        f"Title: {goal['title']}\n"
+        f"Attempts: {goal['attempts']}\n"
+        f"Last result: {goal.get('last_result') or '(none)'}\n"
+        f"History:\n{history}\n\n"
+        f"Return your JSON decision."
+    )
+
+    messages = [
+        {"role": "system", "content": _system_block()},
+        {"role": "system", "content": _REFLECTOR_INSTRUCTIONS},
+        {"role": "user", "content": user_text},
+    ]
+
+    try:
+        resp = _llm_call(messages, model, tools=None, num_predict=BG_NUM_PREDICT)
+    except Exception as e:
+        log.warning("[bg reflector] call failed: %s", e)
+        return {"decision": "keep_blocked", "reason": f"reflector error: {e}",
+                "model": model, "tokens": 0}
+
+    parsed = _extract_json(resp["content"]) or {}
+    d = parsed.get("decision")
+    if d not in ("retry", "cancel", "keep_blocked"):
+        d = "keep_blocked"
+    return {"decision": d, "reason": parsed.get("reason", ""),
+            "model": model, "tokens": resp["tokens"]}
+
+
+# ── ledger update helpers ─────────────────────────────────────────────────────
+
+def _apply_goal_update(g: Dict[str, Any], status: str, last_result: Optional[str]) -> None:
+    now = _now_iso()
+    g["status"] = status
+    g["updated_at"] = now
+    if last_result is not None:
+        g["last_result"] = last_result
+    g.setdefault("history", []).append(
+        {"ts": now, "event": f"status={status}", "by": "executor"}
+    )
+
+
+def _apply_failure(g: Dict[str, Any], observation: str) -> None:
+    g["attempts"] = int(g.get("attempts", 0)) + 1
+    now = _now_iso()
+    g["updated_at"] = now
+    if observation:
+        g["last_result"] = observation
+    if g["attempts"] >= BG_MAX_ATTEMPTS_PER_GOAL:
+        g["status"] = "blocked"
+        event = "blocked"
+    else:
+        g["status"] = "pending"
+        event = "failed"
+    g.setdefault("history", []).append(
+        {"ts": now, "event": event, "by": "executor"}
+    )
+
+
+# ── run_tick ──────────────────────────────────────────────────────────────────
+
+def _tick_impl(payload: Dict[str, Any], req_id: str) -> Dict[str, Any]:
+    started = time.time()
+    tick_deadline = started + BG_TICK_TIMEOUT
+
+    _append_journal({
+        "req_id": req_id,
+        "ts": _now_iso(),
+        "session": BG_SESSION_ID,
+        "payload": payload,
+        "status": "started",
+    })
+
+    # Ledger hygiene: TTL for exploratory goals.
+    goals = _read_goals()
+    cancelled = _cancel_stale_exploratory(goals["goals"])
+    if cancelled:
+        _write_goals(goals)
+        log.info("[bg %s] cancelled %d stale exploratory goal(s)",
+                 req_id, cancelled)
+
+    # Planner
+    planner_result = _run_with_timeout(_planner, BG_PHASE_TIMEOUT)
+    tokens_used = planner_result["tokens"]
+    decision = planner_result["decision"]
+    _append_journal({
+        "req_id": req_id,
+        "ts": _now_iso(),
+        "phase": "planner",
+        "model": planner_result["model"],
+        "decision": decision,
+    })
+    log.info("[bg %s] planner: %s", req_id, decision.get("decision"))
+
+    # Apply planner decision to ledger
+    goals = _read_goals()
+    picked_goal: Optional[Dict[str, Any]] = None
+    d = decision.get("decision")
+
+    if d == "new":
+        open_count = len(_open_goals(goals["goals"]))
+        if open_count >= BG_MAX_OPEN_GOALS:
+            log.info("[bg %s] new-goal blocked at ledger stage", req_id)
+        else:
+            g = _new_goal(decision.get("title", ""), kind="normal")
+            goals["goals"].append(g)
+            g["status"] = "active"
+            g["updated_at"] = _now_iso()
+            g.setdefault("history", []).append(
+                {"ts": g["updated_at"], "event": "status=active", "by": "planner"}
+            )
+            picked_goal = g
+            _write_goals(goals)
+
+    elif d == "pick":
+        g = _find_goal(goals["goals"], decision.get("goal_id", ""))
+        if g is not None:
+            g["status"] = "active"
+            g["updated_at"] = _now_iso()
+            g.setdefault("history", []).append(
+                {"ts": g["updated_at"], "event": "status=active", "by": "planner"}
+            )
+            picked_goal = g
+            _write_goals(goals)
+
+    # Remaining tick budget
+    remaining = int(max(30, tick_deadline - time.time()))
+    if remaining <= 0:
+        raise TimeoutError("tick deadline exceeded after planner")
+
+    # Executor — either runs the picked goal, or explores read-only.
+    if picked_goal is None:
+        # Exploratory path. Enforce per-day cap.
+        goals = _read_goals()
+        made_today = _exploratory_created_today(goals["goals"])
+        if made_today >= BG_EXPLORATORY_PER_DAY:
+            log.info("[bg %s] exploratory cap reached (%d/%d)",
+                     req_id, made_today, BG_EXPLORATORY_PER_DAY)
+            return {
+                "req_id": req_id,
+                "status": "skipped",
+                "reason": "exploratory_cap_reached",
+            }
+        if _active_exploratory(goals["goals"]):
+            log.info("[bg %s] exploratory already active", req_id)
+            return {
+                "req_id": req_id,
+                "status": "skipped",
+                "reason": "exploratory_already_active",
+            }
+        exp_goal = _new_goal("(exploratory tick)", kind="exploratory")
+        exp_goal["status"] = "active"
+        exp_goal.setdefault("history", []).append(
+            {"ts": exp_goal["updated_at"], "event": "status=active", "by": "planner"}
+        )
+        goals["goals"].append(exp_goal)
+        _write_goals(goals)
+        picked_goal = exp_goal
+
+    phase_timeout = min(remaining, BG_PHASE_TIMEOUT_EXECUTOR)
+    try:
+        executor_result = _run_with_timeout(
+            _executor, phase_timeout, picked_goal
+        )
+    except TimeoutError as e:
+        log.warning("[bg %s] executor timeout: %s", req_id, e)
+        goals = _read_goals()
+        g = _find_goal(goals["goals"], picked_goal["id"])
+        if g is not None:
+            _apply_failure(g, "executor timeout")
+            _write_goals(goals)
+        _append_journal({
+            "req_id": req_id, "ts": _now_iso(),
+            "phase": "executor", "status": "timeout", "error": str(e),
+        })
+        raise
+
+    tokens_used += executor_result["tokens"]
+    _append_journal({
+        "req_id": req_id,
+        "ts": _now_iso(),
+        "phase": "executor",
+        "model": executor_result["model"],
+        "outcome": executor_result["outcome"],
+        "tokens": executor_result["tokens"],
+    })
+
+    # Persist executor result
+    goals = _read_goals()
+    g = _find_goal(goals["goals"], picked_goal["id"])
+    reflector_needed = False
+    if g is not None:
+        if executor_result["outcome"] == "failed":
+            _apply_failure(g, executor_result["observation"])
+            if g["status"] == "blocked":
+                reflector_needed = True
+        else:
+            _apply_goal_update(
+                g,
+                executor_result["new_status"] if executor_result["new_status"]
+                in ("done", "partial") else "done",
+                executor_result["observation"],
+            )
+
+        # Add new_goals if room remains.
+        open_count = len(_open_goals(goals["goals"]))
+        added = 0
+        for title in executor_result["new_goals"]:
+            if open_count + added >= BG_MAX_OPEN_GOALS:
+                log.info("[bg %s] dropping extra new_goals (cap reached)", req_id)
+                break
+            goals["goals"].append(_new_goal(title, kind="normal"))
+            added += 1
+
+        _write_goals(goals)
+
+    # Reflector — only on blocked goal with attempts >= cap.
+    if reflector_needed and g is not None:
+        remaining = int(max(30, tick_deadline - time.time()))
+        if remaining > 0:
+            try:
+                refl = _run_with_timeout(
+                    _reflector, min(remaining, BG_PHASE_TIMEOUT), g
+                )
+            except TimeoutError as e:
+                log.warning("[bg %s] reflector timeout: %s", req_id, e)
+                refl = {"decision": "keep_blocked", "reason": "timeout",
+                        "model": BG_MODEL_REFLECTOR or BG_MODEL, "tokens": 0}
+
+            tokens_used += refl["tokens"]
+            _append_journal({
+                "req_id": req_id, "ts": _now_iso(),
+                "phase": "reflector", "model": refl["model"],
+                "decision": refl["decision"], "tokens": refl["tokens"],
+            })
+
+            goals = _read_goals()
+            g = _find_goal(goals["goals"], picked_goal["id"])
+            if g is not None:
+                now = _now_iso()
+                if refl["decision"] == "retry":
+                    g["attempts"] = 0
+                    g["status"] = "pending"
+                elif refl["decision"] == "cancel":
+                    g["status"] = "cancelled"
+                else:
+                    g["status"] = "blocked"
+                g["updated_at"] = now
+                g.setdefault("history", []).append({
+                    "ts": now,
+                    "event": f"reflector={refl['decision']}",
+                    "by": "reflector",
+                    "note": refl.get("reason", ""),
+                })
+                _write_goals(goals)
+
+    elapsed = time.time() - started
+    _budget_add(tokens_used, elapsed)
+
+    result = {
+        "req_id": req_id,
+        "status": "ok",
+        "goal_id": picked_goal["id"],
+        "goal_kind": picked_goal["kind"],
+        "outcome": executor_result["outcome"],
+        "observation": executor_result["observation"],
+        "tokens": tokens_used,
+        "elapsed_ms": int(elapsed * 1000),
+    }
+    _append_journal({
+        "req_id": req_id, "ts": _now_iso(),
+        "status": "done", "result": result,
+    })
+    log.info("[bg %s] tick done: goal=%s outcome=%s tokens=%d elapsed=%dms",
+             req_id, picked_goal["id"], executor_result["outcome"],
+             tokens_used, int(elapsed * 1000))
+    return result
+
 
 def run_tick(payload: Dict[str, Any], req_id: str) -> Dict[str, Any]:
-    """One tick of the subconscious.
-
-    Returns a JSON-serialisable result dict.
-    Raises only on unexpected internal errors — caller (chatd /api/tick)
-    converts them to HTTP 500.
-    """
-    started = time.time()
-    ts = _now_iso()
-
+    """One tick. Returns a JSON-serialisable result dict."""
     lock = TickLock(_lock_path())
     if not lock.acquire():
         log.info("[bg %s] tick skipped — previous tick still running", req_id)
-        return {
-            "req_id": req_id,
-            "status": "skipped",
-            "reason": "tick_already_running",
-            "ts":     ts,
-        }
+        _append_journal({
+            "req_id": req_id, "ts": _now_iso(),
+            "status": "skipped", "reason": "tick_already_running",
+        })
+        return {"req_id": req_id, "status": "skipped",
+                "reason": "tick_already_running"}
 
     try:
+        reason = _budget_allows_new_tick()
+        if reason:
+            log.info("[bg %s] tick skipped — %s", req_id, reason)
+            _append_journal({
+                "req_id": req_id, "ts": _now_iso(),
+                "status": "skipped", "reason": reason,
+            })
+            return {"req_id": req_id, "status": "skipped", "reason": reason}
+
+        return _tick_impl(payload, req_id)
+
+    except TimeoutError as e:
+        log.warning("[bg %s] tick timeout: %s", req_id, e)
         _append_journal({
-            "req_id":  req_id,
-            "ts":      ts,
-            "session": BG_SESSION_ID,
-            "model":   BG_MODEL,
-            "payload": payload,
-            "status":  "started",
+            "req_id": req_id, "ts": _now_iso(),
+            "status": "timeout", "error": str(e),
         })
-
-        answer = _one_shot(payload)
-        elapsed_ms = int((time.time() - started) * 1000)
-
-        result = {
-            "req_id":     req_id,
-            "status":     "ok",
-            "answer":     answer,
-            "elapsed_ms": elapsed_ms,
-        }
-
-        _append_journal({
-            "req_id": req_id,
-            "ts":     _now_iso(),
-            "status": "done",
-            "result": result,
-        })
-
-        log.info("[bg %s] tick done in %d ms (answer=%d chars)",
-                 req_id, elapsed_ms, len(answer))
-        return result
+        return {"req_id": req_id, "status": "timeout", "error": str(e)}
 
     except Exception as e:
         log.error("[bg %s] tick error: %s", req_id, e, exc_info=True)
         _append_journal({
-            "req_id": req_id,
-            "ts":     _now_iso(),
-            "status": "error",
-            "error":  str(e),
+            "req_id": req_id, "ts": _now_iso(),
+            "status": "error", "error": str(e),
         })
         raise
 
