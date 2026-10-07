@@ -1,8 +1,8 @@
-"""backends/openrouter.py — OpenRouter inference backend.
+"""backends/openrouter.py - OpenRouter inference backend.
 
 Wire format: OpenAI /chat/completions over HTTPS.
 Embed: not supported (raises RuntimeError).
-       Use OllamaBackend.embed() for RAG — it is always available locally.
+       Use OllamaBackend.embed() for RAG - it is always available locally.
 
 Model name convention: strip "or/" prefix before sending to OpenRouter.
 Example: "or/mistralai/mistral-7b-instruct:free" -> "mistralai/mistral-7b-instruct:free"
@@ -14,8 +14,8 @@ unique `id`, and that the subsequent `tool` message echoes that id as
 `tool_call_id`.  chatd uses a simple internal format that does NOT carry
 ids through the message list, so we generate/preserve ids here:
 
-  _finalise_tool_calls()  — keeps the `id` collected during SSE streaming
-  _to_openai()            — converts assistant/tool messages to OpenAI wire
+  _finalise_tool_calls()  - keeps the `id` collected during SSE streaming
+  _to_openai()            - converts assistant/tool messages to OpenAI wire
                             format, injecting generated ids where missing
 """
 from __future__ import annotations
@@ -40,7 +40,7 @@ _PREFIX: str = OPENROUTER_PREFIX
 _model_cache: Dict[str, Dict[str, Any]] = {}
 _model_cache_loaded: bool = False
 
-# Persistent session — reuses TCP+TLS connections across tool loop rounds.
+# Persistent session - reuses TCP+TLS connections across tool loop rounds.
 _session: requests.Session = requests.Session()
 
 

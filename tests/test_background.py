@@ -100,3 +100,14 @@ def test_exploratory_cancel_stale(bg, monkeypatch):
     assert changed == 1
     assert goals[0]["status"] == "cancelled"
     assert goals[1]["status"] == "pending"
+
+
+def test_exploratory_tool_calls_default_zero(bg):
+    """The tool_calls key must exist in executor output for the tick-level
+    downgrade logic to work. This is a simple contract test."""
+    # Not a real backend call - we just verify the key is expected in the
+    # return shape by inspecting the source, since mocking _llm_call would
+    # require importing a lot of chatd machinery.
+    import inspect
+    src = inspect.getsource(bg._executor)
+    assert '"tool_calls": tool_calls_made' in src

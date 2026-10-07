@@ -1,6 +1,6 @@
-"""backends/base.py — Backend Protocol (structural interface).
+"""backends/base.py - Backend Protocol (structural interface).
 
-Every backend must satisfy this Protocol. No inheritance required —
+Every backend must satisfy this Protocol. No inheritance required -
 duck typing is sufficient, but explicit registration is encouraged.
 
 Chat contract:
@@ -14,7 +14,7 @@ Chat contract:
 Embed contract:
   embed(text, model) -> list[float]
     Returns a normalised float vector of fixed dimensionality.
-    model — the embedding model identifier to use.
+    model - the embedding model identifier to use.
     Raises RuntimeError if the backend does not support embeddings.
 
 payload is always an Ollama-format dict:

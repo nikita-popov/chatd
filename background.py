@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""background.py — background thinking (subconscious) for chatd.
+"""background.py - background thinking (subconscious) for chatd.
 
 Phases (one per tick):
   Planner    model without tools; selects skip | pick | new goal
@@ -7,10 +7,10 @@ Phases (one per tick):
   Reflector  model without tools; only on blocked goals: retry | cancel | keep
 
 State lives entirely in $CHATD_BG_STATE_DIR:
-  goals.json     — ledger (atomic rewrite)
-  budget.json    — daily token/time counters
-  journal.jsonl  — append-only tick log
-  tick.lock      — flock, prevents overlapping ticks
+  goals.json     - ledger (atomic rewrite)
+  budget.json    - daily token/time counters
+  journal.jsonl  - append-only tick log
+  tick.lock      - flock, prevents overlapping ticks
 
 Hard rules:
   - No writes to mempalace. Only memory.wake_up() (read-only) is used.
@@ -51,7 +51,7 @@ from config import (
     BG_MODEL_EXECUTOR,
     BG_MODEL_PLANNER,
     BG_MODEL_REFLECTOR,
-    BG_MODEL_THINK,  # noqa: F401 — declared for PR D
+    BG_MODEL_THINK,  # noqa: F401 - declared for PR D
     BG_MAX_ATTEMPTS_PER_GOAL,
     BG_MAX_OPEN_GOALS,
     BG_MAX_TOOL_ROUNDS,
@@ -73,7 +73,7 @@ log = logging.getLogger("chatd.bg")
 GOALS_VERSION = 1
 BUDGET_VERSION = 1
 
-# Read-only subset used for exploratory goals — intersection of any tool
+# Read-only subset used for exploratory goals - intersection of any tool
 # list with these suffixes. Keeps the "read-only" promise even if the
 # operator accidentally adds write tools to BG_TOOLS_ALLOWED.
 _READONLY_SUFFIXES = ("_search", "_query", "_status", "_list", "_summary",
@@ -134,7 +134,7 @@ def _read_json(path: Path, default: Dict[str, Any]) -> Dict[str, Any]:
         with path.open("r", encoding="utf-8") as f:
             return json.load(f)
     except Exception as e:
-        log.warning("[bg] failed to read %s: %s — using default", path, e)
+        log.warning("[bg] failed to read %s: %s - using default", path, e)
         return default
 
 
@@ -447,9 +447,9 @@ Return ONLY a JSON object, no prose, using one of these shapes:
   {"decision": "skip", "reason": "..."}
 
 Rules:
-- "pick" — choose an existing pending goal that is most relevant now.
-- "new"  — propose a new goal (only if open goals < cap, see below).
-- "skip" — nothing worth doing this tick.
+- "pick" - choose an existing pending goal that is most relevant now.
+- "new"  - propose a new goal (only if open goals < cap, see below).
+- "skip" - nothing worth doing this tick.
 
 The open-goal cap is a hard limit. If open >= cap, "new" is not allowed.
 """
@@ -490,7 +490,7 @@ def _planner() -> Dict[str, Any]:
         decision = {"decision": "skip", "reason": "open-goal cap reached"}
         d = "skip"
     if d == "pick" and not _find_goal(goals["goals"], decision.get("goal_id", "")):
-        log.info("[bg planner] 'pick' with unknown goal_id — downgrading to skip")
+        log.info("[bg planner] 'pick' with unknown goal_id - downgrading to skip")
         decision = {"decision": "skip", "reason": "unknown goal_id"}
         d = "skip"
     if d not in ("pick", "new", "skip"):
@@ -516,21 +516,29 @@ When you are done, produce ONLY a JSON object, no prose:
    "new_goals": [{"title": "..."}]}
 
 Rules:
-- "done"    — goal fully completed.
-- "partial" — some progress, goal should stay open.
-- "failed"  — could not make progress; attempts will be incremented.
+- "done"    - goal fully completed.
+- "partial" - some progress, goal should stay open.
+- "failed"  - could not make progress; attempts will be incremented.
 - new_goals: only if you discovered something worth following up. May be [].
 """
 
 _EXPLORATORY_INSTRUCTIONS = """\
-No open goals were selected. Your task: pick ONE useful read-only question
-about the current context, investigate it with the available tools, and
-report back.
+No open goals were selected. Your task: perform ONE concrete read-only
+observation about the current infrastructure state.
+
+You MUST:
+1. Pick one read-only tool from the available tool list.
+2. Call it with a sensible default query.
+3. Read the result.
+4. Report in one short paragraph what you observed.
+
+You MUST call at least one tool before producing the final JSON. If the
+tool returns nothing useful, say so - but the call still must happen.
 
 When you are done, produce ONLY a JSON object, no prose:
 
   {"outcome": "done",
-   "observation": "one short paragraph answering your question",
+   "observation": "one short paragraph",
    "goal_updates": {"status": "done", "last_result": "..."},
    "new_goals": []}
 """
@@ -541,9 +549,13 @@ def _executor_tool_loop(
     model: str,
     tools: List[Dict[str, Any]],
     max_rounds: int,
-) -> int:
-    """Run tool rounds in-place on `messages`. Returns total tokens used."""
+) -> tuple[int, int]:
+    """Run tool rounds in-place on `messages`.
+
+    Returns (tokens_total, tool_call_count).
+    """
     tokens_total = 0
+    tool_call_count = 0
     for round_num in range(max_rounds):
         resp = _llm_call(messages, model, tools=tools, num_predict=BG_NUM_PREDICT)
         tokens_total += resp["tokens"]
@@ -567,13 +579,14 @@ def _executor_tool_loop(
 
         for tc in tool_calls:
             result = _execute_tool_call(tc)
+            tool_call_count += 1
             messages.append({
                 "role": "tool",
                 "content": json.dumps(result, ensure_ascii=False),
             })
         log.info("[bg executor] round %d: %d tool call(s)",
                  round_num, len(tool_calls))
-    return tokens_total
+    return tokens_total, tool_call_count
 
 
 def _executor(goal: Dict[str, Any]) -> Dict[str, Any]:
@@ -604,14 +617,42 @@ def _executor(goal: Dict[str, Any]) -> Dict[str, Any]:
     ]
 
     tokens_total = 0
+    tool_calls_made = 0
     try:
-        tokens_total += _executor_tool_loop(
+        t, c = _executor_tool_loop(
             messages, model, tools, BG_MAX_TOOL_ROUNDS
         )
+        tokens_total += t
+        tool_calls_made = c
     except Exception as e:
         log.warning("[bg executor] tool loop failed: %s", e)
 
-    # Final summary call — no tools, forces a clean JSON answer.
+    # Exploratory must produce at least one tool call. Retry once with an
+    # explicit nudge; if the second attempt also fails, we accept the
+    # outcome but the caller will downgrade it to "failed".
+    if kind == "exploratory" and tool_calls_made == 0:
+        log.info("[bg executor] exploratory made no tool calls - retrying once")
+        tool_names = ", ".join(
+            (t.get("function") or {}).get("name", "?") for t in tools
+        )
+        messages.append({
+            "role": "user",
+            "content": (
+                "You did not call any tool. You MUST call at least one "
+                "read-only tool before producing the final JSON. "
+                f"Available tool names: {tool_names}"
+            ),
+        })
+        try:
+            t, c = _executor_tool_loop(
+                messages, model, tools, BG_MAX_TOOL_ROUNDS
+            )
+            tokens_total += t
+            tool_calls_made += c
+        except Exception as e:
+            log.warning("[bg executor] retry failed: %s", e)
+
+    # Final summary call - no tools, forces a clean JSON answer.
     messages.append({
         "role": "user",
         "content": "Now produce ONLY the JSON summary object.",
@@ -647,6 +688,7 @@ def _executor(goal: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "model": model,
         "tokens": tokens_total,
+        "tool_calls": tool_calls_made,
         "outcome": outcome,
         "observation": observation,
         "new_status": new_status,
@@ -663,9 +705,9 @@ Return ONLY a JSON object, no prose:
 
   {"decision": "retry" | "cancel" | "keep_blocked", "reason": "..."}
 
-- "retry"        — reset attempts and leave it pending for another try.
-- "cancel"       — give up permanently.
-- "keep_blocked" — leave it blocked; try again next tick.
+- "retry"        - reset attempts and leave it pending for another try.
+- "cancel"       - give up permanently.
+- "keep_blocked" - leave it blocked; try again next tick.
 """
 
 
@@ -810,7 +852,7 @@ def _tick_impl(payload: Dict[str, Any], req_id: str) -> Dict[str, Any]:
     if remaining <= 0:
         raise TimeoutError("tick deadline exceeded after planner")
 
-    # Executor — either runs the picked goal, or explores read-only.
+    # Executor - either runs the picked goal, or explores read-only.
     if picked_goal is None:
         # Exploratory path. Enforce per-day cap.
         goals = _read_goals()
@@ -857,6 +899,19 @@ def _tick_impl(payload: Dict[str, Any], req_id: str) -> Dict[str, Any]:
         })
         raise
 
+    # Exploratory that produced zero tool calls is not "done" - it did
+    # nothing. Downgrade it to "failed" so it goes back into the ledger as
+    # pending (or blocked after BG_MAX_ATTEMPTS_PER_GOAL) instead of
+    # silently filling goals.json with empty entries.
+    if (picked_goal["kind"] == "exploratory"
+            and executor_result.get("tool_calls", 0) == 0
+            and executor_result["outcome"] == "done"):
+        log.info("[bg %s] exploratory made no tool calls - marking as failed",
+                 req_id)
+        executor_result["outcome"] = "failed"
+        if not executor_result["observation"]:
+            executor_result["observation"] = "exploratory made no tool calls"
+
     tokens_used += executor_result["tokens"]
     _append_journal({
         "req_id": req_id,
@@ -864,6 +919,7 @@ def _tick_impl(payload: Dict[str, Any], req_id: str) -> Dict[str, Any]:
         "phase": "executor",
         "model": executor_result["model"],
         "outcome": executor_result["outcome"],
+        "tool_calls": executor_result.get("tool_calls", 0),
         "tokens": executor_result["tokens"],
     })
 
@@ -896,7 +952,7 @@ def _tick_impl(payload: Dict[str, Any], req_id: str) -> Dict[str, Any]:
 
         _write_goals(goals)
 
-    # Reflector — only on blocked goal with attempts >= cap.
+    # Reflector - only on blocked goal with attempts >= cap.
     if reflector_needed and g is not None:
         remaining = int(max(30, tick_deadline - time.time()))
         if remaining > 0:
@@ -963,7 +1019,7 @@ def run_tick(payload: Dict[str, Any], req_id: str) -> Dict[str, Any]:
     """One tick. Returns a JSON-serialisable result dict."""
     lock = TickLock(_lock_path())
     if not lock.acquire():
-        log.info("[bg %s] tick skipped — previous tick still running", req_id)
+        log.info("[bg %s] tick skipped - previous tick still running", req_id)
         _append_journal({
             "req_id": req_id, "ts": _now_iso(),
             "status": "skipped", "reason": "tick_already_running",
@@ -974,7 +1030,7 @@ def run_tick(payload: Dict[str, Any], req_id: str) -> Dict[str, Any]:
     try:
         reason = _budget_allows_new_tick()
         if reason:
-            log.info("[bg %s] tick skipped — %s", req_id, reason)
+            log.info("[bg %s] tick skipped - %s", req_id, reason)
             _append_journal({
                 "req_id": req_id, "ts": _now_iso(),
                 "status": "skipped", "reason": reason,

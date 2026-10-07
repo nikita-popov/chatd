@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""session.py — per-chat session state.
+"""session.py - per-chat session state.
 
 Each session is identified by the chatId that hollama sends in every
 request.  State is persisted as an append-only JSONL chatlog so the
@@ -79,7 +79,7 @@ class Session:
             log.warning("[session:%s] save failed (path=%s): %s", self.session_id, path, e)
 
     def append_chatlog(self, user: str, assistant: str) -> None:
-        """Append one turn to the persistent JSONL chatlog — never truncates."""
+        """Append one turn to the persistent JSONL chatlog - never truncates."""
         log_path = self._jsonl_path()
         lines = [
             json.dumps({"type": "human",

@@ -1,4 +1,4 @@
-"""backends/ollama.py — Ollama local inference backend.
+"""backends/ollama.py - Ollama local inference backend.
 
 Wire format: Ollama NDJSON over HTTP.
 Embed: POST /api/embed.
@@ -15,7 +15,7 @@ OLLAMA_API: str = os.environ.get("OLLAMA_API", "http://127.0.0.1:11434")
 
 log = logging.getLogger("chatd.backends.ollama")
 
-# Persistent session — reuses TCP connections to the local Ollama daemon.
+# Persistent session - reuses TCP connections to the local Ollama daemon.
 _session: requests.Session = requests.Session()
 
 

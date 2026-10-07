@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""memory.py — fast in-process memory abstraction for chatd.
+"""memory.py - fast in-process memory abstraction for chatd.
 
 Layered memory model:
-  L0   mempalace : model identity.txt — always loaded
-  L1   mempalace : Essential Story (wake-up context) — always loaded
-  L1.5 chatd     : request-scoped sidecar — KG recall + external RAG
-                   injected per request — always loaded
+  L0   mempalace : model identity.txt - always loaded
+  L1   mempalace : Essential Story (wake-up context) - always loaded
+  L1.5 chatd     : request-scoped sidecar - KG recall + external RAG
+                   injected per request - always loaded
                    (disable with CHATD_LAYER_15_ENABLED=false)
-  L2   mempalace : Room Recall (filtered retrieval) — when topic comes up
-  L3   mempalace : Deep Search (full semantic query) — when explicitly asked
+  L2   mempalace : Room Recall (filtered retrieval) - when topic comes up
+  L3   mempalace : Deep Search (full semantic query) - when explicitly asked
 
 mempalace layers (L0, L1, L2, L3) are never modified here.
 chatd layer (L1.5) is a purely additive overlays.
@@ -244,7 +244,7 @@ def _check_palace(palace_path: str) -> bool:
     if not children:
         log.warning("mempalace: palace directory is empty (not initialised?): %s", palace_path)
         return False
-    log.info("mempalace: palace OK — %s (%d entries)", palace_path, len(children))
+    log.info("mempalace: palace OK - %s (%d entries)", palace_path, len(children))
     return True
 
 
@@ -260,10 +260,10 @@ def _check_kg(kg_path: str) -> bool:
         kg = KnowledgeGraph(db_path=kg_path)
         count = len(kg.timeline())
         kg.close()
-        log.info("mempalace: KG OK — %s (%d triples)", kg_path, count)
+        log.info("mempalace: KG OK - %s (%d triples)", kg_path, count)
         return True
     except Exception as e:
-        log.warning("mempalace: KG open failed: %s — %s", kg_path, e)
+        log.warning("mempalace: KG open failed: %s - %s", kg_path, e)
         return False
 
 
@@ -289,7 +289,7 @@ def init() -> None:
         if not kg_ok:
             issues.append(f"KG not found at {kg_path}")
         log.warning(
-            "mempalace: degraded mode — %s. "
+            "mempalace: degraded mode - %s. "
             "Memory context will be empty until mempalace is initialised.",
             "; ".join(issues),
         )

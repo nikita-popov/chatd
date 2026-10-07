@@ -63,7 +63,7 @@ def _to_openai(payload: Dict[str, Any], stream: bool) -> Dict[str, Any]:
                     entry["reasoning_content"] = m["reasoning_content"]
                 converted.append(entry)
             else:
-                # No tool_calls — DO NOT emit the key at all (empty [] is rejected)
+                # No tool_calls - DO NOT emit the key at all (empty [] is rejected)
                 pending_tc_ids = []
                 pending_tc_index = 0
                 entry = {"role": "assistant", "content": m.get("content") or ""}
@@ -249,7 +249,7 @@ class DeepSeekBackend:
             headers=self._headers(), json=body, timeout=600, stream=True,
         )
         if not r.ok:
-            # Log the body — this is where your 400 detail lives
+            # Log the body - this is where your 400 detail lives
             log.error("[deepseek] HTTP %s body: %s", r.status_code, r.text[:2000])
         r.raise_for_status()
         yield from _sse_to_ndjson(r, payload["model"])

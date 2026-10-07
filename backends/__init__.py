@@ -1,4 +1,4 @@
-"""backends/__init__.py — backend registry and router.
+"""backends/__init__.py - backend registry and router.
 
 Selects a backend instance based on the model name prefix.
 Add entries to _REGISTRY to register new backends.

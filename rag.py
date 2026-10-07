@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""rag.py — L1.5 external semantic recall store for chatd.
+"""rag.py - L1.5 external semantic recall store for chatd.
 
-Implements the request-scoped RAG sidecar layer (L1.5) — a chatd-owned
+Implements the request-scoped RAG sidecar layer (L1.5) - a chatd-owned
 SQLite store completely separate from mempalace. Conversation turns are
 embedded via the active backend and retrieved by cosine similarity for
 the current user message.

@@ -1,4 +1,4 @@
-"""backends/onnx.py — ONNX Runtime inference backend.
+"""backends/onnx.py - ONNX Runtime inference backend.
 
 IMPORTANT: This backend is intentionally minimal and serves as a
 reference implementation for non-LLM models (classifiers, encoders,
@@ -74,7 +74,7 @@ class OnnxBackend:
 
     Default use-case: sentence encoder / reranker for RAG embed().
     chat_stream and chat_sync are not implemented for generic ONNX models
-    — override in a subclass for LLM-style ONNX models.
+    - override in a subclass for LLM-style ONNX models.
     """
 
     def chat_stream(

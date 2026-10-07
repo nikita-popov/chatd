@@ -29,7 +29,7 @@ Every request assembles a system prompt from layered memory sources:
 
 | Layer | Owner | Content | When |
 |-------|-------|---------|------|
-| L0 | mempalace | `identity.txt` — persona, rules | Always |
+| L0 | mempalace | `identity.txt` - persona, rules | Always |
 | L1 | mempalace | Essential Story (wake-up context) | Always |
 | L1.5 | chatd | KG recall (entity facts) + RAG sidecar (semantic chunks) | Always |
 | L2 | mempalace | Room Recall (filtered retrieval) | When topic comes up |
@@ -80,7 +80,7 @@ The service binds to `0.0.0.0:5001` via gunicorn (1 worker, 4 threads).
 
 **nginx:** see `example.nginx.conf`. Key points:
 
-- `gzip off` on `/api/` — nginx buffers gzip and breaks streaming
+- `gzip off` on `/api/` - nginx buffers gzip and breaks streaming
 - `proxy_buffering off` on `/api/`
 - `proxy_set_header Connection ""` for HTTP/1.1 keepalive upstream
 
@@ -123,17 +123,17 @@ The file is loaded by MemPalace `wake-up` as L0 context on every request.
 ## Background thinking
 
 `chatd` can run a background worker ("subconscious") on a timer. It reads
-context and — when enabled — maintains its own goal ledger. It never writes
+context and - when enabled - maintains its own goal ledger. It never writes
 to canonical memory.
 
 ### State layout
 
 Everything lives in `$CHATD_BG_STATE_DIR` (default `~/.local/share/chatd/bg`):
 
-- `goals.json`     — goal ledger (atomic rewrite via tmp+rename)
-- `budget.json`    — daily token and time counters
-- `journal.jsonl`  — append-only tick log
-- `tick.lock`      — flock; overlapping ticks are skipped
+- `goals.json`     - goal ledger (atomic rewrite via tmp+rename)
+- `budget.json`    - daily token and time counters
+- `journal.jsonl`  - append-only tick log
+- `tick.lock`      - flock; overlapping ticks are skipped
 
 ### Phases
 
@@ -201,10 +201,10 @@ Inference routing is handled by `backends/`:
 
 | Prefix | Backend | Notes |
 |--------|---------|-------|
-| *(none)* | `OllamaBackend` | Default — local Ollama over HTTP |
-| `or/` | `OpenRouterBackend` | Cloud — OpenAI-compatible API |
-| `onnx/` | `OnnxBackend` | Local ONNX encoder — embed-only, not for chat |
-| `deepseek/` | `DeepSeekBackend` | Cloud — DeepSeek API, OpenAI-compatible |
+| *(none)* | `OllamaBackend` | Default - local Ollama over HTTP |
+| `or/` | `OpenRouterBackend` | Cloud - OpenAI-compatible API |
+| `onnx/` | `OnnxBackend` | Local ONNX encoder - embed-only, not for chat |
+| `deepseek/` | `DeepSeekBackend` | Cloud - DeepSeek API, OpenAI-compatible |
 
 Add a new backend by implementing `BackendProtocol` (`backends/base.py`) and registering it in `backends/__init__.py`.
 

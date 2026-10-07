@@ -81,7 +81,7 @@ OPENROUTER_API_MODELS: List[str] = [
 # ── Events ──────────────────────────────────────────────────────────────────────────
 # Optional shared secret for /api/event.
 # If set, caller must pass Authorization: Bearer <token>.
-# If empty — endpoint is open (only for trusted internal networks).
+# If empty - endpoint is open (only for trusted internal networks).
 CHATD_EVENT_TOKEN: str = os.environ.get("CHATD_EVENT_TOKEN", "")
 
 # Model used to process incoming events (can differ from chat model).
@@ -127,13 +127,13 @@ DEEPSEEK_API_MODELS = [
 ]
 
 # ── Background thinking (subconscious) ───────────────────────────────────────
-# Disabled by default — enable per-installation if you want a periodic
+# Disabled by default - enable per-installation if you want a periodic
 # background worker ("subconscious") that observes and proposes, but never
 # writes to canonical memory.
 BG_ENABLED: bool = os.environ.get("CHATD_BG_ENABLED", "false").lower() == "true"
 
 # Optional bearer token. If set, /api/tick requires Authorization: Bearer <token>.
-# Keep separate from CHATD_EVENT_TOKEN — different triggers, different secrets.
+# Keep separate from CHATD_EVENT_TOKEN - different triggers, different secrets.
 BG_TOKEN: str = os.environ.get("CHATD_BG_TOKEN", "")
 
 # Where the background worker keeps its own state (journal, ledger, locks).
@@ -142,7 +142,7 @@ BG_STATE_DIR: str = os.environ.get(
     "CHATD_BG_STATE_DIR", "~/.local/share/chatd/bg"
 )
 
-# Session id used for background ticks — isolated from user chat sessions.
+# Session id used for background ticks - isolated from user chat sessions.
 BG_SESSION_ID: str = os.environ.get("CHATD_BG_SESSION_ID", "background")
 
 # Model used by the background worker. Same prefix routing as chat models
@@ -154,10 +154,10 @@ BG_MODEL: str = os.environ.get("CHATD_BG_MODEL", "qwen3:8b")
 # on CPU-only hosts.
 BG_NUM_PREDICT: int = int(os.environ.get("CHATD_BG_NUM_PREDICT", "256"))
 
-# Max tool rounds per tick (reserved for Planner/Executor — next PR).
+# Max tool rounds per tick (reserved for Planner/Executor - next PR).
 BG_MAX_TOOL_ROUNDS: int = int(os.environ.get("CHATD_BG_MAX_TOOL_ROUNDS", "5"))
 
-# Tools visible to the background worker — read-only subset.
+# Tools visible to the background worker - read-only subset.
 # Filter is applied when building the tool list for /api/tick.
 BG_TOOLS_ALLOWED: Set[str] = set(
     os.environ.get(
@@ -168,9 +168,9 @@ BG_TOOLS_ALLOWED: Set[str] = set(
     ).split(",")
 )
 
-# ── Background thinking — phases (PR C) ──────────────────────────────────────
+# ── Background thinking - phases (PR C) ──────────────────────────────────────
 # Per-phase model routing. If a phase var is empty, BG_MODEL is used as
-# fallback — this preserves backwards compatibility with PR B+.
+# fallback - this preserves backwards compatibility with PR B+.
 BG_MODEL_PLANNER: str = os.environ.get("CHATD_BG_MODEL_PLANNER", "")
 BG_MODEL_EXECUTOR: str = os.environ.get("CHATD_BG_MODEL_EXECUTOR", "")
 BG_MODEL_REFLECTOR: str = os.environ.get("CHATD_BG_MODEL_REFLECTOR", "")
@@ -182,7 +182,7 @@ BG_PHASE_TIMEOUT: int = int(os.environ.get("CHATD_BG_PHASE_TIMEOUT", "600"))
 BG_PHASE_TIMEOUT_EXECUTOR: int = int(
     os.environ.get("CHATD_BG_PHASE_TIMEOUT_EXECUTOR", "900")
 )
-# Whole-tick timeout — everything above should fit inside this.
+# Whole-tick timeout - everything above should fit inside this.
 BG_TICK_TIMEOUT: int = int(os.environ.get("CHATD_BG_TICK_TIMEOUT", "2700"))
 
 # Goal ledger limits.

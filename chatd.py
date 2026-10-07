@@ -59,7 +59,7 @@ VERSION = "1.0.0"
 TOOLS: List[Dict] = []
 TOOL_REGISTRY: Dict[str, MCPClient] = {}
 
-# All started MCP clients — used for clean shutdown via atexit.
+# All started MCP clients - used for clean shutdown via atexit.
 _MCP_CLIENTS: List[MCPClient] = []
 
 app = Flask(__name__)
@@ -76,18 +76,18 @@ EVENT_TOOL_LOOP_TIMEOUT = 120
 
 _EVENT_DIRECTIVE = (
     "\n\n"
-    "This is an automated system event — there is no human in the conversation.\n"
+    "This is an automated system event - there is no human in the conversation.\n"
     "\n"
-    "STEP 1 — Acknowledge immediately:\n"
+    "STEP 1 - Acknowledge immediately:\n"
     "  Call send_message (or the appropriate notification tool) RIGHT NOW to inform\n"
     "  the user that you received this event. If the event requires action, briefly\n"
-    "  say what you are about to do. If nothing needs to be done — say so and stop.\n"
+    "  say what you are about to do. If nothing needs to be done - say so and stop.\n"
     "\n"
-    "STEP 2 — Act (only if action is needed):\n"
+    "STEP 2 - Act (only if action is needed):\n"
     "  Call the required diagnostic or action tools to handle the event.\n"
-    "  Do NOT just describe what you would do — actually call the tools.\n"
+    "  Do NOT just describe what you would do - actually call the tools.\n"
     "\n"
-    "STEP 3 — Report result:\n"
+    "STEP 3 - Report result:\n"
     "  After all action tools are done, call send_message again to report\n"
     "  what was done and what was found.\n"
     "\n"
@@ -164,7 +164,7 @@ def merge_options(client_options: Optional[Dict]) -> Dict[str, Any]:
 def extract_chat_id(flask_request) -> Optional[str]:
     """Extract chat session ID from the Referer header.
 
-    Hollama sends requests from /sessions/<id> — the browser automatically
+    Hollama sends requests from /sessions/<id> - the browser automatically
     includes this URL as the Referer header, so we parse it from there.
     Falls back to scanning messages for a legacy chatId field.
     """
@@ -211,7 +211,7 @@ def ensure_system_prompt(
 ) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
     """Assemble the always-loaded memory block and prepend it as system message.
 
-    L0+L1 (wake-up base) is cached per session — rebuilt only on the first
+    L0+L1 (wake-up base) is cached per session - rebuilt only on the first
     request of each session, or after a mempalace write operation invalidates
     the cache.  L1.5 (KG recall + RAG sidecar) is always computed per-request
     because it depends on the current user message.
@@ -221,7 +221,7 @@ def ensure_system_prompt(
       L1.5_kg   KG recall sidecar
       L1.5_rag  RAG recall sidecar
 
-    Note: L0.5g (global summary) is intentionally omitted — MemPalace wake-up
+    Note: L0.5g (global summary) is intentionally omitted - MemPalace wake-up
     already covers the same information.
     """
     # L0+L1: use session cache when available
@@ -242,7 +242,7 @@ def ensure_system_prompt(
         "L1.5_rag": 0,
     }
 
-    # L1.5: always per-request — KG and RAG depend on the current question
+    # L1.5: always per-request - KG and RAG depend on the current question
     last_user = _last_user_text(messages)
     if last_user:
         extra = memory.kg_recall_from_text(last_user)
@@ -390,7 +390,7 @@ def run_tool_loop(
 
         if i == MAX_TOOL_ROUNDS - 1:
             payload.pop("tools", None)
-            log.info("[%s] tool_loop round %d: tools stripped — forcing final answer", req_id, i)
+            log.info("[%s] tool_loop round %d: tools stripped - forcing final answer", req_id, i)
 
         _log_payload_sizes(req_id, built, len(TOOLS), layer_sizes if i == 0 else None)
         log.debug("[%s] tool_loop round %d", req_id, i)
@@ -1001,7 +1001,7 @@ def chat_stream_generator(
 
         # Force without tools
         if not final_assistant_content:
-            log.info("[%s] no final content after loop — forcing final answer without tools",
+            log.info("[%s] no final content after loop - forcing final answer without tools",
                      req_id)
             final_built = build_model_messages(messages)
             final_payload = make_ollama_payload(model, final_built, options, stream=True)
@@ -1256,7 +1256,7 @@ def system_event():
     )
     messages: List[Dict[str, Any]] = [{"role": "user", "content": event_text}]
 
-    # /api/event has no session context — session=None, wake-up not cached
+    # /api/event has no session context - session=None, wake-up not cached
     messages, layer_sizes = ensure_system_prompt(messages, session=None)
 
     def _run():
@@ -1282,10 +1282,10 @@ def bg_tick():
     """Background thinking trigger (single-turn preview).
 
     Returns:
-      404 — background disabled (CHATD_BG_ENABLED=false)
-      401 — CHATD_BG_TOKEN set and bearer doesn't match
-      200 — {ok, req_id, result}
-      500 — internal error inside background.run_tick
+      404 - background disabled (CHATD_BG_ENABLED=false)
+      401 - CHATD_BG_TOKEN set and bearer doesn't match
+      200 - {ok, req_id, result}
+      500 - internal error inside background.run_tick
     """
     req_id = uuid.uuid4().hex[:8]
 

@@ -74,7 +74,7 @@ class ThinkingRemapper:
         if not thinking and self._state == "idle":
             return line
 
-        # Strip the separate thinking field — we fold it into content below.
+        # Strip the separate thinking field - we fold it into content below.
         if "thinking" in msg:
             del msg["thinking"]
 
