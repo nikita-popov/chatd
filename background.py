@@ -836,58 +836,90 @@ def _tick_impl(payload: Dict[str, Any], req_id: str) -> Dict[str, Any]:
         log.info("[bg %s] cancelled %d stale exploratory goal(s)",
                  req_id, cancelled)
 
-    # Planner
-    planner_result = _run_with_timeout(_planner, BG_PHASE_TIMEOUT)
-    tokens_used = planner_result["tokens"]
-    decision = planner_result["decision"]
-    _append_journal({
-        "req_id": req_id,
-        "ts": _now_iso(),
-        "phase": "planner",
-        "model": planner_result["model"],
-        "decision": decision,
-    })
-    log.info("[bg %s] planner: %s", req_id, decision.get("decision"))
-
-    # Apply planner decision to ledger
+    # ── Auto-resume pending exploratory before invoking the planner ────
+    # If a previous exploratory tick timed out or failed, its goal is left
+    # in `pending`. Do not spend time on the planner only for it to return
+    # `skip` and then discover there's already a pending exploratory. Take
+    # the existing goal directly - this is deterministic and saves a full
+    # planner round.
     goals = _read_goals()
-    picked_goal: Optional[Dict[str, Any]] = None
-    d = decision.get("decision")
+    existing_expl = _active_exploratory(goals["goals"])
 
-    if d == "new":
-        open_count = len(_open_goals(goals["goals"]))
-        if open_count >= BG_MAX_OPEN_GOALS:
-            log.info("[bg %s] new-goal blocked at ledger stage", req_id)
-        else:
-            g = _new_goal(decision.get("title", ""), kind="normal")
-            goals["goals"].append(g)
-            g["status"] = "active"
-            g["updated_at"] = _now_iso()
-            g.setdefault("history", []).append(
-                {"ts": g["updated_at"], "event": "status=active", "by": "planner"}
-            )
-            picked_goal = g
-            _write_goals(goals)
+    if existing_expl:
+        picked_goal = existing_expl[0]
+        picked_goal["status"] = "active"
+        picked_goal["updated_at"] = _now_iso()
+        picked_goal.setdefault("history", []).append({
+            "ts": picked_goal["updated_at"],
+            "event": "status=active",
+            "by": "system",
+            "note": "auto-resume",
+        })
+        _write_goals(goals)
+        _append_journal({
+            "req_id": req_id,
+            "ts": _now_iso(),
+            "phase": "planner",
+            "model": "(auto-resume)",
+            "decision": {"decision": "pick", "goal_id": picked_goal["id"],
+                         "reason": "auto-resume pending exploratory"},
+        })
+        tokens_used = 0
+        log.info("[bg %s] auto-resuming exploratory %s (attempts=%d)",
+                 req_id, picked_goal["id"], picked_goal.get("attempts", 0))
+    else:
+        # ── Planner ────────────────────────────────────────────────────
+        planner_result = _run_with_timeout(_planner, BG_PHASE_TIMEOUT)
+        tokens_used = planner_result["tokens"]
+        decision = planner_result["decision"]
+        _append_journal({
+            "req_id": req_id,
+            "ts": _now_iso(),
+            "phase": "planner",
+            "model": planner_result["model"],
+            "decision": decision,
+        })
+        log.info("[bg %s] planner: %s", req_id, decision.get("decision"))
 
-    elif d == "pick":
-        g = _find_goal(goals["goals"], decision.get("goal_id", ""))
-        if g is not None:
-            g["status"] = "active"
-            g["updated_at"] = _now_iso()
-            g.setdefault("history", []).append(
-                {"ts": g["updated_at"], "event": "status=active", "by": "planner"}
-            )
-            picked_goal = g
-            _write_goals(goals)
+        goals = _read_goals()
+        picked_goal: Optional[Dict[str, Any]] = None
+        d = decision.get("decision")
+
+        if d == "new":
+            open_count = len(_open_goals(goals["goals"]))
+            if open_count >= BG_MAX_OPEN_GOALS:
+                log.info("[bg %s] new-goal blocked at ledger stage", req_id)
+            else:
+                g = _new_goal(decision.get("title", ""), kind="normal")
+                goals["goals"].append(g)
+                g["status"] = "active"
+                g["updated_at"] = _now_iso()
+                g.setdefault("history", []).append(
+                    {"ts": g["updated_at"], "event": "status=active",
+                     "by": "planner"}
+                )
+                picked_goal = g
+                _write_goals(goals)
+
+        elif d == "pick":
+            g = _find_goal(goals["goals"], decision.get("goal_id", ""))
+            if g is not None:
+                g["status"] = "active"
+                g["updated_at"] = _now_iso()
+                g.setdefault("history", []).append(
+                    {"ts": g["updated_at"], "event": "status=active",
+                     "by": "planner"}
+                )
+                picked_goal = g
+                _write_goals(goals)
 
     # Remaining tick budget
     remaining = int(max(30, tick_deadline - time.time()))
     if remaining <= 0:
         raise TimeoutError("tick deadline exceeded after planner")
 
-    # Executor - either runs the picked goal, or explores read-only.
+    # ── Executor - runs picked goal, or explores read-only ─────────────
     if picked_goal is None:
-        # Exploratory path. Enforce per-day cap.
         goals = _read_goals()
         made_today = _exploratory_created_today(goals["goals"])
         if made_today >= BG_EXPLORATORY_PER_DAY:
@@ -898,17 +930,13 @@ def _tick_impl(payload: Dict[str, Any], req_id: str) -> Dict[str, Any]:
                 "status": "skipped",
                 "reason": "exploratory_cap_reached",
             }
-        if _active_exploratory(goals["goals"]):
-            log.info("[bg %s] exploratory already active", req_id)
-            return {
-                "req_id": req_id,
-                "status": "skipped",
-                "reason": "exploratory_already_active",
-            }
+        # Note: no need to check _active_exploratory here - if there was an
+        # active one, we would have auto-resumed it above.
         exp_goal = _new_goal("(exploratory tick)", kind="exploratory")
         exp_goal["status"] = "active"
         exp_goal.setdefault("history", []).append(
-            {"ts": exp_goal["updated_at"], "event": "status=active", "by": "planner"}
+            {"ts": exp_goal["updated_at"], "event": "status=active",
+             "by": "planner"}
         )
         goals["goals"].append(exp_goal)
         _write_goals(goals)
@@ -937,9 +965,9 @@ def _tick_impl(payload: Dict[str, Any], req_id: str) -> Dict[str, Any]:
         raise
 
     # Exploratory that produced zero tool calls is not "done" - it did
-    # nothing. Downgrade it to "failed" so it goes back into the ledger as
-    # pending (or blocked after BG_MAX_ATTEMPTS_PER_GOAL) instead of
-    # silently filling goals.json with empty entries.
+    # nothing. Downgrade it so it goes back into the ledger as pending
+    # (or blocked after BG_MAX_ATTEMPTS_PER_GOAL) instead of silently
+    # filling goals.json with empty entries.
     if (picked_goal["kind"] == "exploratory"
             and executor_result.get("tool_calls", 0) == 0
             and executor_result["outcome"] == "done"):
@@ -977,12 +1005,12 @@ def _tick_impl(payload: Dict[str, Any], req_id: str) -> Dict[str, Any]:
                 executor_result["observation"],
             )
 
-        # Add new_goals if room remains.
         open_count = len(_open_goals(goals["goals"]))
         added = 0
         for title in executor_result["new_goals"]:
             if open_count + added >= BG_MAX_OPEN_GOALS:
-                log.info("[bg %s] dropping extra new_goals (cap reached)", req_id)
+                log.info("[bg %s] dropping extra new_goals (cap reached)",
+                         req_id)
                 break
             goals["goals"].append(_new_goal(title, kind="normal"))
             added += 1
@@ -1000,7 +1028,8 @@ def _tick_impl(payload: Dict[str, Any], req_id: str) -> Dict[str, Any]:
             except TimeoutError as e:
                 log.warning("[bg %s] reflector timeout: %s", req_id, e)
                 refl = {"decision": "keep_blocked", "reason": "timeout",
-                        "model": BG_MODEL_REFLECTOR or BG_MODEL, "tokens": 0}
+                        "model": BG_MODEL_REFLECTOR or BG_MODEL,
+                        "tokens": 0}
 
             tokens_used += refl["tokens"]
             _append_journal({

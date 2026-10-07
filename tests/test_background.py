@@ -111,3 +111,16 @@ def test_exploratory_tool_calls_default_zero(bg):
     import inspect
     src = inspect.getsource(bg._executor)
     assert '"tool_calls": tool_calls_made' in src
+
+
+def test_auto_resume_picks_existing_exploratory(bg):
+    """When a pending exploratory exists, _active_exploratory must find it."""
+    goals = [
+        {"id": "g-1", "kind": "exploratory", "status": "pending",
+         "attempts": 1, "history": []},
+        {"id": "g-2", "kind": "normal", "status": "pending",
+         "attempts": 0, "history": []},
+    ]
+    active = bg._active_exploratory(goals)
+    assert len(active) == 1
+    assert active[0]["id"] == "g-1"
