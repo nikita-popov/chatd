@@ -16,6 +16,7 @@ from requests.exceptions import ReadTimeout, RequestException
 from flask import Flask, request, Response, jsonify, stream_with_context
 
 import backends
+import background
 import memory
 import rag
 import session as sess
@@ -34,6 +35,8 @@ from config import (
     OPENROUTER_API_MODELS,
     DEEPSEEK_API,
     DEEPSEEK_API_MODELS,
+    BG_ENABLED,
+    BG_TOKEN,
 )
 from backends.ollama import OLLAMA_API
 from backends.openrouter import fetch_model_info, OPENROUTER_PREFIX
@@ -465,8 +468,9 @@ def add_cors(response: Response) -> Response:
 
 
 @app.route("/api/chat",  methods=["OPTIONS"])
-@app.route("/chat",      methods=["OPTIONS"])
 @app.route("/api/event", methods=["OPTIONS"])
+@app.route("/api/tick",  methods=["OPTIONS"])
+@app.route("/chat",      methods=["OPTIONS"])
 def options_chat():
     return Response(status=204)
 
@@ -1269,6 +1273,47 @@ def system_event():
     t.start()
 
     return jsonify({"ok": True, "req_id": req_id}), 202
+
+
+# ── /api/tick ──────────────────────────────────────────────────────────────────
+
+@app.post("/api/tick")
+def bg_tick():
+    """Background thinking trigger (single-turn preview).
+
+    Returns:
+      404 — background disabled (CHATD_BG_ENABLED=false)
+      401 — CHATD_BG_TOKEN set and bearer doesn't match
+      200 — {ok, req_id, result}
+      500 — internal error inside background.run_tick
+    """
+    req_id = uuid.uuid4().hex[:8]
+
+    if not BG_ENABLED:
+        return jsonify({"error": "background disabled"}), 404
+
+    if BG_TOKEN:
+        auth = request.headers.get("Authorization", "")
+        if not auth.startswith("Bearer "):
+            return jsonify({"error": "missing Authorization header"}), 401
+        token = auth.removeprefix("Bearer ").strip()
+        if token != BG_TOKEN:
+            return jsonify({"error": "invalid token"}), 401
+
+    try:
+        payload = request.get_json(force=True, silent=True) or {}
+    except Exception:
+        payload = {}
+
+    log.info("[%s] POST /api/tick", req_id)
+
+    try:
+        result = background.run_tick(payload, req_id)
+    except Exception as e:
+        log.error("[%s] tick failed: %s", req_id, traceback.format_exc())
+        return jsonify({"error": str(e), "req_id": req_id}), 500
+
+    return jsonify({"ok": True, "req_id": req_id, "result": result}), 200
 
 
 init_tools()

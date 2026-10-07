@@ -125,3 +125,40 @@ DEEPSEEK_API_MODELS = [
     ).split(",")
     if m.strip()
 ]
+
+# ── Background thinking (subconscious) ───────────────────────────────────────
+# Disabled by default — enable per-installation if you want a periodic
+# background worker ("subconscious") that observes and proposes, but never
+# writes to canonical memory.
+BG_ENABLED: bool = os.environ.get("CHATD_BG_ENABLED", "false").lower() == "true"
+
+# Optional bearer token. If set, /api/tick requires Authorization: Bearer <token>.
+# Keep separate from CHATD_EVENT_TOKEN — different triggers, different secrets.
+BG_TOKEN: str = os.environ.get("CHATD_BG_TOKEN", "")
+
+# Where the background worker keeps its own state (journal, ledger, locks).
+# Never place this inside mempalace or session storage.
+BG_STATE_DIR: str = os.environ.get(
+    "CHATD_BG_STATE_DIR", "~/.local/share/chatd/bg"
+)
+
+# Session id used for background ticks — isolated from user chat sessions.
+BG_SESSION_ID: str = os.environ.get("CHATD_BG_SESSION_ID", "background")
+
+# Model used by the background worker. Same prefix routing as chat models
+# (e.g. "qwen3:8b" → Ollama, "deepseek/deepseek-flash" → DeepSeek).
+BG_MODEL: str = os.environ.get("CHATD_BG_MODEL", "qwen3:8b")
+
+# Max tool rounds per tick (reserved for Planner/Executor — next PR).
+BG_MAX_TOOL_ROUNDS: int = int(os.environ.get("CHATD_BG_MAX_TOOL_ROUNDS", "5"))
+
+# Tools visible to the background worker — read-only subset.
+# Filter is applied when building the tool list for /api/tick.
+BG_TOOLS_ALLOWED: Set[str] = set(
+    os.environ.get(
+        "CHATD_BG_TOOLS_ALLOWED",
+        "mempalace_search,mempalace_kg_query,mempalace_status,"
+        "mempalace_wake_up,mempalace_kg_timeline,"
+        "alerts_list,alerts_summary,monitor_query,notes_search",
+    ).split(",")
+)

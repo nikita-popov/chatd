@@ -120,6 +120,43 @@ The assistant identity and tool usage rules live in `identity.txt`.
 Edit it to change the persona, language, or memory behaviour.
 The file is loaded by MemPalace `wake-up` as L0 context on every request.
 
+## Background thinking (preview)
+
+`chatd` can act as a background worker ("subconscious") that runs on a
+timer, observes state, and — eventually — proposes new goals. It never
+writes to canonical memory.
+
+The background worker keeps its own state in `$CHATD_BG_STATE_DIR`
+(default `~/.local/share/chatd/bg`):
+
+- `journal.jsonl` — append-only log of ticks
+- `tick.lock`     — concurrency lock (overlapping ticks are skipped)
+
+**Status:** single-turn preview. `/api/tick` calls `BG_MODEL` once with
+the wake-up block as system prompt and returns the model's text. No tools,
+no memory writes, no goals yet. Planner / Executor / Reflector phases will
+be added in a follow-up.
+
+**Enable:**
+
+```sh
+CHATD_BG_ENABLED=true
+CHATD_BG_TOKEN=<random-secret>
+CHATD_BG_MODEL=qwen3:8b
+```
+
+**Trigger:**
+
+```sh
+curl -X POST http://127.0.0.1:5001/api/tick \
+  -H "Authorization: Bearer $CHATD_BG_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{}'
+```
+
+When `CHATD_BG_ENABLED=false` (default), the endpoint returns `404`.
+When `CHATD_BG_TOKEN` is set but the bearer doesn't match, `401`.
+
 ## Backends
 
 Inference routing is handled by `backends/`:
@@ -186,6 +223,13 @@ All `CHATD_RAG_*` variables are documented in `.env.example`.
 | `DEEPSEEK_API_KEY` | *(unset)* | DeepSeek API key |
 | `CHATD_DEEPSEEK_API` | `https://api.deepseek.com` | DeepSeek API base URL |
 | `CHATD_DEEPSEEK_MODELS` | `deepseek-flash` | Comma-separated DeepSeek models to expose in `/api/tags` |
+| `CHATD_BG_ENABLED` | `false` | Enable background worker (`/api/tick`) |
+| `CHATD_BG_TOKEN` | *(unset)* | Bearer token for `/api/tick` |
+| `CHATD_BG_STATE_DIR` | `~/.local/share/chatd/bg` | Background worker state |
+| `CHATD_BG_SESSION_ID` | `background` | Isolated session id |
+| `CHATD_BG_MODEL` | `qwen3:8b` | Model for background worker |
+| `CHATD_BG_MAX_TOOL_ROUNDS` | `5` | Max tool rounds per tick (reserved) |
+| `CHATD_BG_TOOLS_ALLOWED` | *(read-only list)* | Tools visible to background |
 
 Full list with comments: `.env.example`.
 
