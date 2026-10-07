@@ -59,6 +59,7 @@ from config import (
     BG_EXPLORATORY_TTL_HOURS,
     BG_PHASE_TIMEOUT,
     BG_PHASE_TIMEOUT_EXECUTOR,
+    BG_PHASE_TIMEOUT_EXPLORATORY,
     BG_TICK_TIMEOUT,
     BG_DAILY_TOKEN_BUDGET,
     BG_DAILY_TIME_BUDGET_SEC,
@@ -594,25 +595,83 @@ def _executor(goal: Dict[str, Any]) -> Dict[str, Any]:
     kind = goal.get("kind", "normal")
     tools = _allowed_tools_for(kind)
 
-    if kind == "normal":
-        user_text = (
-            f"Goal: {goal['title']}\n"
-            f"Attempt: {goal['attempts'] + 1} of {BG_MAX_ATTEMPTS_PER_GOAL}\n"
-            f"Previous result: {goal.get('last_result') or '(none)'}\n\n"
-            f"Work the goal using the available tools, then produce the JSON "
-            f"summary as instructed."
-        )
-        instructions = _EXECUTOR_JSON_INSTRUCTIONS
-    else:
-        user_text = (
-            f"Context: no open goals.\n"
-            f"Investigate read-only. Return the JSON summary."
-        )
-        instructions = _EXPLORATORY_INSTRUCTIONS
+    # ── Exploratory: single LLM call, no tool loop ──────────────────────
+    # On slow hardware a tool loop of 2-3 rounds costs 10+ minutes and
+    # never fits the phase budget. Exploratory does exactly one
+    # deterministic read-only tool call (seed), then asks the model to
+    # interpret the result. One LLM call total.
+    if kind == "exploratory":
+        if not tools:
+            return {
+                "model": model, "tokens": 0, "tool_calls": 0,
+                "outcome": "failed",
+                "observation": "no read-only tools available",
+                "new_status": "blocked", "new_goals": [],
+            }
+        seed = _exploratory_seed_tool(tools)
+        seed_name = (seed.get("function") or {}).get("name", "?")
+        log.info("[bg executor] exploratory seed tool: %s", seed_name)
+        seed_result = _execute_tool_call({
+            "function": {"name": seed_name, "arguments": {}}
+        })
+        seed_str = json.dumps(seed_result, ensure_ascii=False)[:4000]
+
+        messages: List[Dict[str, Any]] = [
+            {"role": "system", "content": _system_block()},
+            {"role": "system", "content": _EXPLORATORY_INSTRUCTIONS},
+            {"role": "user", "content":
+                f"I ran the read-only tool {seed_name} with empty arguments.\n"
+                f"Result:\n{seed_str}\n\n"
+                f"Interpret this result in one short paragraph. If it suggests "
+                f"a concrete follow-up, put it in new_goals; otherwise leave "
+                f"new_goals empty. Produce ONLY the JSON summary."
+            },
+        ]
+        tokens_total = 0
+        try:
+            resp = _llm_call(messages, model, tools=None,
+                             num_predict=BG_NUM_PREDICT)
+            tokens_total = resp["tokens"]
+            parsed = _extract_json(resp["content"]) or {}
+        except Exception as e:
+            log.warning("[bg executor] exploratory LLM call failed: %s", e)
+            parsed = {}
+
+        outcome = parsed.get("outcome") if parsed.get("outcome") in (
+            "done", "partial", "failed"
+        ) else "done"
+        observation = str(parsed.get("observation") or "").strip()
+        if not observation:
+            observation = "(empty observation)"
+        new_goals = []
+        raw = parsed.get("new_goals") or []
+        if isinstance(raw, list):
+            for item in raw[:3]:
+                if isinstance(item, dict):
+                    t = str(item.get("title") or "").strip()
+                    if t:
+                        new_goals.append(t[:300])
+
+        return {
+            "model": model, "tokens": tokens_total, "tool_calls": 1,
+            "outcome": outcome,
+            "observation": observation,
+            "new_status": "done",
+            "new_goals": new_goals,
+        }
+
+    # ── Normal goal: tool loop + summary ────────────────────────────────
+    user_text = (
+        f"Goal: {goal['title']}\n"
+        f"Attempt: {goal['attempts'] + 1} of {BG_MAX_ATTEMPTS_PER_GOAL}\n"
+        f"Previous result: {goal.get('last_result') or '(none)'}\n\n"
+        f"Work the goal using the available tools, then produce the JSON "
+        f"summary as instructed."
+    )
 
     messages: List[Dict[str, Any]] = [
         {"role": "system", "content": _system_block()},
-        {"role": "system", "content": instructions},
+        {"role": "system", "content": _EXECUTOR_JSON_INSTRUCTIONS},
         {"role": "user", "content": user_text},
     ]
 
@@ -627,32 +686,6 @@ def _executor(goal: Dict[str, Any]) -> Dict[str, Any]:
     except Exception as e:
         log.warning("[bg executor] tool loop failed: %s", e)
 
-    # Exploratory must produce at least one tool call. Retry once with an
-    # explicit nudge; if the second attempt also fails, we accept the
-    # outcome but the caller will downgrade it to "failed".
-    if kind == "exploratory" and tool_calls_made == 0:
-        log.info("[bg executor] exploratory made no tool calls - retrying once")
-        tool_names = ", ".join(
-            (t.get("function") or {}).get("name", "?") for t in tools
-        )
-        messages.append({
-            "role": "user",
-            "content": (
-                "You did not call any tool. You MUST call at least one "
-                "read-only tool before producing the final JSON. "
-                f"Available tool names: {tool_names}"
-            ),
-        })
-        try:
-            t, c = _executor_tool_loop(
-                messages, model, tools, BG_MAX_TOOL_ROUNDS
-            )
-            tokens_total += t
-            tool_calls_made += c
-        except Exception as e:
-            log.warning("[bg executor] retry failed: %s", e)
-
-    # Final summary call - no tools, forces a clean JSON answer.
     messages.append({
         "role": "user",
         "content": "Now produce ONLY the JSON summary object.",
@@ -881,7 +914,11 @@ def _tick_impl(payload: Dict[str, Any], req_id: str) -> Dict[str, Any]:
         _write_goals(goals)
         picked_goal = exp_goal
 
-    phase_timeout = min(remaining, BG_PHASE_TIMEOUT_EXECUTOR)
+    if picked_goal["kind"] == "exploratory":
+        phase_timeout = min(remaining, BG_PHASE_TIMEOUT_EXPLORATORY)
+    else:
+        phase_timeout = min(remaining, BG_PHASE_TIMEOUT_EXECUTOR)
+
     try:
         executor_result = _run_with_timeout(
             _executor, phase_timeout, picked_goal

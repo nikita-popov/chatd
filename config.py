@@ -180,10 +180,16 @@ BG_MODEL_THINK: str = os.environ.get("CHATD_BG_MODEL_THINK", "")
 # Per-phase timeouts (seconds). Executor gets more room for its tool loop.
 BG_PHASE_TIMEOUT: int = int(os.environ.get("CHATD_BG_PHASE_TIMEOUT", "600"))
 BG_PHASE_TIMEOUT_EXECUTOR: int = int(
-    os.environ.get("CHATD_BG_PHASE_TIMEOUT_EXECUTOR", "900")
+    os.environ.get("CHATD_BG_PHASE_TIMEOUT_EXECUTOR", "1500")
+)
+# Per-phase timeout for exploratory ticks. Exploratory does one deterministic
+# seed tool call and one LLM call - no tool loop - so it needs less headroom
+# than a normal executor phase.
+BG_PHASE_TIMEOUT_EXPLORATORY: int = int(
+    os.environ.get("CHATD_BG_PHASE_TIMEOUT_EXPLORATORY", "600")
 )
 # Whole-tick timeout - everything above should fit inside this.
-BG_TICK_TIMEOUT: int = int(os.environ.get("CHATD_BG_TICK_TIMEOUT", "2700"))
+BG_TICK_TIMEOUT: int = int(os.environ.get("CHATD_BG_TICK_TIMEOUT", "3600"))
 
 # Goal ledger limits.
 BG_MAX_ATTEMPTS_PER_GOAL: int = int(
