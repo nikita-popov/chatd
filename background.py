@@ -550,6 +550,10 @@ _EXPLORATORY_SEED_PREFERENCE = [
     "mempalace_kg_timeline",
     "mempalace_status",
     "monitor_query",
+    "notes_search",
+    "alerts_summary",
+    "mempalace_list_wings",
+    "mempalace_list_rooms",
 ]
 
 
@@ -566,6 +570,35 @@ def _exploratory_seed_tool(tools: List[Dict[str, Any]]) -> Optional[Dict[str, An
         if name in by_name:
             return by_name[name]
     return tools[0] if tools else None
+
+
+def _seed_state_path() -> Path:
+    return _state_dir() / "seed_rotation.json"
+
+
+def _pick_seed_tool(tools: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Rotate through available seed tools, one per exploratory tick.
+
+    The rotation index is persisted so consecutive exploratory ticks produce
+    different observations instead of re-reading the same KG timeline.
+    """
+    by_name = {(t.get("function") or {}).get("name"): t for t in tools}
+    available = [
+        by_name[name] for name in _EXPLORATORY_SEED_PREFERENCE
+        if name in by_name
+    ]
+    if not available:
+        return tools[0] if tools else None
+
+    state = _read_json(_seed_state_path(), {"last_index": -1})
+    idx = (int(state.get("last_index", -1)) + 1) % len(available)
+    _atomic_write_json(_seed_state_path(), {"last_index": idx})
+
+    picked = available[idx]
+    log.info("[bg executor] exploratory seed rotation: idx=%d/%d tool=%s",
+             idx, len(available),
+             (picked.get("function") or {}).get("name", "?"))
+    return picked
 
 
 def _executor_tool_loop(
@@ -631,7 +664,7 @@ def _executor(goal: Dict[str, Any]) -> Dict[str, Any]:
                 "observation": "no read-only tools available",
                 "new_status": "blocked", "new_goals": [],
             }
-        seed = _exploratory_seed_tool(tools)
+        seed = _pick_seed_tool(tools)
         seed_name = (seed.get("function") or {}).get("name", "?")
         log.info("[bg executor] exploratory seed tool: %s", seed_name)
         seed_result = _execute_tool_call({
@@ -640,7 +673,11 @@ def _executor(goal: Dict[str, Any]) -> Dict[str, Any]:
         seed_str = json.dumps(seed_result, ensure_ascii=False)[:4000]
 
         messages: List[Dict[str, Any]] = [
-            {"role": "system", "content": _system_block()},
+            # Deliberately no full wake-up here — exploratory gets its
+            # context from the seed tool result, not from the static KG
+            # block. This cuts prefill from ~3500 chars to ~200 and forces
+            # the model to look at fresh data instead of recalled facts.
+            # {"role": "system", "content": _system_block()},
             {"role": "system", "content": _EXPLORATORY_INSTRUCTIONS},
             {"role": "user", "content":
                 f"I ran the read-only tool {seed_name} with empty arguments.\n"
@@ -675,13 +712,20 @@ def _executor(goal: Dict[str, Any]) -> Dict[str, Any]:
                     if t:
                         new_goals.append(t[:300])
 
+        # Derive a readable title from the observation so goals.json isn't
+        # full of "(exploratory tick)" entries.
+        title = (observation[:80].rstrip() or "(exploratory tick)") \
+            if observation else "(exploratory tick)"
+
         return {
             "model": model, "tokens": tokens_total, "tool_calls": 1,
             "outcome": outcome,
             "observation": observation,
             "new_status": "done",
             "new_goals": new_goals,
+            "title": title,
         }
+
 
     # ── Normal goal: tool loop + summary ────────────────────────────────
     user_text = (
@@ -1021,6 +1065,8 @@ def _tick_impl(payload: Dict[str, Any], req_id: str) -> Dict[str, Any]:
             if g["status"] == "blocked":
                 reflector_needed = True
         else:
+            if picked_goal["kind"] == "exploratory" and executor_result.get("title"):
+                g["title"] = executor_result["title"]
             _apply_goal_update(
                 g,
                 executor_result["new_status"] if executor_result["new_status"]
