@@ -549,11 +549,13 @@ _EXPLORATORY_SEED_PREFERENCE = [
     "alerts_list",
     "mempalace_kg_timeline",
     "mempalace_status",
+    "mempalace_kg_stats",
+    "mempalace_graph_stats",
+    "mempalace_list_wings",
+    "mempalace_get_taxonomy",
+    "mempalace_diary_read",
     "monitor_query",
     "notes_search",
-    "alerts_summary",
-    "mempalace_list_wings",
-    "mempalace_list_rooms",
 ]
 
 
@@ -935,6 +937,28 @@ def _tick_impl(payload: Dict[str, Any], req_id: str) -> Dict[str, Any]:
         log.info("[bg %s] auto-resuming exploratory %s (attempts=%d)",
                  req_id, picked_goal["id"], picked_goal.get("attempts", 0))
     else:
+        # Short-circuit: if there is nothing useful the planner could do,
+        # do not spend 2.5 minutes on it. The planner can only act on
+        # pending open goals or create a new exploratory — if neither is
+        # possible, skip outright.
+        goals_now = _read_goals()
+        open_now = _open_goals(goals_now["goals"])
+        made_today = _exploratory_created_today(goals_now["goals"])
+        if not open_now and made_today >= BG_EXPLORATORY_PER_DAY:
+            log.info("[bg %s] short-circuit: no open goals, exploratory cap "
+                     "reached (%d/%d)", req_id, made_today,
+                     BG_EXPLORATORY_PER_DAY)
+            _append_journal({
+                "req_id": req_id, "ts": _now_iso(),
+                "status": "skipped",
+                "reason": "no_open_goals_and_exploratory_cap_reached",
+            })
+            return {
+                "req_id": req_id,
+                "status": "skipped",
+                "reason": "no_open_goals_and_exploratory_cap_reached",
+            }
+
         # ── Planner ────────────────────────────────────────────────────
         planner_result = _run_with_timeout(_planner, BG_PHASE_TIMEOUT)
         tokens_used = planner_result["tokens"]
