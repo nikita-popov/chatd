@@ -77,8 +77,12 @@ BUDGET_VERSION = 1
 # Read-only subset used for exploratory goals - intersection of any tool
 # list with these suffixes. Keeps the "read-only" promise even if the
 # operator accidentally adds write tools to BG_TOOLS_ALLOWED.
-_READONLY_SUFFIXES = ("_search", "_query", "_status", "_list", "_summary",
-                      "_timeline", "_wake_up")
+_READONLY_SUFFIXES = (
+    "_search", "_query", "_status", "_list", "_summary",
+    "_timeline", "_wake_up", "_stats", "_read", "_wings",
+    "_rooms", "_taxonomy", "_peers", "_tunnels", "_hallways",
+    "_drawer", "_drawers", "_duplicate", "_away", "_settings",
+)
 
 
 # ── paths ─────────────────────────────────────────────────────────────────────
@@ -579,18 +583,23 @@ def _seed_state_path() -> Path:
 
 
 def _pick_seed_tool(tools: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    """Rotate through available seed tools, one per exploratory tick.
+    """Rotate through ALL available read-only tools, one per exploratory tick.
 
-    The rotation index is persisted so consecutive exploratory ticks produce
-    different observations instead of re-reading the same KG timeline.
+    Preference list is used only for ordering: preferred tools go first, the
+    rest follow. This guarantees rotation visits every available tool, not
+    just the ones in the preference list.
     """
+    if not tools:
+        return None
+
     by_name = {(t.get("function") or {}).get("name"): t for t in tools}
-    available = [
-        by_name[name] for name in _EXPLORATORY_SEED_PREFERENCE
-        if name in by_name
+    preferred = [by_name[n] for n in _EXPLORATORY_SEED_PREFERENCE if n in by_name]
+    preferred_names = {n for n in _EXPLORATORY_SEED_PREFERENCE if n in by_name}
+    rest = [
+        t for t in tools
+        if (t.get("function") or {}).get("name") not in preferred_names
     ]
-    if not available:
-        return tools[0] if tools else None
+    available = preferred + rest
 
     state = _read_json(_seed_state_path(), {"last_index": -1})
     idx = (int(state.get("last_index", -1)) + 1) % len(available)
