@@ -1243,14 +1243,18 @@ def _tick_impl(payload: Dict[str, Any], req_id: str) -> Dict[str, Any]:
     # nothing. Downgrade it so it goes back into the ledger as pending
     # (or blocked after BG_MAX_ATTEMPTS_PER_GOAL) instead of silently
     # filling goals.json with empty entries.
-    if (picked_goal["kind"] == "exploratory"
-            and executor_result.get("tool_calls", 0) == 0
-            and executor_result["outcome"] == "done"):
-        log.info("[bg %s] exploratory made no tool calls - marking as failed",
-                 req_id)
+    if (executor_result.get("tool_calls", 0) == 0
+            and executor_result["outcome"] in ("done", "partial")):
+        # An executor that produced no tool calls did not execute the goal.
+        # For exploratory this is always wrong; for normal goals it means
+        # the model answered from memory and likely hallucinated. Either
+        # way, mark as failed so attempts increment and Reflector can act.
+        log.info("[bg %s] executor made no tool calls (%s) - marking as failed",
+                 req_id, picked_goal["kind"])
         executor_result["outcome"] = "failed"
         if not executor_result["observation"]:
-            executor_result["observation"] = "exploratory made no tool calls"
+            executor_result["observation"] = \
+                f"executor made no tool calls ({picked_goal['kind']})"
 
     tokens_used += executor_result["tokens"]
     _append_journal({
