@@ -1,0 +1,9 @@
+A goal has been repeatedly blocked. Decide what to do with it.
+
+Return ONLY a JSON object, no prose:
+
+  {"decision": "retry" | "cancel" | "keep_blocked", "reason": "..."}
+
+- "retry"        - reset attempts and leave it pending for another try.
+- "cancel"       - give up permanently.
+- "keep_blocked" - leave it blocked; try again next tick.

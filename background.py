@@ -70,6 +70,10 @@ from config import (
     BG_MAX_NEW_GOALS_PER_DAY,
     BG_JOURNAL_MAX_MB,
     BG_JOURNAL_KEEP,
+    BG_PROMPT_PLANNER,
+    BG_PROMPT_EXECUTOR,
+    BG_PROMPT_EXPLORATORY,
+    BG_PROMPT_REFLECTOR,
 )
 
 log = logging.getLogger("chatd.bg")
@@ -86,6 +90,116 @@ _READONLY_SUFFIXES = (
     "_rooms", "_taxonomy", "_peers", "_tunnels", "_hallways",
     "_drawer", "_drawers", "_duplicate", "_away", "_settings",
 )
+
+_DEFAULT_PLANNER_INSTRUCTIONS = """\
+You are the planner of a background worker. Pick exactly one action.
+
+You are shown:
+- Recent observations from previous ticks (what you noticed).
+- Currently open goals (pending or active).
+- A hard cap on how many goals can be open at once.
+- A daily limit on how many NEW normal goals you may create.
+
+Return ONLY a JSON object, no prose, using one of these shapes:
+
+  {"decision": "pick", "goal_id": "<id>", "reason": "..."}
+  {"decision": "new",  "title": "...", "reason": "...", "based_on": "<ts>"}
+  {"decision": "skip", "reason": "..."}
+
+Rules:
+- "pick"  - choose an existing pending goal that is most relevant now.
+- "new"   - propose a NEW concrete goal. Only allowed if:
+              * open goals < cap, AND
+              * new goals created today < daily limit, AND
+              * you can point to a specific observation via "based_on".
+            The goal should FOLLOW UP on something you already observed.
+            Never invent work out of thin air.
+- "skip"  - nothing worth doing this tick.
+
+Good "new" examples (following up on observations):
+- "HTTP :80 is open globally"  -> "Check what service listens on port 80"
+- "10 expired facts in KG"     -> "List the 10 expired KG facts and decide if any should be renewed"
+- "wing 'user_family' has only 1 drawer" -> "Investigate why user_family wing is nearly empty"
+
+Bad "new" examples (do NOT do this):
+- "Check that ai00 is running" (vague, no basis in observations)
+- "Verify backups work" (already covered by borgmatic observation)
+- "Monitor disk space" (not based on any observation)
+
+If you cannot point to a specific observation, return "skip".
+"""
+
+_DEFAULT_EXECUTOR_INSTRUCTIONS = """\
+When you are done, produce ONLY a JSON object, no prose:
+
+  {"outcome": "done" | "partial" | "failed",
+   "observation": "one short paragraph",
+   "goal_updates": {"status": "done" | "partial" | "blocked",
+                    "last_result": "..."},
+   "new_goals": [{"title": "..."}]}
+
+Rules:
+- "done"    - goal fully completed.
+- "partial" - some progress, goal should stay open.
+- "failed"  - could not make progress; attempts will be incremented.
+- new_goals: only if you discovered something worth following up. May be [].
+"""
+
+_DEFAULT_EXPLORATORY_INSTRUCTIONS = """\
+No open goals were selected. Your task: perform ONE concrete read-only
+observation about the current infrastructure state.
+
+You MUST:
+1. Pick one read-only tool from the available tool list.
+2. Call it with a sensible default query.
+3. Read the result.
+4. Report in one short paragraph what you observed.
+
+You MUST call at least one tool before producing the final JSON. If the
+tool returns nothing useful, say so - but the call still must happen.
+
+When you are done, produce ONLY a JSON object, no prose:
+
+  {"outcome": "done",
+   "observation": "one short paragraph",
+   "goal_updates": {"status": "done", "last_result": "..."},
+   "new_goals": []}
+"""
+
+_DEFAULT_REFLECTOR_INSTRUCTIONS = """\
+A goal has been repeatedly blocked. Decide what to do with it.
+
+Return ONLY a JSON object, no prose:
+
+  {"decision": "retry" | "cancel" | "keep_blocked", "reason": "..."}
+
+- "retry"        - reset attempts and leave it pending for another try.
+- "cancel"       - give up permanently.
+- "keep_blocked" - leave it blocked; try again next tick.
+"""
+
+# Resolved prompts: file/env override wins, code default is the fallback.
+_PLANNER_INSTRUCTIONS = BG_PROMPT_PLANNER or _DEFAULT_PLANNER_INSTRUCTIONS
+_EXECUTOR_JSON_INSTRUCTIONS = BG_PROMPT_EXECUTOR or _DEFAULT_EXECUTOR_INSTRUCTIONS
+_EXPLORATORY_INSTRUCTIONS = BG_PROMPT_EXPLORATORY or _DEFAULT_EXPLORATORY_INSTRUCTIONS
+_REFLECTOR_INSTRUCTIONS = BG_PROMPT_REFLECTOR or _DEFAULT_REFLECTOR_INSTRUCTIONS
+
+_EXPLORATORY_SEED_PREFERENCE = [
+    "alerts_list",
+    "mempalace_kg_timeline",
+    "mempalace_status",
+    "mempalace_kg_stats",
+    "mempalace_graph_stats",
+    "mempalace_list_wings",
+    "mempalace_get_taxonomy",
+    "mempalace_diary_read",
+    "monitor_query",
+    "notes_search",
+]
+
+
+
+
 
 
 # ── paths ─────────────────────────────────────────────────────────────────────
@@ -550,45 +664,6 @@ def _execute_tool_call(tc: Dict[str, Any]) -> Any:
 
 # ── Planner ───────────────────────────────────────────────────────────────────
 
-_PLANNER_INSTRUCTIONS = """\
-You are the planner of a background worker. Pick exactly one action.
-
-You are shown:
-- Recent observations from previous ticks (what you noticed).
-- Currently open goals (pending or active).
-- A hard cap on how many goals can be open at once.
-- A daily limit on how many NEW normal goals you may create.
-
-Return ONLY a JSON object, no prose, using one of these shapes:
-
-  {"decision": "pick", "goal_id": "<id>", "reason": "..."}
-  {"decision": "new",  "title": "...", "reason": "...", "based_on": "<ts>"}
-  {"decision": "skip", "reason": "..."}
-
-Rules:
-- "pick"  - choose an existing pending goal that is most relevant now.
-- "new"   - propose a NEW concrete goal. Only allowed if:
-              * open goals < cap, AND
-              * new goals created today < daily limit, AND
-              * you can point to a specific observation via "based_on".
-            The goal should FOLLOW UP on something you already observed.
-            Never invent work out of thin air.
-- "skip"  - nothing worth doing this tick.
-
-Good "new" examples (following up on observations):
-- "HTTP :80 is open globally"  -> "Check what service listens on port 80"
-- "10 expired facts in KG"     -> "List the 10 expired KG facts and decide if any should be renewed"
-- "wing 'user_family' has only 1 drawer" -> "Investigate why user_family wing is nearly empty"
-
-Bad "new" examples (do NOT do this):
-- "Check that ai00 is running" (vague, no basis in observations)
-- "Verify backups work" (already covered by borgmatic observation)
-- "Monitor disk space" (not based on any observation)
-
-If you cannot point to a specific observation, return "skip".
-"""
-
-
 def _planner() -> Dict[str, Any]:
     model = BG_MODEL_PLANNER or BG_MODEL
     goals = _read_goals()
@@ -672,58 +747,6 @@ def _planner() -> Dict[str, Any]:
 
 
 # ── Executor ──────────────────────────────────────────────────────────────────
-
-_EXECUTOR_JSON_INSTRUCTIONS = """\
-When you are done, produce ONLY a JSON object, no prose:
-
-  {"outcome": "done" | "partial" | "failed",
-   "observation": "one short paragraph",
-   "goal_updates": {"status": "done" | "partial" | "blocked",
-                    "last_result": "..."},
-   "new_goals": [{"title": "..."}]}
-
-Rules:
-- "done"    - goal fully completed.
-- "partial" - some progress, goal should stay open.
-- "failed"  - could not make progress; attempts will be incremented.
-- new_goals: only if you discovered something worth following up. May be [].
-"""
-
-_EXPLORATORY_INSTRUCTIONS = """\
-No open goals were selected. Your task: perform ONE concrete read-only
-observation about the current infrastructure state.
-
-You MUST:
-1. Pick one read-only tool from the available tool list.
-2. Call it with a sensible default query.
-3. Read the result.
-4. Report in one short paragraph what you observed.
-
-You MUST call at least one tool before producing the final JSON. If the
-tool returns nothing useful, say so - but the call still must happen.
-
-When you are done, produce ONLY a JSON object, no prose:
-
-  {"outcome": "done",
-   "observation": "one short paragraph",
-   "goal_updates": {"status": "done", "last_result": "..."},
-   "new_goals": []}
-"""
-
-
-_EXPLORATORY_SEED_PREFERENCE = [
-    "alerts_list",
-    "mempalace_kg_timeline",
-    "mempalace_status",
-    "mempalace_kg_stats",
-    "mempalace_graph_stats",
-    "mempalace_list_wings",
-    "mempalace_get_taxonomy",
-    "mempalace_diary_read",
-    "monitor_query",
-    "notes_search",
-]
-
 
 def _exploratory_seed_tool(tools: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     """Pick one read-only tool to call before invoking the LLM.
@@ -970,19 +993,6 @@ def _executor(goal: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # ── Reflector ─────────────────────────────────────────────────────────────────
-
-_REFLECTOR_INSTRUCTIONS = """\
-A goal has been repeatedly blocked. Decide what to do with it.
-
-Return ONLY a JSON object, no prose:
-
-  {"decision": "retry" | "cancel" | "keep_blocked", "reason": "..."}
-
-- "retry"        - reset attempts and leave it pending for another try.
-- "cancel"       - give up permanently.
-- "keep_blocked" - leave it blocked; try again next tick.
-"""
-
 
 def _reflector(goal: Dict[str, Any]) -> Dict[str, Any]:
     model = BG_MODEL_REFLECTOR or BG_MODEL

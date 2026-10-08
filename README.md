@@ -126,6 +126,28 @@ The file is loaded by MemPalace `wake-up` as L0 context on every request.
 context and - when enabled - maintains its own goal ledger. It never writes
 to canonical memory.
 
+### Overriding background prompts
+
+Background prompts (planner, executor, exploratory, reflector) ship as
+plain-text files in `prompts/`. They can be overridden per host or per user
+without editing code:
+
+1. `prompts/<name>.txt` — bundled default (in repo)
+2. `/etc/chatd/prompts/<name>.txt` — system override
+3. `~/.config/chatd/prompts/<name>.txt` — user override
+4. `CHATD_BG_PROMPT_<NAME>` env var — runtime override
+
+Later sources win. Example — override just the planner for this host:
+
+```sh
+sudo mkdir -p /etc/chatd/prompts
+sudo cp prompts/planner.txt /etc/chatd/prompts/planner.txt
+sudo $EDITOR /etc/chatd/prompts/planner.txt
+sudo systemctl restart chatd
+```
+
+The four names are: `planner`, `executor`, `exploratory`, `reflector`.
+
 ### State layout
 
 Everything lives in `$CHATD_BG_STATE_DIR` (default `~/.local/share/chatd/bg`):

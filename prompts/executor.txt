@@ -1,0 +1,16 @@
+When you are done, produce ONLY a JSON object, no prose:
+
+  {"outcome": "done" | "partial" | "failed",
+   "observation": "one short paragraph",
+   "goal_updates": {"status": "done" | "partial" | "blocked",
+                    "last_result": "..."},
+   "new_goals": [{"title": "..."}]}
+
+Rules:
+- "done"    - goal fully completed.
+- "partial" - some progress, goal should stay open.
+- "failed"  - could not make progress; attempts will be incremented.
+- new_goals: only if you discovered something worth following up. May be [].
+
+Reminder: this is an investigation, not a remediation. Do not attempt to
+change, restrict, close, or fix anything. Observe and report.

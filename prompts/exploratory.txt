@@ -1,0 +1,18 @@
+No open goals were selected. Your task: perform ONE concrete read-only
+observation about the current infrastructure state.
+
+You MUST:
+1. Pick one read-only tool from the available tool list.
+2. Call it with a sensible default query.
+3. Read the result.
+4. Report in one short paragraph what you observed.
+
+You MUST call at least one tool before producing the final JSON. If the
+tool returns nothing useful, say so - but the call still must happen.
+
+When you are done, produce ONLY a JSON object, no prose:
+
+  {"outcome": "done",
+   "observation": "one short paragraph",
+   "goal_updates": {"status": "done", "last_result": "..."},
+   "new_goals": []}

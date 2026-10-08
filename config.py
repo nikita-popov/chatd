@@ -235,3 +235,39 @@ BG_JOURNAL_MAX_MB: int = int(os.environ.get("CHATD_BG_JOURNAL_MAX_MB", "10"))
 
 # How many rotated journal files to keep. 0 = keep all.
 BG_JOURNAL_KEEP: int = int(os.environ.get("CHATD_BG_JOURNAL_KEEP", "5"))
+
+
+# ── Background prompts (layered override) ────────────────────────────────────
+# Each background prompt has a bundled default in ./prompts/<name>.txt.
+# Installations can override per-host or per-user without touching code:
+#
+#   1. prompts/<name>.txt                     (bundled default, in repo)
+#   2. /etc/chatd/prompts/<name>.txt          (system override)
+#   3. ~/.config/chatd/prompts/<name>.txt     (user override)
+#   4. CHATD_BG_PROMPT_<NAME> env var         (runtime override)
+#
+# Later sources override earlier ones. Empty result means "use code default",
+# which is the same as the bundled file at the time of release.
+
+def _load_bg_prompt(name: str) -> str:
+    paths = [
+        Path(__file__).parent / "prompts" / f"{name}.txt",
+        Path("/etc/chatd/prompts") / f"{name}.txt",
+        Path(os.path.expanduser("~/.config/chatd/prompts")) / f"{name}.txt",
+    ]
+    for p in paths:
+        if p.exists():
+            try:
+                text = p.read_text(encoding="utf-8").strip()
+                if text:
+                    return text
+            except Exception:
+                continue
+    env_key = f"CHATD_BG_PROMPT_{name.upper()}"
+    return os.environ.get(env_key, "")
+
+
+BG_PROMPT_PLANNER: str = _load_bg_prompt("planner")
+BG_PROMPT_EXECUTOR: str = _load_bg_prompt("executor")
+BG_PROMPT_EXPLORATORY: str = _load_bg_prompt("exploratory")
+BG_PROMPT_REFLECTOR: str = _load_bg_prompt("reflector")
