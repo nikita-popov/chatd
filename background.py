@@ -654,7 +654,7 @@ def _truncate_tool_result(result: Any) -> str:
 
     Prefill cost dominates on CPU-only hosts. A 40k-char mempalace_search
     result can add 15+ minutes to the next LLM call, so we cap aggressively.
-    The model still sees the first few KB — enough to decide the next step
+    The model still sees the first few KB - enough to decide the next step
     or produce a summary.
     """
     try:
@@ -897,7 +897,7 @@ def _executor(goal: Dict[str, Any]) -> Dict[str, Any]:
         seed_str = json.dumps(seed_result, ensure_ascii=False)[:4000]
 
         messages: List[Dict[str, Any]] = [
-            # Deliberately no full wake-up here — exploratory gets its
+            # Deliberately no full wake-up here - exploratory gets its
             # context from the seed tool result, not from the static KG
             # block. This cuts prefill from ~3500 chars to ~200 and forces
             # the model to look at fresh data instead of recalled facts.
@@ -1148,7 +1148,7 @@ def _tick_impl(payload: Dict[str, Any], req_id: str) -> Dict[str, Any]:
     else:
         # Short-circuit: if there is nothing useful the planner could do,
         # do not spend 2.5 minutes on it. The planner can only act on
-        # pending open goals or create a new exploratory — if neither is
+        # pending open goals or create a new exploratory - if neither is
         # possible, skip outright.
         goals_now = _read_goals()
         open_now = _open_goals(goals_now["goals"])

@@ -132,12 +132,12 @@ Background prompts (planner, executor, exploratory, reflector) ship as
 plain-text files in `prompts/`. They can be overridden per host or per user
 without editing code:
 
-1. `prompts/<name>.txt` — bundled default (in repo)
-2. `/etc/chatd/prompts/<name>.txt` — system override
-3. `~/.config/chatd/prompts/<name>.txt` — user override
-4. `CHATD_BG_PROMPT_<NAME>` env var — runtime override
+1. `prompts/<name>.txt` - bundled default (in repo)
+2. `/etc/chatd/prompts/<name>.txt` - system override
+3. `~/.config/chatd/prompts/<name>.txt` - user override
+4. `CHATD_BG_PROMPT_<NAME>` env var - runtime override
 
-Later sources win. Example — override just the planner for this host:
+Later sources win. Example - override just the planner for this host:
 
 ```sh
 sudo mkdir -p /etc/chatd/prompts

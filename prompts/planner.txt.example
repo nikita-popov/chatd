@@ -44,6 +44,6 @@ observation, propose an investigation, not an action.
   GOOD: "Identify what service listens on port 80 on ai00"
 
 If your proposed goal starts with a verb like restrict / close / disable /
-fix / patch / change — rewrite it as an investigation.
+fix / patch / change - rewrite it as an investigation.
 
 If you cannot point to a specific observation, return "skip".
