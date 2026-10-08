@@ -67,6 +67,9 @@ from config import (
     BG_SESSION_ID,
     BG_STATE_DIR,
     BG_TOOLS_ALLOWED,
+    BG_MAX_NEW_GOALS_PER_DAY,
+    BG_JOURNAL_MAX_MB,
+    BG_JOURNAL_KEEP,
 )
 
 log = logging.getLogger("chatd.bg")
@@ -109,6 +112,23 @@ def _lock_path() -> Path:
     return _state_dir() / "tick.lock"
 
 
+def _goals_archive_path() -> Path:
+    return _state_dir() / "goals.archive.jsonl"
+
+
+def _new_goals_counter_path() -> Path:
+    return _state_dir() / "new_goals_counter.json"
+
+
+def _append_archive(goal: Dict[str, Any]) -> None:
+    """Append one done/cancelled goal to the archive (JSONL)."""
+    try:
+        with _goals_archive_path().open("a", encoding="utf-8") as f:
+            f.write(json.dumps(goal, ensure_ascii=False) + "\n")
+    except Exception as e:
+        log.warning("[bg] goals archive append failed: %s", e)
+
+
 def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f") + "000Z"
 
@@ -145,8 +165,37 @@ def _read_json(path: Path, default: Dict[str, Any]) -> Dict[str, Any]:
 
 # ── journal ───────────────────────────────────────────────────────────────────
 
+def _rotate_journal_if_needed() -> None:
+    """Rotate journal.jsonl if it exceeds BG_JOURNAL_MAX_MB."""
+    if BG_JOURNAL_MAX_MB <= 0:
+        return
+    path = _journal_path()
+    if not path.exists():
+        return
+    try:
+        size_mb = path.stat().st_size / (1024 * 1024)
+        if size_mb < BG_JOURNAL_MAX_MB:
+            return
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        rotated = path.with_name(f"journal.{stamp}.jsonl")
+        os.rename(path, rotated)
+        log.info("[bg] journal rotated: %s -> %s (%.1f MB)",
+                 path.name, rotated.name, size_mb)
+        if BG_JOURNAL_KEEP > 0:
+            old = sorted(_state_dir().glob("journal.*.jsonl"))
+            for p in old[:-BG_JOURNAL_KEEP]:
+                try:
+                    p.unlink()
+                    log.debug("[bg] removed old journal: %s", p.name)
+                except Exception:
+                    pass
+    except Exception as e:
+        log.warning("[bg] journal rotation failed: %s", e)
+
+
 def _append_journal(entry: Dict[str, Any]) -> None:
     try:
+        _rotate_journal_if_needed()
         with _journal_path().open("a", encoding="utf-8") as f:
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
     except Exception as e:
@@ -255,8 +304,67 @@ def _read_goals() -> Dict[str, Any]:
 
 
 def _write_goals(g: Dict[str, Any]) -> None:
+    """Persist goals. Active/pending/blocked stay in goals.json;
+    done/cancelled get appended to goals.archive.jsonl and removed
+    from the active file.
+    """
+    active = []
+    for goal in g.get("goals", []):
+        if goal.get("status") in ("done", "cancelled"):
+            _append_archive(goal)
+        else:
+            active.append(goal)
+    g["goals"] = active
     g["updated_at"] = _now_iso()
     _atomic_write_json(_goals_path(), g)
+
+
+def _read_new_goals_counter() -> Dict[str, Any]:
+    c = _read_json(_new_goals_counter_path(), {"date": _today_utc(), "count": 0})
+    if c.get("date") != _today_utc():
+        c = {"date": _today_utc(), "count": 0}
+    return c
+
+
+def _increment_new_goals_counter() -> None:
+    c = _read_new_goals_counter()
+    c["count"] = int(c.get("count", 0)) + 1
+    c["date"] = _today_utc()
+    _atomic_write_json(_new_goals_counter_path(), c)
+
+
+def _new_goals_created_today() -> int:
+    return int(_read_new_goals_counter().get("count", 0))
+
+
+def _read_recent_observations(limit: int = 12) -> List[Dict[str, Any]]:
+    """Return the most recent observations from archive + active goals.
+
+    Used to give the planner context about what it has noticed before.
+    """
+    items: List[Dict[str, Any]] = []
+
+    archive_path = _goals_archive_path()
+    if archive_path.exists():
+        try:
+            with archive_path.open("r", encoding="utf-8") as f:
+                lines = f.readlines()[-limit * 3:]
+            for line in lines:
+                try:
+                    g = json.loads(line)
+                except Exception:
+                    continue
+                if g.get("last_result"):
+                    items.append(g)
+        except Exception as e:
+            log.debug("[bg] archive read failed: %s", e)
+
+    for g in _read_goals().get("goals", []):
+        if g.get("last_result"):
+            items.append(g)
+
+    items.sort(key=lambda x: x.get("updated_at", ""), reverse=True)
+    return items[:limit]
 
 
 def _open_goals(goals: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -445,18 +553,39 @@ def _execute_tool_call(tc: Dict[str, Any]) -> Any:
 _PLANNER_INSTRUCTIONS = """\
 You are the planner of a background worker. Pick exactly one action.
 
+You are shown:
+- Recent observations from previous ticks (what you noticed).
+- Currently open goals (pending or active).
+- A hard cap on how many goals can be open at once.
+- A daily limit on how many NEW normal goals you may create.
+
 Return ONLY a JSON object, no prose, using one of these shapes:
 
   {"decision": "pick", "goal_id": "<id>", "reason": "..."}
-  {"decision": "new",  "title": "...", "reason": "..."}
+  {"decision": "new",  "title": "...", "reason": "...", "based_on": "<ts>"}
   {"decision": "skip", "reason": "..."}
 
 Rules:
-- "pick" - choose an existing pending goal that is most relevant now.
-- "new"  - propose a new goal (only if open goals < cap, see below).
-- "skip" - nothing worth doing this tick.
+- "pick"  - choose an existing pending goal that is most relevant now.
+- "new"   - propose a NEW concrete goal. Only allowed if:
+              * open goals < cap, AND
+              * new goals created today < daily limit, AND
+              * you can point to a specific observation via "based_on".
+            The goal should FOLLOW UP on something you already observed.
+            Never invent work out of thin air.
+- "skip"  - nothing worth doing this tick.
 
-The open-goal cap is a hard limit. If open >= cap, "new" is not allowed.
+Good "new" examples (following up on observations):
+- "HTTP :80 is open globally"  -> "Check what service listens on port 80"
+- "10 expired facts in KG"     -> "List the 10 expired KG facts and decide if any should be renewed"
+- "wing 'user_family' has only 1 drawer" -> "Investigate why user_family wing is nearly empty"
+
+Bad "new" examples (do NOT do this):
+- "Check that ai00 is running" (vague, no basis in observations)
+- "Verify backups work" (already covered by borgmatic observation)
+- "Monitor disk space" (not based on any observation)
+
+If you cannot point to a specific observation, return "skip".
 """
 
 
@@ -465,6 +594,20 @@ def _planner() -> Dict[str, Any]:
     goals = _read_goals()
     open_list = _open_goals(goals["goals"])
     cap = BG_MAX_OPEN_GOALS
+
+    # Recent observations for context
+    observations = _read_recent_observations(limit=12)
+    obs_lines = []
+    for o in observations:
+        ts = (o.get("updated_at") or o.get("created_at") or "?")[:16]
+        kind = o.get("kind", "?")
+        res = (o.get("last_result") or "").replace("\n", " ").strip()
+        if len(res) > 250:
+            res = res[:250] + "..."
+        obs_lines.append(f"- [{ts}] ({kind}) {res}")
+    obs_block = "\n".join(obs_lines) if obs_lines else "(no observations yet)"
+
+    made_today = _new_goals_created_today()
 
     listing_lines = []
     for g in open_list:
@@ -475,8 +618,10 @@ def _planner() -> Dict[str, Any]:
     listing = "\n".join(listing_lines) if listing_lines else "(none)"
 
     user_text = (
+        f"Recent observations:\n{obs_block}\n\n"
         f"Open goals: {len(open_list)} / {cap}\n"
         f"{listing}\n\n"
+        f"New normal goals created today: {made_today} / {BG_MAX_NEW_GOALS_PER_DAY}\n\n"
         f"Return your JSON decision."
     )
 
@@ -490,10 +635,27 @@ def _planner() -> Dict[str, Any]:
     decision = _extract_json(resp["content"]) or {}
 
     d = decision.get("decision")
-    if d == "new" and len(open_list) >= cap:
-        log.info("[bg planner] 'new' rejected: open cap %d reached", cap)
-        decision = {"decision": "skip", "reason": "open-goal cap reached"}
-        d = "skip"
+
+    if d == "new":
+        if len(open_list) >= cap:
+            log.info("[bg planner] 'new' rejected: open cap reached")
+            decision = {"decision": "skip", "reason": "open-goal cap reached"}
+            d = "skip"
+        elif made_today >= BG_MAX_NEW_GOALS_PER_DAY:
+            log.info("[bg planner] 'new' rejected: daily new-goal limit reached")
+            decision = {"decision": "skip",
+                        "reason": "daily new-goal limit reached"}
+            d = "skip"
+        elif not decision.get("based_on"):
+            log.info("[bg planner] 'new' rejected: missing 'based_on'")
+            decision = {"decision": "skip",
+                        "reason": "new goal without based_on"}
+            d = "skip"
+        elif not decision.get("title"):
+            log.info("[bg planner] 'new' rejected: empty title")
+            decision = {"decision": "skip", "reason": "new goal without title"}
+            d = "skip"
+
     if d == "pick" and not _find_goal(goals["goals"], decision.get("goal_id", "")):
         log.info("[bg planner] 'pick' with unknown goal_id - downgrading to skip")
         decision = {"decision": "skip", "reason": "unknown goal_id"}
@@ -991,6 +1153,8 @@ def _tick_impl(payload: Dict[str, Any], req_id: str) -> Dict[str, Any]:
                 log.info("[bg %s] new-goal blocked at ledger stage", req_id)
             else:
                 g = _new_goal(decision.get("title", ""), kind="normal")
+                if decision.get("based_on"):
+                    g["based_on"] = decision["based_on"]
                 goals["goals"].append(g)
                 g["status"] = "active"
                 g["updated_at"] = _now_iso()
@@ -999,6 +1163,7 @@ def _tick_impl(payload: Dict[str, Any], req_id: str) -> Dict[str, Any]:
                      "by": "planner"}
                 )
                 picked_goal = g
+                _increment_new_goals_counter()
                 _write_goals(goals)
 
         elif d == "pick":

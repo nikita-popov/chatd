@@ -222,3 +222,16 @@ BG_DAILY_TOKEN_BUDGET: int = int(
 BG_DAILY_TIME_BUDGET_SEC: int = int(
     os.environ.get("CHATD_BG_DAILY_TIME_BUDGET_SEC", "0")
 )
+
+# Daily cap on new normal goals created by the planner. Prevents the 4B
+# model from inventing goals indefinitely when nothing changes.
+BG_MAX_NEW_GOALS_PER_DAY: int = int(
+    os.environ.get("CHATD_BG_MAX_NEW_GOALS_PER_DAY", "3")
+)
+
+# Journal rotation. Rotate journal.jsonl when it exceeds this size (MB).
+# 0 disables rotation.
+BG_JOURNAL_MAX_MB: int = int(os.environ.get("CHATD_BG_JOURNAL_MAX_MB", "10"))
+
+# How many rotated journal files to keep. 0 = keep all.
+BG_JOURNAL_KEEP: int = int(os.environ.get("CHATD_BG_JOURNAL_KEEP", "5"))
