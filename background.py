@@ -646,6 +646,31 @@ def _allowed_tools_for(kind: str) -> List[Dict[str, Any]]:
     return selected
 
 
+_MAX_TOOL_RESULT_CHARS = 3000
+
+
+def _truncate_tool_result(result: Any) -> str:
+    """Serialize a tool result and cap its size.
+
+    Prefill cost dominates on CPU-only hosts. A 40k-char mempalace_search
+    result can add 15+ minutes to the next LLM call, so we cap aggressively.
+    The model still sees the first few KB — enough to decide the next step
+    or produce a summary.
+    """
+    try:
+        serialized = json.dumps(result, ensure_ascii=False)
+    except Exception:
+        serialized = str(result)
+    if len(serialized) <= _MAX_TOOL_RESULT_CHARS:
+        return serialized
+    return (
+        serialized[:_MAX_TOOL_RESULT_CHARS]
+        + ' ... [truncated, result was '
+        + str(len(serialized))
+        + ' chars]'
+    )
+
+
 def _execute_tool_call(tc: Dict[str, Any]) -> Any:
     import chatd
     fn = tc.get("function") or {}
@@ -833,9 +858,12 @@ def _executor_tool_loop(
         for tc in tool_calls:
             result = _execute_tool_call(tc)
             tool_call_count += 1
+            truncated = _truncate_tool_result(result)
+            log.info("[bg executor] round %d tool result: %d chars (after cap)",
+                     round_num, len(truncated))
             messages.append({
                 "role": "tool",
-                "content": json.dumps(result, ensure_ascii=False),
+                "content": truncated,
             })
         log.info("[bg executor] round %d: %d tool call(s)",
                  round_num, len(tool_calls))
