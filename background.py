@@ -42,6 +42,7 @@ import re
 import threading
 import time
 import uuid
+from collections import deque
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -191,15 +192,14 @@ _EXPLORATORY_SEED_PREFERENCE = [
     "mempalace_kg_stats",
     "mempalace_graph_stats",
     "mempalace_list_wings",
+    "mempalace_list_rooms",
     "mempalace_get_taxonomy",
-    "mempalace_diary_read",
+    "mempalace_find_tunnels",
+    "mempalace_mesh_peers",
+    "mempalace_list_tunnels",
     "monitor_query",
     "notes_search",
 ]
-
-
-
-
 
 
 # ── paths ─────────────────────────────────────────────────────────────────────
@@ -689,6 +689,29 @@ def _execute_tool_call(tc: Dict[str, Any]) -> Any:
 
 # ── Planner ───────────────────────────────────────────────────────────────────
 
+def _read_recent_normal_goals(limit: int = 5) -> List[Dict[str, Any]]:
+    items = []
+    archive_path = _goals_archive_path()
+    if archive_path.exists():
+        try:
+            with archive_path.open("r", encoding="utf-8") as f:
+                tail = deque(f, maxlen=limit * 3)
+                for line in tail:
+                    try:
+                        g = json.loads(line)
+                    except Exception:
+                        continue
+                    if g.get("kind") == "normal":
+                        items.append(g)
+        except Exception:
+            pass
+    for g in _read_goals().get("goals", []):
+        if g.get("kind") == "normal":
+            items.append(g)
+    items.sort(key=lambda x: x.get("created_at", ""), reverse=True)
+    return items[:limit]
+
+
 def _planner() -> Dict[str, Any]:
     model = BG_MODEL_PLANNER or BG_MODEL
     goals = _read_goals()
@@ -709,7 +732,16 @@ def _planner() -> Dict[str, Any]:
 
     made_today = _new_goals_created_today()
 
+    # Recent normal goals — to prevent duplicate proposals. We look at
+    # the last 5 created normal goals regardless of status, because a
+    # completed investigation shouldn't be repeated.
+    recent_normal = _read_recent_normal_goals(limit=5)
+    recent_titles = "\n".join(
+        f"- {g.get('title', '?')}" for g in recent_normal
+    ) or "(none)"
+
     listing_lines = []
+
     for g in open_list:
         listing_lines.append(
             f"- id={g['id']} kind={g['kind']} attempts={g['attempts']} "
@@ -719,6 +751,7 @@ def _planner() -> Dict[str, Any]:
 
     user_text = (
         f"Recent observations:\n{obs_block}\n\n"
+        f"Recently created normal goals (do NOT duplicate these):\n{recent_titles}\n\n"
         f"Open goals: {len(open_list)} / {cap}\n"
         f"{listing}\n\n"
         f"New normal goals created today: {made_today} / {BG_MAX_NEW_GOALS_PER_DAY}\n\n"
@@ -792,21 +825,42 @@ def _seed_state_path() -> Path:
     return _state_dir() / "seed_rotation.json"
 
 
-def _pick_seed_tool(tools: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    """Rotate through ALL available read-only tools, one per exploratory tick.
+def _tool_needs_args(tool: Dict[str, Any]) -> bool:
+    """Return True if the tool has any required parameters.
 
-    Preference list is used only for ordering: preferred tools go first, the
-    rest follow. This guarantees rotation visits every available tool, not
-    just the ones in the preference list.
+    Exploratory seed tools are called with empty arguments. Any tool with
+    required parameters would fail immediately. We filter those out instead
+    of relying on a hand-maintained preference list.
+    """
+    fn = tool.get("function") or {}
+    params = fn.get("parameters") or {}
+    if not isinstance(params, dict):
+        return False
+    required = params.get("required") or []
+    return bool(required)
+
+
+def _pick_seed_tool(tools: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Rotate through read-only tools that can be called with no arguments.
+
+    Preference list is used for ordering: preferred tools go first, the
+    rest follow. Tools with required parameters are excluded entirely,
+    because calling them with {} would just return an error.
     """
     if not tools:
         return None
 
-    by_name = {(t.get("function") or {}).get("name"): t for t in tools}
+    # Exclude tools that need arguments - they will fail with {}.
+    callable_now = [t for t in tools if not _tool_needs_args(t)]
+    if not callable_now:
+        log.warning("[bg executor] no no-arg tools available for exploratory")
+        return None
+
+    by_name = {(t.get("function") or {}).get("name"): t for t in callable_now}
     preferred = [by_name[n] for n in _EXPLORATORY_SEED_PREFERENCE if n in by_name]
     preferred_names = {n for n in _EXPLORATORY_SEED_PREFERENCE if n in by_name}
     rest = [
-        t for t in tools
+        t for t in callable_now
         if (t.get("function") or {}).get("name") not in preferred_names
     ]
     available = preferred + rest
@@ -889,6 +943,13 @@ def _executor(goal: Dict[str, Any]) -> Dict[str, Any]:
                 "new_status": "blocked", "new_goals": [],
             }
         seed = _pick_seed_tool(tools)
+        if seed is None:
+            return {
+                "model": model, "tokens": 0, "tool_calls": 0,
+                "outcome": "failed",
+                "observation": "no no-arg read-only tools available",
+                "new_status": "blocked", "new_goals": [],
+            }
         seed_name = (seed.get("function") or {}).get("name", "?")
         log.info("[bg executor] exploratory seed tool: %s", seed_name)
         seed_result = _execute_tool_call({
