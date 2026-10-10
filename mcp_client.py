@@ -13,11 +13,19 @@ from typing import Any, Optional
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 try:
-    # Newer SDK
-    from mcp.client.streamable_http import streamable_http_client
+    # Newer SDK (mcp >= 1.10): headers via create_mcp_http_client
+    from mcp.client.streamable_http import (
+        streamable_http_client,
+        create_mcp_http_client,
+    )
+    _HTTP_NEW_API = True
 except ImportError:
-    # Older SDK
-    from mcp.client.streamable_http import streamablehttp_client as streamable_http_client
+    # Older SDK: streamablehttp_client accepts headers= directly
+    from mcp.client.streamable_http import (
+        streamablehttp_client as streamable_http_client,
+    )
+    create_mcp_http_client = None
+    _HTTP_NEW_API = False
 
 from config import MCP_ENV_PREFIX
 
@@ -163,9 +171,17 @@ class MCPClient:
             headers: dict[str, str] = {}
             if self.token:
                 headers["Authorization"] = f"Bearer {self.token}"
-            read, write, _ = await self._stack.enter_async_context(
-                streamable_http_client(self.url, headers=headers)
-            )
+
+            if _HTTP_NEW_API:
+                http_client = create_mcp_http_client(headers=headers or None)
+                await self._stack.enter_async_context(http_client)
+                read, write, _ = await self._stack.enter_async_context(
+                    streamable_http_client(self.url, http_client=http_client)
+                )
+            else:
+                read, write, _ = await self._stack.enter_async_context(
+                    streamable_http_client(self.url, headers=headers)
+                )
         else:
             raise ValueError(f"unknown transport: {self.transport}")
 
