@@ -54,7 +54,7 @@ log = logging.getLogger("chatd")
 
 # ── app ────────────────────────────────────────────────────────────────────────
 
-VERSION = "1.0.0"
+VERSION = "2.0.0"
 
 TOOLS: List[Dict] = []
 TOOL_REGISTRY: Dict[str, MCPClient] = {}
@@ -482,12 +482,12 @@ def load_tools():
     registry = {}
     clients  = []
 
-    for source, cmd in discover_mcp_servers().items():
-        client = MCPClient(cmd)
+    for server_name, cfg in discover_mcp_servers().items():
+        client = MCPClient(cfg, name=server_name)
         try:
             client.start()
         except Exception as e:
-            log.error("[tools] %s: failed to start MCP server: %s", source, e)
+            log.error("[tools] %s: failed to start MCP server: %s", server_name, e)
             continue
 
         clients.append(client)
@@ -495,9 +495,9 @@ def load_tools():
         try:
             server_tools = client.list_tools()
         except Exception as e:
-            log.error("[tools] %s: failed to list tools: %s", source, e)
+            log.error("[tools] %s: failed to list tools: %s", server_name, e)
             continue
-        log.info("[tools] %s: %d tools loaded", source, len(server_tools))
+        log.info("[tools] %s: %d tools loaded", server_name, len(server_tools))
 
         for t in server_tools:
             name         = getattr(t, "name", None)
@@ -505,7 +505,7 @@ def load_tools():
             input_schema = getattr(t, "inputSchema", None) or getattr(t, "input_schema", None)
 
             if not name or not input_schema:
-                log.warning("[tools] %s: skipping tool without name/schema: %r", source, t)
+                log.warning("[tools] %s: skipping tool without name/schema: %r", server_name, t)
                 continue
 
             if TOOL_OVERRIDE and name in TOOL_DESCRIPTION_OVERRIDES:

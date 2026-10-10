@@ -101,3 +101,60 @@ core      →  ничего внутри проекта
 
 **Никогда** в `/opt/<svc>/`, никогда в home сервиса.
 ```
+
+## Filesystem layout
+
+Code and state are separated.
+
+```
+/opt/subconscious/          ← code and venv (read-only for the service)
+├── venv/
+├── subconscious/           ← Python package
+├── prompts/
+├── docs/
+├── tests/
+├── pyproject.toml
+└── ...
+
+/etc/subconscious/          ← configuration (not touched on upgrade)
+├── subconscious.env        ← env vars
+├── tool_descriptions.ini   ← tool overrides
+└── prompts/                ← prompt overrides
+
+/var/lib/subconscious/      ← mutable state
+├── bg/                     ← background worker state
+├── sessions/               ← chat session logs
+├── rag.sqlite3             ← RAG index
+├── kg.sqlite3              ← own KG (PR E)
+└── vectors.sqlite3         ← own vector store (PR E)
+
+/var/lib/mempalace/         ← mempalace palace (external)
+
+/run/subconscious/          ← runtime (tmpfs, cleared on boot)
+├── subconscious.sock       ← UDS (future)
+└── subconscious.pid
+
+/usr/local/bin/
+├── subconscious            ← CLI wrapper
+└── subconscious-tick       ← tick wrapper
+```
+
+**Principles:**
+
+1. **Code in `/opt`, state in `/var/lib`.** Upgrading code never touches
+   data; backing up data never drags code.
+2. **Config in `/etc`.** Not touched on upgrade. Edit here, not in repo.
+3. **No `.local/share` inside `/opt`.** State belongs in `/var/lib`.
+4. **HOME = `/var/lib/subconscious`.** HOME is state, not code.
+5. **Runtime in `/run`.** UDS, pid, ephemeral locks.
+6. **Logs in journald.** No `/var/log/subconscious/`.
+
+### MCP transports
+
+Two transports are supported, chosen by env prefix:
+
+- `SUBCONSCIOUS_MCP_STDIO_<NAME>=<command>` — spawn the MCP server as a
+  subprocess, talk over stdin/stdout. This is the default for local tools.
+- `SUBCONSCIOUS_MCP_HTTP_<NAME>_URL=<url>` (+ optional `_TOKEN=<bearer>`) —
+  connect to a remote MCP server over HTTP. Used for services that already
+  run as daemons (e.g. mempalace in Docker).

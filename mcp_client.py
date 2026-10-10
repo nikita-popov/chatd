@@ -8,45 +8,96 @@ import signal
 import subprocess
 import threading
 from contextlib import AsyncExitStack
-from typing import Any
+from typing import Any, Optional
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
+from mcp.client.streamable_http import streamablehttp_client
 
 from config import MCP_ENV_PREFIX
 
 log = logging.getLogger("chatd.mcp_client")
 
-# Seconds to wait for MCP server to respond.
 MCP_LIST_TOOLS_TIMEOUT: float = float(os.environ.get("CHATD_MCP_LIST_TOOLS_TIMEOUT", "30"))
 MCP_CALL_TOOL_TIMEOUT:  float = float(os.environ.get("CHATD_MCP_CALL_TOOL_TIMEOUT",  "60"))
+
 
 # ---------------------------------------------------------------------------
 # MCP server auto-discovery
 #
-# Each CHATD_MCP_<NAME> environment variable registers one MCP server.
-# The value is a shell command string, e.g.:
+# Env var conventions:
+#   CHATD_MCP_STDIO_<NAME>=<command>
+#       Spawn <command> as a subprocess; talk stdin/stdout.
 #
-#   CHATD_MCP_MONITOR="/opt/chatd/venv/bin/python /opt/chatd/mcp-monitor.py"
-#   CHATD_MCP_NOTES="/opt/chatd/venv/bin/python /opt/chatd/mcp-notes.py"
-#   CHATD_MCP_MEMPALACE="/opt/chatd/venv/bin/python -m mempalace.mcp_server"
+#   CHATD_MCP_HTTP_<NAME>_URL=<url>
+#   CHATD_MCP_HTTP_<NAME>_TOKEN=<bearer>     (optional)
+#       Connect to a remote MCP server over streamable HTTP.
 #
-# Set these in .env or the systemd unit Environment= directives.
+# Returns {name: config}, where config is one of:
+#   {"transport": "stdio", "cmd": [argv...]}
+#   {"transport": "http",  "url": "...", "token": "..."}
 # ---------------------------------------------------------------------------
 
+def discover_mcp_servers() -> dict[str, dict]:
+    servers: dict[str, dict] = {}
 
-def discover_mcp_servers() -> dict[str, list[str]]:
-    """Return {name: argv} for every CHATD_MCP_* variable in the environment."""
-    servers: dict[str, list[str]] = {}
-    for key, val in os.environ.items():
-        if key.startswith(MCP_ENV_PREFIX) and val.strip():
-            name = key[len(MCP_ENV_PREFIX):].lower()
-            servers[name] = shlex.split(val)
-    return servers
+    for key, raw in os.environ.items():
+        if not key.startswith(MCP_ENV_PREFIX):
+            continue
+        val = (raw or "").strip()
+        rest = key[len(MCP_ENV_PREFIX):]
+
+        if rest.startswith("STDIO_"):
+            name = rest[len("STDIO_"):].lower()
+            if not name or not val:
+                continue
+            if name in servers:
+                log.warning(
+                    "[mcp] duplicate config for %s, ignoring stdio entry", name
+                )
+                continue
+            servers[name] = {
+                "transport": "stdio",
+                "cmd": shlex.split(val),
+            }
+
+        elif rest.startswith("HTTP_"):
+            body = rest[len("HTTP_"):]
+            for suffix, field in (("_URL", "url"), ("_TOKEN", "token")):
+                if not body.endswith(suffix):
+                    continue
+                name = body[:-len(suffix)].lower()
+                if not name:
+                    break
+                entry = servers.setdefault(name, {"transport": "http"})
+                if entry.get("transport") != "http":
+                    log.warning(
+                        "[mcp] %s already configured as stdio; ignoring http %s",
+                        name, field,
+                    )
+                    break
+                entry[field] = val
+                break
+
+    pruned: dict[str, dict] = {}
+    for name, cfg in servers.items():
+        if cfg.get("transport") == "http" and not cfg.get("url"):
+            log.warning("[mcp] %s has no URL, skipping", name)
+            continue
+        if cfg.get("transport") == "stdio" and not cfg.get("cmd"):
+            log.warning("[mcp] %s has empty stdio command, skipping", name)
+            continue
+        pruned[name] = cfg
+
+    return pruned
 
 
 def _kill_process(cmd: list[str]) -> None:
-    """Best-effort: find and SIGKILL child processes matching cmd."""
+    """Best-effort: find and SIGKILL child processes matching cmd.
+    Only meaningful for stdio transports.
+    """
+    if not cmd:
+        return
     try:
         result = subprocess.run(
             ["pgrep", "-f", " ".join(cmd)],
@@ -57,8 +108,7 @@ def _kill_process(cmd: list[str]) -> None:
                 pid = int(pid_str.strip())
                 os.kill(pid, signal.SIGKILL)
                 log.warning(
-                    "[mcp] killed hung MCP process pid=%d cmd=%s",
-                    pid, cmd[0],
+                    "[mcp] killed hung MCP process pid=%d cmd=%s", pid, cmd[0]
                 )
             except (ValueError, ProcessLookupError, PermissionError) as e:
                 log.debug("[mcp] kill pid=%s failed: %s", pid_str.strip(), e)
@@ -67,18 +117,23 @@ def _kill_process(cmd: list[str]) -> None:
 
 
 class MCPClient:
-    """Long-lived MCP client that keeps the server process running.
+    """Long-lived MCP client. Supports stdio and streamable HTTP transports.
 
     Call start() once after construction, stop() on shutdown.
     list_tools() and call_tool() reuse the persistent session.
     """
 
-    def __init__(self, cmd: list[str]):
-        self.cmd = cmd
-        self._session: ClientSession | None = None
-        self._stack: AsyncExitStack | None = None
-        self._loop: asyncio.AbstractEventLoop | None = None
-        self._thread: threading.Thread | None = None
+    def __init__(self, cfg: dict, name: str = "?"):
+        self.name = name
+        self.transport: str = cfg.get("transport", "stdio")
+        self.cmd: list[str] = cfg.get("cmd", []) or []
+        self.url: str = cfg.get("url", "") or ""
+        self.token: str = cfg.get("token", "") or ""
+
+        self._session: Optional[ClientSession] = None
+        self._stack: Optional[AsyncExitStack] = None
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._thread: Optional[threading.Thread] = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -89,35 +144,46 @@ class MCPClient:
         self._loop.run_forever()
 
     async def _start_async(self) -> None:
-        command = self.cmd[0]
-        args    = self.cmd[1:]
         self._stack = AsyncExitStack()
-        read, write = await self._stack.enter_async_context(
-            stdio_client(StdioServerParameters(
-                command=command, args=args, env=os.environ.copy(),
-            ))
-        )
+
+        if self.transport == "stdio":
+            command = self.cmd[0]
+            args = self.cmd[1:]
+            read, write = await self._stack.enter_async_context(
+                stdio_client(StdioServerParameters(
+                    command=command, args=args, env=os.environ.copy(),
+                ))
+            )
+        elif self.transport == "http":
+            headers: dict[str, str] = {}
+            if self.token:
+                headers["Authorization"] = f"Bearer {self.token}"
+            read, write, _ = await self._stack.enter_async_context(
+                streamablehttp_client(self.url, headers=headers)
+            )
+        else:
+            raise ValueError(f"unknown transport: {self.transport}")
+
         self._session = await self._stack.enter_async_context(
             ClientSession(read, write)
         )
         await self._session.initialize()
 
-
     def start(self) -> None:
         self._loop = asyncio.new_event_loop()
         self._thread = threading.Thread(
-            target=self._loop_forever, daemon=True, name=f"mcp-loop-{self.cmd[0]}"
+            target=self._loop_forever, daemon=True,
+            name=f"mcp-loop-{self.name}",
         )
         self._thread.start()
         fut = asyncio.run_coroutine_threadsafe(self._start_async(), self._loop)
         try:
             fut.result(timeout=30)
-            log.info("[mcp] started: %s", self.cmd[0])
+            log.info("[mcp] started: %s (%s)", self.name, self.transport)
         except Exception as e:
-            log.error("[mcp] failed to start %s: %s", self.cmd, e)
+            log.error("[mcp] failed to start %s: %s", self.name, e)
             self._shutdown_loop()
             raise
-
 
     def _shutdown_loop(self) -> None:
         if self._loop is None:
@@ -131,25 +197,21 @@ class MCPClient:
         self._session = None
         self._stack = None
 
-
     def stop(self) -> None:
         if self._stack and self._loop:
             try:
-                fut = asyncio.run_coroutine_threadsafe(self._stack.aclose(), self._loop)
+                fut = asyncio.run_coroutine_threadsafe(
+                    self._stack.aclose(), self._loop
+                )
                 fut.result(timeout=10)
             except Exception as e:
                 log.debug("[mcp] stop aclose error: %s", e)
         self._shutdown_loop()
-        log.info("[mcp] stopped: %s", self.cmd[0])
-
-
-    # ------------------------------------------------------------------
-    # Internal: run a coroutine on the persistent loop (thread-safe)
-    # ------------------------------------------------------------------
+        log.info("[mcp] stopped: %s", self.name)
 
     def _run(self, coro, timeout: float):
         if self._loop is None or self._session is None:
-            raise RuntimeError(f"MCPClient not started: {self.cmd}")
+            raise RuntimeError(f"MCPClient not started: {self.name}")
         fut = asyncio.run_coroutine_threadsafe(coro, self._loop)
         return fut.result(timeout=timeout)
 
@@ -164,11 +226,12 @@ class MCPClient:
         except asyncio.TimeoutError:
             log.error(
                 "[mcp] list_tools timed out after %.0fs: %s",
-                MCP_LIST_TOOLS_TIMEOUT, self.cmd,
+                MCP_LIST_TOOLS_TIMEOUT, self.name,
             )
-            _kill_process(self.cmd)
+            if self.transport == "stdio":
+                _kill_process(self.cmd)
             raise RuntimeError(
-                f"MCP list_tools timeout ({MCP_LIST_TOOLS_TIMEOUT:.0f}s): {self.cmd}"
+                f"MCP list_tools timeout ({MCP_LIST_TOOLS_TIMEOUT:.0f}s): {self.name}"
             )
 
     def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
@@ -180,9 +243,10 @@ class MCPClient:
         except asyncio.TimeoutError:
             log.error(
                 "[mcp] call_tool '%s' timed out after %.0fs: %s",
-                name, MCP_CALL_TOOL_TIMEOUT, self.cmd,
+                name, MCP_CALL_TOOL_TIMEOUT, self.name,
             )
-            _kill_process(self.cmd)
+            if self.transport == "stdio":
+                _kill_process(self.cmd)
             raise RuntimeError(
                 f"MCP call_tool timeout ({MCP_CALL_TOOL_TIMEOUT:.0f}s): {name}"
             )
@@ -192,7 +256,7 @@ class MCPClient:
             return None
 
         first = contents[0]
-        text  = getattr(first, "text", None)
+        text = getattr(first, "text", None)
         if text is None and isinstance(first, dict):
             text = first.get("text")
         if text is None:
