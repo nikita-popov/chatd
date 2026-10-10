@@ -12,7 +12,12 @@ from typing import Any, Optional
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
-from mcp.client.streamable_http import streamablehttp_client
+try:
+    # Newer SDK
+    from mcp.client.streamable_http import streamable_http_client
+except ImportError:
+    # Older SDK
+    from mcp.client.streamable_http import streamablehttp_client as streamable_http_client
 
 from config import MCP_ENV_PREFIX
 
@@ -159,7 +164,7 @@ class MCPClient:
             if self.token:
                 headers["Authorization"] = f"Bearer {self.token}"
             read, write, _ = await self._stack.enter_async_context(
-                streamablehttp_client(self.url, headers=headers)
+                streamable_http_client(self.url, headers=headers)
             )
         else:
             raise ValueError(f"unknown transport: {self.transport}")
